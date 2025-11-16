@@ -1,0 +1,71 @@
+name: Create Release Tag on Main Merge
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+
+jobs:
+  release:
+    # Esegui solo se la PR è stata effettivamente mergiata
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      
+      - name: Extract version from PR title
+        id: version
+        run: |
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          
+          # Pattern: [v1.2.3] o (v1.2.3) o v1.2.3
+          VERSION=$(echo "$PR_TITLE" | grep -oP '[\[\(]?v[0-9]+\.[0-9]+\.[0-9]+[\]\)]?' | head -1 | tr -d '[]()' )
+          
+          if [ -z "$VERSION" ]; then
+            echo "❌ No version tag found in PR title"
+            echo "Expected format: [v1.2.3] Description"
+            echo "PR title was: $PR_TITLE"
+            exit 1
+          fi
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Found version: $VERSION"
+      
+      - name: Check if tag exists
+        id: check_tag
+        run: |
+          if git rev-parse "${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            echo "Tag ${{ steps.version.outputs.version }} already exists"
+            exit 1
+          fi
+          echo "Tag ${{ steps.version.outputs.version }} is unique"
+      
+      - name: Create and push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.version.outputs.version }}" -m "Release ${{ steps.version.outputs.version }}"
+          git push origin "${{ steps.version.outputs.version }}"
+          echo "Tag created and pushed: ${{ steps.version.outputs.version }}"
+      
+      - name: Create GitHub Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          release_name: Release ${{ steps.version.outputs.version }}
+          body: |
+            ## Changes
+            ${{ github.event.pull_request.body }}
+            
+            **Full Changelog**: [Compare](https://github.com/${{ github.repository }}/compare/${{ steps.version.outputs.version }})
+          draft: false
+          prerelease: false
