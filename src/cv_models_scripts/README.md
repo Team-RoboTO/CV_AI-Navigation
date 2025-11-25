@@ -21,12 +21,6 @@ This code had been tested using `Python-3.10`, but should work for `Python-3.8+`
 pip install ultralytics opencv-python numpy pyyaml roboflow
 ```
 
-Then, inside `cv_models_scripts/scripts` run on a terminal:
-
-```bash
-python3 download_dataset.py
-```
-
 ---
 
 ### 2. Download a dataset
