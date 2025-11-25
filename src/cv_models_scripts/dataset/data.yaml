@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 11
+names: ['0_CyanKit', '10_DeadCar', '1_RedKit', '2_BlueKit', '3_RedArmy', '4_BlueArmy', '5_RedEar', '6_BlueEar', '7_Redbase', '8_Bluebase', '9_DeadKit']
+
+roboflow:
+  workspace: andrea-blf47
+  project: 23424t56t53rt5rt65-ivhs3
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/andrea-blf47/23424t56t53rt5rt65-ivhs3/dataset/1
