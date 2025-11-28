@@ -24,7 +24,7 @@ def download_dataset(dataset_path="../dataset", data_yaml_path="../dataset/data.
         workspace_name = roboflow_config['workspace']
         project_name = roboflow_config['project']
         version = roboflow_config['version']
-        download_format = 'yolov8'
+        download_format = 'coco'
         
     except FileNotFoundError:
         print(f"Error: {data_yaml_path} not found.")

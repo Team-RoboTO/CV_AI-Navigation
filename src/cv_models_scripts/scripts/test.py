@@ -14,11 +14,11 @@ class TestConfig:
     temp_test_dir = "../test_aug"
     test_runs_dir = "../test_runs"
     runs_dir = "../runs"
-    yolo_type = "yolo11n"
-    model_weights = f"{runs_dir}/{yolo_type}_train/weights/best.pt"
-    train_config_path = f"{runs_dir}/{yolo_type}_train/train_config.yaml"
+    model_type = "yolov10n"
+    model_weights = f"{runs_dir}/{model_type}_train/weights/best.pt"
+    train_config_path = f"{runs_dir}/{model_type}_train/train_config.yaml"
     imgsz = 320
-    confidence_thresh = 0.45
+    confidence_thresh = 0.25
     max_brightness_percentage = 0.4
     max_zoom_percentage = 0.3
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -249,7 +249,7 @@ def main():
     
     robustify_test_images(test_dir=config.test_dir, save_dir=config.temp_test_dir, config=config)
 
-    run_name = f"{config.yolo_type}_test"
+    run_name = f"{config.model_type}_test"
     project_dir = config.test_runs_dir
 
     res = yolo_model.predict(

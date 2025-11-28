@@ -1,15 +1,21 @@
 .github/
+.vscode/
 src/cv_models_scripts/scripts/__pycache__
 src/cv_models_scripts/scripts/*.pt
+src/cv_models_scripts/scripts/*.pth
 src/cv_models_scripts/runs/*/*.yaml
 src/cv_models_scripts/runs/*/*.png
 src/cv_models_scripts/runs/*/*.jpg
+src/cv_models_scripts/runs/*/*.pth
+src/cv_models_scripts/runs/*/eval
 src/cv_models_scripts/runs/*/weights/*.pt
 src/cv_models_scripts/test_runs/*/labels
 src/cv_models_scripts/test_runs/*/images/*
 
 !src/cv_models_scripts/runs/*/results.png
+!src/cv_models_scripts/runs/*/metrics_plot.png
 !src/cv_models_scripts/runs/*/train_config.yaml
 !src/cv_models_scripts/runs/*/weights/best.pt
+!src/cv_models_scripts/runs/*/checkpoint_best_total.pth
 !src/cv_models_scripts/test_runs/*/images/*curve.png
 !src/cv_models_scripts/test_runs/*/images/confusion_matrix_normalized.png

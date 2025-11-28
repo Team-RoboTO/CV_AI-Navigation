@@ -1,0 +1,11 @@
+dataset_path: ../dataset
+data_yaml: ../dataset/data.yaml
+model_name: yolov10n.pt
+runs_dir: ../runs
+imgsz: 320
+num_epochs: 100
+batch_size: 10
+lr0: 0.01
+weight_decay: 0.0005
+patience: 20
+device: cuda
