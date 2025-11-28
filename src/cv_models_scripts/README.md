@@ -6,6 +6,11 @@ In particular, three scripts are provided:
 - `train.py`: trains a yolo model with the specified configuration (`TrainConfig`)
 - `test.py`: performs inference on a trained yolo model with the specified configuration (`TestConfig`)
 - `download_dataset.py`: export and saves a dataset from RoboFlow to the `dataset` folder (this folder should contain a valid `data.yaml` file before running the script, otherwise it won't work)
+- `visualize_metrics.py`: retrieve all the metrics saved inside .txt files in `test_runs` folder and generates bar plots in the `metrics` folder. Currently the metrics considered are:
+    - mean average precision mAP50
+    - average confidence
+    - latency (ms)
+    - FPS (Frames Per Second)
 
 Inside `TestConfig` is possible to set brightness and zoom in/out max percentages to test the trained model under different lighting conditions and from different perspectives.
 
@@ -23,7 +28,27 @@ pip install ultralytics opencv-python numpy pyyaml roboflow
 
 ---
 
-### 2. Download a dataset
+### 2. Setting up Git LFS
+
+This repository uses ***Git Large File Storage*** (**LFS**) to handle  large model weights (.pth files). You must install LFS to download the actual model files, otherwise you will only download small pointer files and the code will fail.
+
+#### 2.1 Install Git LFS:
+
+On a terminal:
+
+```bash
+git lfs install
+```
+
+#### 2.2 Pull the weights:
+
+On a terminal:
+
+```bash
+git lfs pull
+```
+
+### 3. Download a dataset
 
 Be sure to have exported your Roboflow API Key as an environment variable by running the following on a terminal:
 
@@ -45,7 +70,7 @@ python3 download_dataset.py
 
 ---
 
-### 3. Perform training
+### 4. Perform training
 
 Update the `TrainConfig` instance as desired, then open a terminal, go inside `cv_models_scripts/scripts` via `cd` and run:
 
@@ -55,7 +80,7 @@ python3 train.py
 
 ---
 
-### 4. Perform inference
+### 5. Perform inference
 
 Update the `TestConfig` instance as desired, then open a terminal, go inside `cv_models_scripts/scripts` via `cd` and run:
 
