@@ -37,7 +37,9 @@ def save_config_to_yaml(config_instance, config_save_dir):
     json_string = json.dumps(config_dict, indent=4)
     yaml_data = yaml.safe_load(json_string)
 
-    with open(config_save_dir, 'w') as f:
+    config_output_path = os.path.join(config_save_dir, "train_config.yaml")
+
+    with open(config_output_path, 'w') as f:
         yaml.safe_dump(yaml_data, f, sort_keys=False)
 
 
@@ -67,6 +69,7 @@ def main():
             early_stopping=True if config.patience > 0 else False,
             early_stopping_patience=config.patience
         )
+        actual_run_dir = os.path.join(project_dir, run_name)
     else:
         results = model.train(
             data=config.data_yaml,
@@ -84,14 +87,13 @@ def main():
             project=project_dir
         )
 
-    # avoid AttributeError in case the used YOLO version does not provide this attribute
-    if hasattr(results, 'save_dir') and results.save_dir:
-        actual_run_dir = results.save_dir
-    else:
-        actual_run_dir = os.path.join(project_dir, run_name)
-
-    config_output_path = os.path.join(actual_run_dir, "train_config.yaml")
-    save_config_to_yaml(config_instance=config, config_save_dir=config_output_path)
+        # avoid AttributeError in case the used YOLO version does not provide this attribute
+        if hasattr(results, 'save_dir') and results.save_dir:
+            actual_run_dir = results.save_dir
+        else:
+            actual_run_dir = os.path.join(project_dir, run_name)
+            
+    save_config_to_yaml(config_instance=config, config_save_dir=actual_run_dir)
 
 
 if __name__ == '__main__':

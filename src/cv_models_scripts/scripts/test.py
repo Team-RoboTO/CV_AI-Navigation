@@ -4,7 +4,9 @@ import cv2
 import numpy as np
 import os
 import shutil
+import tensorrt as trt
 from train import save_config_to_yaml
+from rfdetr import RFDETRNano
 
 
 class TestConfig:
@@ -14,8 +16,8 @@ class TestConfig:
     temp_test_dir = "../test_aug"
     test_runs_dir = "../test_runs"
     runs_dir = "../runs"
-    model_type = "yolov10n"
-    model_weights = f"{runs_dir}/{model_type}_train/weights/best.pt"
+    model_type = "RF_DETR"
+    model_weights = f"{runs_dir}/{model_type}_train/checkpoint_best_total.pth"
     train_config_path = f"{runs_dir}/{model_type}_train/train_config.yaml"
     imgsz = 320
     confidence_thresh = 0.25
@@ -114,26 +116,83 @@ def robustify_test_images(test_dir, save_dir, config: TestConfig):
             cv2.imwrite(os.path.join(save_dir, file_name), cv2.cvtColor(out, cv2.COLOR_BGR2RGB))
 
 
-def export_to_onnx(pt_weights_path, imgsz):
+def export_to_onnx(config: TestConfig):
     """
     Exports a trained YOLO PyTorch model to the **ONNX** (***Open Neural Network Exchange***) format.
     The exported ONNX file will be saved in the same directory as the input .pt file.
 
     **Input**:
-        - pt_weights_path: path to the trained PyTorch weights file
-        - imgsz: image size used for training and inference
+        - config: testing configuration instance
     """
 
-    model = YOLO(pt_weights_path)
+    if "yolo" in config.model_type:
+        model = YOLO(config.model_weights)
+    else:
+        model = RFDETRNano(pretrain_weights=config.model_weights)
+
+    output_dir = os.path.dirname(config.model_weights)
     
     model.export(
         format="onnx",
+        output_dir=output_dir,
         opset=12,      # ONNX Operator Set version (for modern models a common value is >= 12)
-        imgsz=imgsz,   # input image size for the resulting ONNX graph
+        imgsz=config.imgsz,   # input image size for the resulting ONNX graph
         dynamic=False, # set this to False when using a fixed batch size and image size
         simplify=True, # set this to True to optimize the model structure for faster inference
         half=True      # export using Half Precision (FP16) arithmetic to reduce model size and to speed up inference
     )
+
+
+def generate_plan_file(onnx_file_path, engine_file_path, fp16=True):
+    """
+    Compiles an ONNX model into a serialized TensorRT engine file (.plan) 
+    optimized for NVIDIA GPUs. It sets up the TensorRT builder, parses the ONNX graph, 
+    and optionally enables FP16 precision before building the optimized engine.
+
+    **Input**:
+        - config: testing configuration instance
+    """
+    # setup the Logger
+    TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+    
+    # create the Builder and Network
+    builder = trt.Builder(TRT_LOGGER)
+    network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+    parser = trt.OnnxParser(network, TRT_LOGGER)
+    config = builder.create_builder_config()
+
+    # enable FP16 precision (recommended for fast GPU inference)
+    if fp16:
+        if builder.platform_has_fast_fp16:
+            config.set_flag(trt.BuilderFlag.FP16)
+            print("Enabling FP16 precision")
+        else:
+            print("FP16 not supported on this platform, using FP32")
+
+    # parse the ONNX File
+    print(f"Loading ONNX file from: {onnx_file_path}")
+    if not os.path.exists(onnx_file_path):
+        print(f"Error: File {onnx_file_path} not found.")
+        return
+
+    with open(onnx_file_path, 'rb') as model:
+        if not parser.parse(model.read()):
+            print("ERROR: Failed to parse the ONNX file.")
+            for error in range(parser.num_errors):
+                print(parser.get_error(error))
+            return None
+
+    # build the engine
+    print("Building TensorRT Engine...")
+    serialized_engine = builder.build_serialized_network(network, config)
+
+    if serialized_engine:
+        print(f"Saving Plan file to: {engine_file_path}")
+        with open(engine_file_path, "wb") as f:
+            f.write(serialized_engine)
+        print("Success!")
+    else:
+        print("Failed to build engine.")
 
 
 def compute_metrics(results, model_weights, test_aug_dir, labels_dir, output_file, train_config_path):
@@ -278,8 +337,7 @@ def main():
         actual_run_dir = os.path.join(project_dir, run_name)
 
     metrics_file = os.path.join(actual_run_dir, "metrics.txt")
-    config_output_path = os.path.join(actual_run_dir, "test_config.yaml")
-    save_config_to_yaml(config_instance=config, config_save_dir=config_output_path)
+    save_config_to_yaml(config_instance=config, config_save_dir=actual_run_dir)
 
     compute_metrics(
         results=res,
@@ -303,4 +361,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    #main()
+    config = TestConfig()
+    #export_to_onnx(config=config)
+    model_dir = os.path.dirname(config.model_weights)
+    onnx_path = os.path.join(model_dir, "inference_model.onnx")
+    engine_path = os.path.join(model_dir, "inference_model.sim.onnx")
+    generate_plan_file(onnx_file_path=onnx_path, engine_file_path=engine_path, fp16=True)
