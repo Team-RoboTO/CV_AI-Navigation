@@ -143,15 +143,17 @@ def export_to_onnx(config: TestConfig):
     )
 
 
-def generate_plan_file(onnx_file_path, engine_file_path, fp16=True):
+def generate_plan_file(onnx_file_path, fp16=True):
     """
     Compiles an ONNX model into a serialized TensorRT engine file (.plan) 
     optimized for NVIDIA GPUs. It sets up the TensorRT builder, parses the ONNX graph, 
     and optionally enables FP16 precision before building the optimized engine.
 
     **Input**:
-        - config: testing configuration instance
+        - onnx_file_path: path to the .onnx model
     """
+    model_dir = os.path.dirname(onnx_file_path)
+    plan_file_path = os.path.join(model_dir, "inference_model.plan")
     # setup the Logger
     TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
     
@@ -187,8 +189,8 @@ def generate_plan_file(onnx_file_path, engine_file_path, fp16=True):
     serialized_engine = builder.build_serialized_network(network, config)
 
     if serialized_engine:
-        print(f"Saving Plan file to: {engine_file_path}")
-        with open(engine_file_path, "wb") as f:
+        print(f"Saving Plan file to: {plan_file_path}")
+        with open(plan_file_path, "wb") as f:
             f.write(serialized_engine)
         print("Success!")
     else:
@@ -363,8 +365,7 @@ def main():
 if __name__ == "__main__":
     #main()
     config = TestConfig()
-    #export_to_onnx(config=config)
+    export_to_onnx(config=config)
     model_dir = os.path.dirname(config.model_weights)
     onnx_path = os.path.join(model_dir, "inference_model.onnx")
-    engine_path = os.path.join(model_dir, "inference_model.sim.onnx")
-    generate_plan_file(onnx_file_path=onnx_path, engine_file_path=engine_path, fp16=True)
+    generate_plan_file(onnx_file_path=onnx_path, fp16=True)
