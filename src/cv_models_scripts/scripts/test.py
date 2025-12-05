@@ -16,10 +16,13 @@ class TestConfig:
     temp_test_dir = "../test_aug"
     test_runs_dir = "../test_runs"
     runs_dir = "../runs"
-    model_type = "RF_DETR"
-    model_weights = f"{runs_dir}/{model_type}_train/checkpoint_best_total.pth"
-    train_config_path = f"{runs_dir}/{model_type}_train/train_config.yaml"
-    imgsz = 320
+    model_type = "yolov8n"
+    if "RF_DETR" in model_type:
+        model_weights = f"{runs_dir}/{model_type}_train/checkpoint_best_total.pth"
+    else:
+        model_weights = f"{runs_dir}/{model_type}_train2/weights/best.pt"
+    train_config_path = f"{runs_dir}/{model_type}_train2/train_config.yaml"
+    imgsz = 640
     confidence_thresh = 0.25
     max_brightness_percentage = 0.4
     max_zoom_percentage = 0.3
@@ -125,22 +128,32 @@ def export_to_onnx(config: TestConfig):
         - config: testing configuration instance
     """
 
-    if "yolo" in config.model_type:
-        model = YOLO(config.model_weights)
-    else:
-        model = RFDETRNano(pretrain_weights=config.model_weights)
-
     output_dir = os.path.dirname(config.model_weights)
-    
-    model.export(
-        format="onnx",
-        output_dir=output_dir,
-        opset=12,      # ONNX Operator Set version (for modern models a common value is >= 12)
-        imgsz=config.imgsz,   # input image size for the resulting ONNX graph
-        dynamic=False, # set this to False when using a fixed batch size and image size
-        simplify=True, # set this to True to optimize the model structure for faster inference
-        half=True      # export using Half Precision (FP16) arithmetic to reduce model size and to speed up inference
-    )
+
+    if "yolo" in config.model_type:
+
+        model = YOLO(config.model_weights)
+        model.export(
+            format="onnx",
+            opset=12,      # ONNX Operator Set version (for modern models a common value is >= 12)
+            imgsz=config.imgsz,   # input image size for the resulting ONNX graph
+            dynamic=False, # set this to False when using a fixed batch size and image size
+            simplify=True, # set this to True to optimize the model structure for faster inference
+            half=True      # export using Half Precision (FP16) arithmetic to reduce model size and to speed up inference
+        )
+
+    else:
+
+        model = RFDETRNano(pretrain_weights=config.model_weights)
+        model.export(
+            format="onnx",
+            output_dir=output_dir,
+            opset=12,      # ONNX Operator Set version (for modern models a common value is >= 12)
+            imgsz=config.imgsz,   # input image size for the resulting ONNX graph
+            dynamic=False, # set this to False when using a fixed batch size and image size
+            simplify=True, # set this to True to optimize the model structure for faster inference
+            half=True      # export using Half Precision (FP16) arithmetic to reduce model size and to speed up inference
+        )
 
 
 def generate_plan_file(onnx_file_path, fp16=True):
@@ -367,5 +380,8 @@ if __name__ == "__main__":
     config = TestConfig()
     export_to_onnx(config=config)
     model_dir = os.path.dirname(config.model_weights)
-    onnx_path = os.path.join(model_dir, "inference_model.onnx")
+    if "RF_DETR" in config.model_type:
+        onnx_path = os.path.join(model_dir, "inference_model.onnx")
+    else:
+        onnx_path = os.path.join(model_dir, "best.onnx")
     generate_plan_file(onnx_file_path=onnx_path, fp16=True)

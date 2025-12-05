@@ -1,5 +1,0 @@
-mAP50: 0.0614
-FPS: 166.19
-Avg confidence: 0.6945
-Latency: 6.02 ms/image
-Training config path: ../runs/yolov10n_train/train_config.yaml

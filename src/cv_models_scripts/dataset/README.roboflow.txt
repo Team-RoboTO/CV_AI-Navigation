@@ -1,8 +1,8 @@
 
-23424t56t53rt5rt65 - v1 RoboTo_Dataset_20250914
+GigaDataset_No_Robot_Class - v2 GigaDataset_No_Robot_28092025
 ==============================
 
-This dataset was exported via roboflow.com on November 27, 2025 at 10:37 AM GMT
+This dataset was exported via roboflow.com on December 4, 2025 at 12:33 PM GMT
 
 Roboflow is an end-to-end computer vision platform that helps you
 * collaborate with your team on computer vision projects
@@ -17,13 +17,15 @@ visit https://github.com/roboflow/notebooks
 
 To find over 100k other datasets and pre-trained models, visit https://universe.roboflow.com
 
-The dataset includes 8518 images.
-Ewrt454425245rt35634542 are annotated in COCO format.
+The dataset includes 11312 images.
+Robot are annotated in YOLOv8 format.
 
 The following pre-processing was applied to each image:
-* Auto-contrast via histogram equalization
 
 The following augmentation was applied to create 3 versions of each source image:
-* Random brigthness adjustment of between -29 and +29 percent
+* Random brigthness adjustment of between -51 and +51 percent
+
+The following transformations were applied to the bounding boxes of each image:
+* Randomly crop between 0 and 30 percent of the bounding box
 
 

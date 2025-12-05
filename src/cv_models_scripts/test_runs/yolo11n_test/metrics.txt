@@ -1,5 +1,0 @@
-mAP50: 0.0510
-FPS: 116.52
-Avg confidence: 0.6923
-Latency: 8.58 ms/image
-Training config path: ../runs/yolo11n_train/train_config.yaml
