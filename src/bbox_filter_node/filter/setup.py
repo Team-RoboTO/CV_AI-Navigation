@@ -33,6 +33,7 @@ setup(
             'depth = filter.depth_node:main',
             'imu_filter = filter.imu_filter_node:main',
             'bbox_shoot = filter.bbox_filter_node_plus_shooting:main',
+            'viewer_node_test = filter.viewer_node_test:main',
         ],
     },
 )
