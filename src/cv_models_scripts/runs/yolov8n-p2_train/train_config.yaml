@@ -1,0 +1,12 @@
+dataset_path: ../dataset
+data_yaml: ../dataset/data.yaml
+model_name: yolov8n-p2.yaml
+runs_dir: ../runs
+imgsz: 640
+num_epochs: 200
+batch_size: 10
+lr0: 2e-05
+weight_decay: 0.0005
+patience: 40
+rect: false
+device: cuda

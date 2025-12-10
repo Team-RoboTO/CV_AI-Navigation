@@ -1,4 +1,4 @@
-from ultralytics import YOLO
+from ultralytics import YOLO, YOLOWorld
 import torch
 import os
 import json
@@ -9,10 +9,10 @@ from rfdetr import RFDETRNano
 class TrainConfig:
     dataset_path = "../dataset"
     data_yaml = f"{dataset_path}/data.yaml" 
-    model_name = "yolov8n"
+    model_name = "yolov8s-worldv2.pt"
     runs_dir = "../runs"
     imgsz = 640
-    num_epochs = 100
+    num_epochs = 50
     batch_size = 10
     lr0 = 2e-5
     weight_decay = 0.0005
@@ -52,7 +52,13 @@ def main():
     if 'RF_DETR' in model_type:
         model = RFDETRNano()
     else:
-        model = YOLO(config.model_name)
+        if 'p2' in model_type:
+            model = YOLO(config.model_name)
+            model.load(f"{model_type.split('-')[0]}.pt")
+        elif 'world' in model_type:
+            model = YOLOWorld(config.model_name)
+        else:
+            model = YOLO(config.model_name)
 
     run_name = f"{model_type}_train"
     project_dir = config.runs_dir

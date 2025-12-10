@@ -1,4 +1,4 @@
-from ultralytics import YOLO
+from ultralytics import YOLO, YOLOWorld
 import torch
 import cv2
 import numpy as np
@@ -16,16 +16,16 @@ class TestConfig:
     temp_test_dir = "../test_aug"
     test_runs_dir = "../test_runs"
     runs_dir = "../runs"
-    model_type = "yolov8n"
+    model_type = "yolov10n"
     if "RF_DETR" in model_type:
         model_weights = f"{runs_dir}/{model_type}_train/checkpoint_best_total.pth"
     else:
-        model_weights = f"{runs_dir}/{model_type}_train2/weights/best.pt"
-    train_config_path = f"{runs_dir}/{model_type}_train2/train_config.yaml"
+        model_weights = f"{runs_dir}/{model_type}_train/weights/best.pt"
+    train_config_path = f"{runs_dir}/{model_type}_train/train_config.yaml"
     imgsz = 640
     confidence_thresh = 0.25
-    max_brightness_percentage = 0.4
-    max_zoom_percentage = 0.3
+    max_brightness_percentage = 0.0
+    max_zoom_percentage = 0.0
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
@@ -131,8 +131,11 @@ def export_to_onnx(config: TestConfig):
     output_dir = os.path.dirname(config.model_weights)
 
     if "yolo" in config.model_type:
+        if "world" in config.model_type:
+            model = YOLOWorld(config.model_weights)
+        else:
+            model = YOLO(config.model_weights)
 
-        model = YOLO(config.model_weights)
         model.export(
             format="onnx",
             opset=12,      # ONNX Operator Set version (for modern models a common value is >= 12)
@@ -299,7 +302,7 @@ def compute_metrics(results, model_weights, test_aug_dir, labels_dir, output_fil
                         
                 shutil.move(src, dst)
             
-            #shutil.rmtree(temp_val_path)
+            shutil.rmtree(temp_val_path)
         #shutil.rmtree("./runs")
     except Exception as e:
         print(f"Warning: could not compute mAP50: {e}")
@@ -319,7 +322,10 @@ def main():
     config = TestConfig()
 
     os.makedirs(config.temp_test_dir, exist_ok=True)
-    yolo_model = YOLO(config.model_weights)
+    if 'world' in config.model_type:
+        yolo_model = YOLOWorld(config.model_weights)
+    else:
+        yolo_model = YOLO(config.model_weights)
     
     robustify_test_images(test_dir=config.test_dir, save_dir=config.temp_test_dir, config=config)
 
@@ -379,9 +385,3 @@ if __name__ == "__main__":
     #main()
     config = TestConfig()
     export_to_onnx(config=config)
-    model_dir = os.path.dirname(config.model_weights)
-    if "RF_DETR" in config.model_type:
-        onnx_path = os.path.join(model_dir, "inference_model.onnx")
-    else:
-        onnx_path = os.path.join(model_dir, "best.onnx")
-    generate_plan_file(onnx_file_path=onnx_path, fp16=True)
