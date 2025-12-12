@@ -303,8 +303,6 @@ def generate_launch_description():
         parameters=[
             {'bullet_speed': 25.0},
             {'gravity': 9.8},
-            {'bullet_speed': 25.0},
-            {'gravity': 9.8},
             {'k': 0.01},
             {'time_bias': 0.05}
         ],
