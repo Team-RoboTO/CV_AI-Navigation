@@ -7,7 +7,7 @@ import message_filters
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped, Twist
 import numpy as np
-from .library.score_functions import _get_centered, _get_close, _get_wide, _get_fract_sizes
+from .library.score_functions import _get_centered, _get_wide, _get_fract_sizes
 # import time
 
 names = {
@@ -107,7 +107,6 @@ class FilterPublisher(Node):
             color = names[int(detection.results[0].hypothesis.class_id)]
 
             if color == self.color_to_shoot:
-                score += _get_close(detection)
                 score += _get_centered(detection)
                 score += _get_wide(detection)
                 score += _get_fract_sizes(detection)

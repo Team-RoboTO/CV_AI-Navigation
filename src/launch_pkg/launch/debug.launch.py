@@ -183,7 +183,10 @@ def generate_launch_description():
         package='realsense2_camera',
         plugin='realsense2_camera::RealSenseNodeFactory',
         parameters=[realsense_config_file_path],
-        remappings=[('/color/image_raw', '/image_origin')]
+        remappings=[
+            ('/color/image_raw', '/image_origin'),
+            ('/color/camera_info', '/camera_info')
+        ]
     )
 
     # Vertical flip on color image
@@ -256,7 +259,8 @@ def generate_launch_description():
             'out_width': 640.0,
             'in_height': 360.0,
             'out_height': 640.0
-        }]
+        }],
+        remappings=[('detections', '/detections_output')]
     )
 
     # 3D bbox extraction
@@ -266,6 +270,45 @@ def generate_launch_description():
         plugin='pointcloud_consumer::BboxXyzNode',
         remappings=[('/pointcloud2', '/points'),
                     ('/input_detections', '/detections_output')]
+    )
+
+    # Armor Tracker Node
+    armor_tracker_node = ComposableNode(
+        package='armor_tracker',
+        plugin='rm_auto_aim::ArmorTrackerNode',
+        name='armor_tracker',
+        parameters=[
+            {'max_armor_distance': 10.0},
+            {'tracker.max_match_distance': 0.15},
+            {'tracker.max_match_yaw_diff': 1.0},
+            {'tracker.tracking_thres': 5},
+            {'tracker.lost_time_thres': 0.3},
+            # EKF parameters
+            {'ekf.sigma2_q_xyz': 20.0},
+            {'ekf.sigma2_q_yaw': 100.0},
+            {'ekf.sigma2_q_r': 800.0}
+        ],
+        remappings=[
+            ('/detector/armors', '/detections_output'),
+            ('/camera_info', '/camera_info') 
+        ],
+        extra_arguments=[{'use_intra_process_comms': True}]
+    )
+
+    # Trajectory Solver Node
+    trajectory_solver_node = ComposableNode(
+        package='rm_trajectory',
+        plugin='rm_auto_aim::TrajectorySolverNode',
+        name='trajectory_solver',
+        parameters=[
+            {'bullet_speed': 25.0},
+            {'gravity': 9.8},
+            {'bullet_speed': 25.0},
+            {'gravity': 9.8},
+            {'k': 0.01},
+            {'time_bias': 0.05}
+        ],
+        extra_arguments=[{'use_intra_process_comms': True}]
     )
 
     container = ComposableNodeContainer(
@@ -280,7 +323,9 @@ def generate_launch_description():
             encoder_node,
             tensor_rt_node,
             yolov8_decoder_node,
-            bbox_extactor_node
+            bbox_extactor_node,
+            armor_tracker_node,
+            trajectory_solver_node
         ],
         output='screen',
         arguments=['--ros-args', '--log-level', 'INFO']
