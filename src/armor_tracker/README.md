@@ -18,7 +18,7 @@ Where:
 - $r$: Radius (Distance from center to armor).
 
 ### Workflow
-1.  **Input**: Receives 3D positions of detected armors from the vision system.
+1.  **Input**: Receives 2D bounding boxes from the vision system and solves PnP to get 3D positions.
 2.  **Predict**: Uses the kinematic model to predict where the armors will be (accounting for rotation).
 3.  **Update**:
     -   If an armor is matched, update the state using the EKF.
@@ -26,11 +26,17 @@ Where:
 
 ## Usage
 ### Subscribed Topics
--   `/detections_output` (`auto_aim_interfaces/Armors`): The 3D position of armors from the detector.
+-   `/detector/armors` (`vision_msgs/Detection2DArray`): The 2D bounding boxes of armors from the detector.
 -   `/camera_info`: Camera intrinsic parameters.
 
 ### Published Topics
 -   `/tracker/target` (`auto_aim_interfaces/Target`): High-level tracking data (position, velocity, radius, yaw) sent to the trajectory solver.
+-   `/tracker/info` (`auto_aim_interfaces/TrackerInfo`): Debug information about the EKF state and matches.
+-   `/detections_output/optimal_target` (`vision_msgs/Detection2D`): The 2D bounding box of the currently tracked target.
+-   `/tracker/marker` (`visualization_msgs/MarkerArray`): Visualization markers for Rviz (position, velocity, armors).
+
+### Services
+-   `/tracker/reset` (`std_srvs/Trigger`): Resets the tracker state to LOST.
 
 ### Parameters
 | Parameter | Default | Description |

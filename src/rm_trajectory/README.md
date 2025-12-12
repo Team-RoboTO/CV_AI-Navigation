@@ -33,6 +33,8 @@ Where:
 
 ### Published Topics
 -   `/tracker/cmd_gimbal` (`auto_aim_interfaces/GimbalCmd`): Pitch/Yaw commands for the turret.
+-   `/tracker/cmd_vel` (`geometry_msgs/Twist`): Angular velocities (for debugging).
+-   `/trajectory/marker` (`visualization_msgs/Marker`): Impact point visualization.
 
 ### Parameters
 | Parameter | Default | Description |
