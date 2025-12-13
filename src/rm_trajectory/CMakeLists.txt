@@ -8,6 +8,7 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_components REQUIRED)
 find_package(auto_aim_interfaces REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(tf2 REQUIRED)
@@ -23,16 +24,15 @@ target_include_directories(${PROJECT_NAME} PUBLIC
   $<INSTALL_INTERFACE:include>
 )
 
-target_link_libraries(${PROJECT_NAME} PUBLIC
-  visualization_msgs::visualization_msgs
-)
-
 ament_target_dependencies(${PROJECT_NAME}
+  PUBLIC
   rclcpp
+  rclcpp_components
   auto_aim_interfaces
   geometry_msgs
   tf2
   tf2_geometry_msgs
+  visualization_msgs
 )
 
 rclcpp_components_register_node(${PROJECT_NAME}

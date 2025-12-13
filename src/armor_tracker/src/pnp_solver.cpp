@@ -1,6 +1,4 @@
-// Copyright 2022 Chen Jun
-
-#include "armor_detector/pnp_solver.hpp"
+#include "armor_tracker/pnp_solver.hpp"
 
 #include <opencv2/calib3d.hpp>
 #include <vector>

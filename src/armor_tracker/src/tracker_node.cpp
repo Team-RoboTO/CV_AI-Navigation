@@ -1,9 +1,9 @@
-// Copyright 2022 Chen Jun
 #include "armor_tracker/tracker_node.hpp"
 
 // STD
 #include <memory>
 #include <vector>
+#include <opencv2/calib3d.hpp>
 
 namespace rm_auto_aim
 {
@@ -223,8 +223,8 @@ void ArmorTrackerNode::armorsCallback(
     // Heuristic for Armor Type
     float ratio = width / height;
     armor_obj.type = (ratio > 3.0) ? ArmorType::LARGE : ArmorType::SMALL;
-    armor_obj.number = detection.results.empty() ? "unknown" : detection.results[0].id;
-    armor_obj.confidence = detection.results.empty() ? 0.0 : detection.results[0].score;
+    armor_obj.number = detection.results.empty() ? "unknown" : detection.results[0].hypothesis.class_id;
+    armor_obj.confidence = detection.results.empty() ? 0.0 : detection.results[0].hypothesis.score;
     // Map class_id to type if possible, but ratio heuristic is good fallback
     // Set classification result for debug
     armor_obj.classfication_result = armor_obj.number;
@@ -232,16 +232,16 @@ void ArmorTrackerNode::armorsCallback(
     // Construct lights (approximated)
     // Left light
     armor_obj.left_light.center = cv::Point2f(center_x - width / 2, center_y);
-    armor_obj.left_light.size = cv::Size2f(width / 10, height);  // assume light width is small
-    armor_obj.left_light.angle = 90;                             // upright
+    // armor_obj.left_light.size = cv::Size2f(width / 10, height);  // assume light width is small
+    // armor_obj.left_light.angle = 90;                             // upright
     // Calculate light corners (top/bottom)
     armor_obj.left_light.top = cv::Point2f(center_x - width / 2, center_y - height / 2);
     armor_obj.left_light.bottom = cv::Point2f(center_x - width / 2, center_y + height / 2);
 
     // Right light
     armor_obj.right_light.center = cv::Point2f(center_x + width / 2, center_y);
-    armor_obj.right_light.size = cv::Size2f(width / 10, height);
-    armor_obj.right_light.angle = 90;
+    // armor_obj.right_light.size = cv::Size2f(width / 10, height);
+    // armor_obj.right_light.angle = 90;
     armor_obj.right_light.top = cv::Point2f(center_x + width / 2, center_y - height / 2);
     armor_obj.right_light.bottom = cv::Point2f(center_x + width / 2, center_y + height / 2);
 
@@ -330,6 +330,10 @@ void ArmorTrackerNode::armorsCallback(
     target_msg.tracking = false;
   } else {
     dt_ = (time - last_time_).seconds();
+    if (dt_ < 1e-9) {
+      // Avoid division by zero or extremely small dt causing overflow
+      return;
+    }
     tracker_->lost_thres = static_cast<int>(lost_time_thres_ / dt_);
     tracker_->update(armors_ptr);
 

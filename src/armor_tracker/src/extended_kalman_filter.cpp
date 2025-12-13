@@ -1,5 +1,3 @@
-// Copyright 2022 Chen Jun
-
 #include "armor_tracker/extended_kalman_filter.hpp"
 
 namespace rm_auto_aim

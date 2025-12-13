@@ -1,5 +1,3 @@
-// Copyright 2022 Chen Jun
-
 #include "rm_trajectory/trajectory_solver.hpp"
 
 #include <cmath>
