@@ -15,7 +15,7 @@ names = {
         1: 'grey_armor',
         2: 'purple_armor',
         3: 'red_armor',
-        #4: 'robot',
+        4: 'robot',
 }
 
 path = Path()

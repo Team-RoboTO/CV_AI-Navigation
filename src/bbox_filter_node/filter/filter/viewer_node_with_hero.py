@@ -55,7 +55,7 @@ class BboxWithDistance(Node):
         self._detections_subscription = message_filters.Subscriber(
             self,
             Detection2DArray,
-            '/output_detections_with_pose')
+            '/detections_output/with_pose')
         
         # 2 SUBSCRIBER: Takes the image
         self._image_subscription = message_filters.Subscriber(
