@@ -135,14 +135,11 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
     this->get_node_base_interface(), this->get_node_timers_interface());
   tf2_buffer_->setCreateTimerInterface(timer_interface);
   tf2_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf2_buffer_);
-  // subscriber and filter
-  armors_sub_.subscribe(this, "/detector/armors", rmw_qos_profile_sensor_data);
+  // sottoscrizione diretta a yolo, se non si aggira il filtro non funziona
   target_frame_ = this->declare_parameter("target_frame", "odom");
-  tf2_filter_ = std::make_shared<tf2_filter>(
-    armors_sub_, *tf2_buffer_, target_frame_, 10, this->get_node_logging_interface(),
-    this->get_node_clock_interface(), std::chrono::duration<int>(1));
-  // Register a callback with tf2_ros::MessageFilter to be called when transforms are available
-  tf2_filter_->registerCallback(&ArmorTrackerNode::armorsCallback, this);
+  armors_sub_ = this->create_subscription<vision_msgs::msg::Detection2DArray>(
+    "/detector/armors", rclcpp::SensorDataQoS(),
+    std::bind(&ArmorTrackerNode::armorsCallback, this, std::placeholders::_1));
 
   cam_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
     "/camera_info", rclcpp::SensorDataQoS(),
@@ -200,6 +197,11 @@ void ArmorTrackerNode::armorsCallback(
   // Convert 2D detections to Armors message
   auto_aim_interfaces::msg::Armors armors_msg;
   armors_msg.header = detection_msg->header;
+
+  if (armors_msg.header.frame_id.empty()) {
+    armors_msg.header.frame_id = "camera_color_optical_frame";
+  }
+  
   std::vector<size_t> detection_indices;
 
   if (pnp_solver_ == nullptr) {
@@ -211,9 +213,10 @@ void ArmorTrackerNode::armorsCallback(
     auto_aim_interfaces::msg::Armor armor_msg;
     // Extract bbox
     auto center_x = detection.bbox.center.position.x;
-    auto center_y = detection.bbox.center.position.y;
+    // scala le coordinate y dal tensore 640x640 all'immagine reale 640x480
+    auto center_y = detection.bbox.center.position.y * 0.75; 
     auto width = detection.bbox.size_x;
-    auto height = detection.bbox.size_y;
+    auto height = detection.bbox.size_y * 0.75;
 
     // Create a fake Armor object for PnP
     // We assume the bbox covers the armor lights

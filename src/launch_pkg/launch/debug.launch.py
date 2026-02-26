@@ -168,8 +168,9 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch_ros.actions import ComposableNodeContainer
+from launch_ros.actions import ComposableNodeContainer, Node
 from launch_ros.descriptions import ComposableNode
+from launch.actions import TimerAction
 
 def generate_launch_description():
     launch_pkg_dir = get_package_share_directory('launch_pkg')
@@ -178,51 +179,44 @@ def generate_launch_description():
         launch_pkg_dir, 'config', 'sensors', 'realsense.yaml'
     )
 
+    realsense_json_file_path = os.path.join(
+        launch_pkg_dir, 'config', 'sensors', 'realsense.json'
+    )
+
     # RealSense camera
     realsense_node = ComposableNode(
+        name='camera',
+        namespace='camera',
         package='realsense2_camera',
         plugin='realsense2_camera::RealSenseNodeFactory',
-        parameters=[realsense_config_file_path],
+        parameters=[
+            realsense_config_file_path, 
+            {'json_file_path': realsense_json_file_path,
+            'publish_tf': False}],
         remappings=[
-            ('/color/image_raw', '/image_origin'),
-            ('/color/camera_info', '/camera_info')
+            ('color/image_raw', '/image'),      
+            ('color/camera_info', '/camera_info'),
+            ('depth/image_rect_raw', '/depth_image'),
+            ('depth/camera_info', '/depth_info')
         ]
     )
 
-    # Vertical flip on color image
-    image_flip_node = ComposableNode(
-        name='image_flip',
-        package='isaac_ros_image_proc',
-        plugin='nvidia::isaac_ros::image_proc::ImageFlipNode',
-        parameters=[{'flip_mode': 'VERTICAL'}],
-        remappings=[('/image', '/image_origin'),
-                    ('image_flipped', '/image')]
-    )
-
-    pointcloud_node = ComposableNode(
-    name='pointcloud_node',
-    package='depth_image_proc',
-    plugin='depth_image_proc::PointCloudXyzNode',
-    remappings=[('image_rect', '/depth/image_rect_raw'),  # <-- niente più flipped
-                ('camera_info', '/depth/camera_info')]
-    )
-
-
-    # DNN Image Encoder with flip_horizontal = True
     encoder_node = ComposableNode(
         name='dnn_image_encoder',
         package='isaac_ros_dnn_image_encoder',
         plugin='nvidia::isaac_ros::dnn_inference::DnnImageEncoderNode',
-        remappings=[('encoded_tensor', 'tensor_pub')],
+        remappings=[('encoded_tensor', 'tensor_pub'),
+                    ('image', '/camera/camera/color/image_raw')],
         parameters=[{
             'input_image_width': 640,
-            'input_image_height': 360,
+            'input_image_height': 480,
             'network_image_width': 640,
-            'network_image_height': 640,
+            'network_image_height': 640,    
             'image_mean': [0.0, 0.0, 0.0],
-            'image_stddev': [1.0, 1.0, 1.0],
+            'image_stddev': [1.0,1.0,1.0],
             'num_blocks': 80,
-            'flip_horizontal': True  # <--- aggiunto
+            'flip_horizontal': False,
+            'keep_aspect_ratio': True
         }]
     )
 
@@ -232,8 +226,8 @@ def generate_launch_description():
         package='isaac_ros_tensor_rt',
         plugin='nvidia::isaac_ros::dnn_inference::TensorRTNode',
         parameters=[{
-            'model_file_path': os.path.join(launch_pkg_dir, 'resources', 'yolov8s_od_gigadataset.v1.onnx'),
-            'engine_file_path': os.path.join(launch_pkg_dir, 'resources', 'yolov8s_od_gigadataset.v1.plan'),
+            'model_file_path': os.path.join(launch_pkg_dir, 'resources', 'yolov8_op.onnx'),
+            'engine_file_path': os.path.join(launch_pkg_dir, 'resources', 'yolov8_op.plan'),
             'output_binding_names': ['output0'],
             'output_tensor_names': ['output_tensor'],
             'input_tensor_names': ['input_tensor'],
@@ -252,24 +246,16 @@ def generate_launch_description():
         package='isaac_ros_yolov8',
         plugin='nvidia::isaac_ros::yolov8::YoloV8DecoderNode',
         parameters=[{
-            'confidence_threshold': 0.50,
+            'confidence_threshold': 0.10, # !!!!!!DA CAMBIARE DOPO TEST!!!!!!
             'nms_threshold': 0.45,
-            'num_classes': 5,
+            'num_classes': 4,
             'in_width': 640.0,
+            'in_height': 640.0,
             'out_width': 640.0,
-            'in_height': 360.0,
-            'out_height': 640.0
+            'out_height': 488.0,
+            'tf_frame_id': 'camera_color_optical_frame'
         }],
         remappings=[('detections', '/detections_output')]
-    )
-
-    # 3D bbox extraction
-    bbox_extactor_node = ComposableNode(
-        name='bbox_xyz_node',
-        package='pointcloud_consumer',
-        plugin='pointcloud_consumer::BboxXyzNode',
-        remappings=[('/pointcloud2', '/points'),
-                    ('/input_detections', '/detections_output')]
     )
 
     # Armor Tracker Node
@@ -277,20 +263,23 @@ def generate_launch_description():
         package='armor_tracker',
         plugin='rm_auto_aim::ArmorTrackerNode',
         name='armor_tracker',
+        remappings=[
+            ('/detector/armors', '/detections_output'),
+            ('/camera_info', '/camera/camera/color/camera_info')
+        ],
         parameters=[
+            # ATTENZIONE! parametri sotto cambiati per fase testing!!!
+            {'target_frame': 'odom'},
+            {'tracker.tracking_thres': 0},   # !!!!!!DA TOGLIERE DOPO TEST!!!!!!
             {'max_armor_distance': 10.0},
-            {'tracker.max_match_distance': 0.15},
-            {'tracker.max_match_yaw_diff': 1.0},
-            {'tracker.tracking_thres': 5},
-            {'tracker.lost_time_thres': 0.3},
+            {'tracker.max_match_distance': 0.60},
+            {'tracker.max_match_yaw_diff': 2.0},
+            {'tracker.tracking_thres': 2},
+            {'tracker.lost_time_thres': 1.0},
             # EKF parameters
             {'ekf.sigma2_q_xyz': 20.0},
             {'ekf.sigma2_q_yaw': 100.0},
             {'ekf.sigma2_q_r': 800.0}
-        ],
-        remappings=[
-            ('/detector/armors', '/detections_output'),
-            ('/camera_info', '/camera_info') 
         ],
         extra_arguments=[{'use_intra_process_comms': True}]
     )
@@ -308,6 +297,14 @@ def generate_launch_description():
         ],
         extra_arguments=[{'use_intra_process_comms': True}]
     )
+    
+    static_tf_node = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='odom_to_camera_tf',
+        # ruota il frame standard (-90 su yaw e roll) per farlo coincidere con la lente
+        arguments=['0', '0', '0.5', '-1.5708', '0', '-1.5708', 'odom', 'camera_color_optical_frame']
+    )
 
     container = ComposableNodeContainer(
         name='biggest_container',
@@ -316,12 +313,9 @@ def generate_launch_description():
         executable='component_container',
         composable_node_descriptions=[
             realsense_node,
-            image_flip_node,
-            pointcloud_node,
             encoder_node,
             tensor_rt_node,
             yolov8_decoder_node,
-            bbox_extactor_node,
             armor_tracker_node,
             trajectory_solver_node
         ],
@@ -329,4 +323,10 @@ def generate_launch_description():
         arguments=['--ros-args', '--log-level', 'INFO']
     )
 
-    return LaunchDescription([container])
+    return LaunchDescription([
+        static_tf_node,
+        TimerAction(
+            period=2.0,                  # <--- Aspetta 2 secondi esatti
+            actions=[container]          # <--- POI lancia il container pesante
+        )
+    ])
