@@ -1,5 +1,7 @@
 #include "armor_tracker/extended_kalman_filter.hpp"
 
+#include <cmath>
+
 namespace rm_auto_aim
 {
 ExtendedKalmanFilter::ExtendedKalmanFilter(
@@ -39,9 +41,22 @@ Eigen::MatrixXd ExtendedKalmanFilter::update(const Eigen::VectorXd & z)
 {
   H = jacobian_h(x_pri), R = update_R(z);
 
-  K = P_pri * H.transpose() * (H * P_pri * H.transpose() + R).inverse();
+  Eigen::MatrixXd S = H * P_pri * H.transpose() + R;
+
+  // Check for near-singular innovation covariance — fall back to prediction if ill-conditioned
+  double det = S.determinant();
+  if (std::abs(det) < 1e-12) {
+    // Matrix is near-singular; skip update, keep prediction
+    x_post = x_pri;
+    P_post = P_pri;
+    return x_post;
+  }
+
+  K = P_pri * H.transpose() * S.inverse();
   x_post = x_pri + K * (z - h(x_pri));
-  P_post = (I - K * H) * P_pri;
+  // Joseph form for numerical stability
+  Eigen::MatrixXd IKH = I - K * H;
+  P_post = IKH * P_pri * IKH.transpose() + K * R * K.transpose();
 
   return x_post;
 }

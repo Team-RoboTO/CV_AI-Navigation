@@ -1,64 +1,50 @@
-#ifndef ARMOR_DETECTOR__ARMOR_HPP_
-#define ARMOR_DETECTOR__ARMOR_HPP_
+// Copyright 2022 Chen Jun
+// Licensed under the MIT License.
+
+#ifndef ARMOR_TRACKER__ARMOR_HPP_
+#define ARMOR_TRACKER__ARMOR_HPP_
 
 #include <opencv2/core.hpp>
 
-// STL
-#include <algorithm>
 #include <string>
 
 namespace rm_auto_aim
 {
-const int RED = 0;
-const int BLUE = 1;
 
-enum class ArmorType { SMALL, LARGE, INVALID };
-const std::string ARMOR_TYPE_STR[3] = {"small", "large", "invalid"};
+enum class ArmorType { SMALL = 0, LARGE = 1 };
 
-struct Light : public cv::Rect
+const std::string ARMOR_TYPE_STR[] = {"small", "large"};
+
+struct Light : public cv::RotatedRect
 {
   Light() = default;
-  explicit Light(cv::Rect box, cv::Point2f top, cv::Point2f bottom, int area, float tilt_angle)
-  : cv::Rect(box), top(top), bottom(bottom), tilt_angle(tilt_angle)
-  {
-    length = cv::norm(top - bottom);
-    width = area / length;
-    center = (top + bottom) / 2;
-  }
+  explicit Light(const cv::RotatedRect & rect) : cv::RotatedRect(rect) {}
 
-  int color;
-  cv::Point2f top, bottom;
-  cv::Point2f center;
-  double length;
-  double width;
-  float tilt_angle;
+  cv::Point2f top;
+  cv::Point2f bottom;
 };
 
 struct Armor
 {
-  Armor() = default;
-  Armor(const Light & l1, const Light & l2)
-  {
-    if (l1.center.x < l2.center.x) {
-      left_light = l1, right_light = l2;
-    } else {
-      left_light = l2, right_light = l1;
-    }
-    center = (left_light.center + right_light.center) / 2;
-  }
-
-  // Light pairs part
-  Light left_light, right_light;
-  cv::Point2f center;
+  Light left_light;
+  Light right_light;
   ArmorType type;
-
-  // Number part
-  cv::Mat number_img;
+  cv::Point2f center;
   std::string number;
-  float confidence;
   std::string classfication_result;
+  float confidence;
 };
 
 }  // namespace rm_auto_aim
 
-#endif  // ARMOR_DETECTOR__ARMOR_HPP_
+// Also expose in the armor_detector namespace so that pnp_solver.hpp
+// (which includes "armor_detector/armor.hpp") resolves the same types.
+namespace armor_detector
+{
+using rm_auto_aim::ArmorType;
+using rm_auto_aim::ARMOR_TYPE_STR;
+using rm_auto_aim::Light;
+using rm_auto_aim::Armor;
+}  // namespace armor_detector
+
+#endif  // ARMOR_TRACKER__ARMOR_HPP_

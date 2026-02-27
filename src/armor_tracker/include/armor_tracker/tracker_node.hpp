@@ -43,13 +43,17 @@ private:
   // Maximum allowable armor distance in the XOY plane
   double max_armor_distance_;
 
+  // PnP light-bar corner correction factor
+  double light_ratio_;
+
   // The time when the last message was received
   rclcpp::Time last_time_;
-  double dt_;
+  double dt_ = 1.0 / 30.0;
 
   // Armor tracker
   double s2qxyz_, s2qyaw_, s2qr_;
-  double r_xyz_factor, r_yaw;
+  double r_xyz_base_, r_xyz_slope_;   // R_pos(d) = (base + slope*d)²
+  double r_yaw_base_, r_yaw_slope_;   // R_yaw(d) = (base + slope*d)²
   double lost_time_thres_;
   std::unique_ptr<Tracker> tracker_;
 

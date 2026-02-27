@@ -1,8 +1,8 @@
 // Copyright 2022 Chen Jun
 // Licensed under the MIT License.
 
-#ifndef ARMOR_DETECTOR__PNP_SOLVER_HPP_
-#define ARMOR_DETECTOR__PNP_SOLVER_HPP_
+#ifndef ARMOR_TRACKER__PNP_SOLVER_HPP_
+#define ARMOR_TRACKER__PNP_SOLVER_HPP_
 
 #include <geometry_msgs/msg/point.hpp>
 #include <opencv2/core.hpp>
@@ -45,4 +45,4 @@ private:
 
 }  // namespace rm_auto_aim
 
-#endif  // ARMOR_DETECTOR__PNP_SOLVER_HPP_
+#endif  // ARMOR_TRACKER__PNP_SOLVER_HPP_

@@ -29,6 +29,9 @@ public:
   // Update the estimated state based on measurement
   Eigen::MatrixXd update(const Eigen::VectorXd & z);
 
+  // Get posterior variance of a single state element
+  double getVariance(int idx) const { return P_post(idx, idx); }
+
 private:
   // Process nonlinear vector function
   VecVecFunc f;

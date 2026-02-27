@@ -11,8 +11,7 @@ find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(auto_aim_interfaces REQUIRED)
 find_package(geometry_msgs REQUIRED)
-find_package(tf2 REQUIRED)
-find_package(tf2_geometry_msgs REQUIRED)
+find_package(angles REQUIRED)
 find_package(visualization_msgs REQUIRED)
 
 add_library(${PROJECT_NAME} SHARED
@@ -30,8 +29,7 @@ ament_target_dependencies(${PROJECT_NAME}
   rclcpp_components
   auto_aim_interfaces
   geometry_msgs
-  tf2
-  tf2_geometry_msgs
+  angles
   visualization_msgs
 )
 

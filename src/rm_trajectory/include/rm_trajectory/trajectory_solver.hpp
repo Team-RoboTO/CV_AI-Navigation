@@ -30,9 +30,15 @@ private:
 
   // Parameters
   double bullet_speed_;
-  double gravity_;   // Gravity acceleration
-  double k_;         // Air resistance coefficient
-  double time_bias_; // System latency compensation
+  double gravity_;         // Gravity acceleration
+  double k_;               // Air resistance coefficient
+  double time_bias_;       // Adaptive latency compensation (EMA)
+  double time_bias_alpha_; // EMA smoothing factor for time_bias_
+  double min_fire_dist_;   // Minimum engagement range (metres)
+  double max_fire_dist_;   // Maximum engagement range (metres)
+  double max_spin_rate_;              // Slow-target gate: block if |v_yaw| >= this (rad/s)
+  double min_spin_rate_for_predictor_; // Above this, use armor-window predictor (rad/s)
+  double angular_window_;             // Half-width of armor face window (rad)
 
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr twist_pub_;
 };

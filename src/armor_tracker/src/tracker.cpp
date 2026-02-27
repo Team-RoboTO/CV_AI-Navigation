@@ -13,9 +13,6 @@
 #include <memory>
 #include <string>
 
-// TODO: v_b t_f = |\vec{s_0}+\vec{v}t|
-// TODO: assess whether or not I have to integrate air resistance
-// TODO: integrate ballistics.
 namespace rm_auto_aim
 {
 Tracker::Tracker(double max_match_distance, double max_match_yaw_diff)
@@ -83,7 +80,8 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
         if (position_diff < min_position_diff) {
           // Find the closest armor
           min_position_diff = position_diff;
-          yaw_diff = abs(orientationToYaw(armor.pose.orientation) - ekf_prediction(6));
+          double measured_yaw = orientationToYaw(armor.pose.orientation);
+          yaw_diff = std::abs(angles::shortest_angular_distance(ekf_prediction(6), measured_yaw));
           tracked_armor = armor;
         }
       }
@@ -119,6 +117,14 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
     ekf.setState(target_state);
   } else if (target_state(8) > 0.4) {
     target_state(8) = 0.4;
+    ekf.setState(target_state);
+  }
+
+  // Clamp v_yaw to physically plausible range.
+  // RoboMaster robots cannot spin faster than ~15 rad/s (~143 rpm);
+  // values beyond this indicate EKF divergence from a bad detection.
+  if (std::abs(target_state(7)) > 15.0) {
+    target_state(7) = std::copysign(15.0, target_state(7));
     ekf.setState(target_state);
   }
 
@@ -181,11 +187,27 @@ void Tracker::updateArmorsNum(const Armor & armor)
   } else {
     tracked_armors_num = ArmorsNum::NORMAL_4;
   }
+
+  // Adjust yaw jump threshold to match the geometric spacing of this robot's armors.
+  // Using (inter-armor angle) minus a 0.3 rad margin to avoid false positives mid-spin.
+  switch (tracked_armors_num) {
+    case ArmorsNum::BALANCE_2:  max_match_yaw_diff_ = M_PI - 0.3;         break;  // ~150°
+    case ArmorsNum::OUTPOST_3:  max_match_yaw_diff_ = 2.0 * M_PI / 3.0 - 0.3;  break;  // ~90°
+    default:  /* NORMAL_4 */    max_match_yaw_diff_ = M_PI / 2.0 - 0.3;   break;  // ~60°
+  }
 }
 
 void Tracker::handleArmorJump(const Armor & current_armor)
 {
   double yaw = orientationToYaw(current_armor.pose.orientation);
+  // Check if jump direction agrees with current v_yaw.
+  // If the robot reversed spin, v_yaw sign will disagree with the jump direction.
+  double jump_direction = angles::shortest_angular_distance(target_state(6), yaw);
+  if (jump_direction * target_state(7) < 0) {
+    // Spin reversal detected — zero v_yaw to prevent EKF from extrapolating in wrong direction
+    target_state(7) = 0.0;
+    RCLCPP_WARN(rclcpp::get_logger("armor_tracker"), "Spin reversal — v_yaw zeroed");
+  }
   target_state(6) = yaw;
   updateArmorsNum(current_armor);
   // Only 4 armors has 2 radius and height

@@ -1,7 +1,12 @@
 #include "armor_tracker/tracker_node.hpp"
 
+#include "armor_tracker/armor.hpp"
+
 // STD
+#include <algorithm>
+#include <cmath>
 #include <memory>
+#include <string>
 #include <vector>
 #include <opencv2/calib3d.hpp>
 
@@ -15,6 +20,10 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   // Maximum allowable armor distance in the XOY plane
   max_armor_distance_ = this->declare_parameter("max_armor_distance", 10.0);
 
+  // PnP light-bar corner correction: scale bbox half-width inward to match
+  // actual light-bar separation (tune empirically via /tracker/info yaw_diff)
+  light_ratio_ = this->declare_parameter("light_ratio", 0.85);
+
   // Tracker
   double max_match_distance = this->declare_parameter("tracker.max_match_distance", 0.15);
   double max_match_yaw_diff = this->declare_parameter("tracker.max_match_yaw_diff", 1.0);
@@ -26,28 +35,34 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   // xa = x_armor, xc = x_robot_center
   // state: xc, v_xc, yc, v_yc, za, v_za, yaw, v_yaw, r
   // measurement: xa, ya, za, yaw
+  // v_yaw damping: models friction-induced spin deceleration (alpha^(dt/T))
+  // alpha=0.98 at 30Hz ≈ half-life ~1.1s — prevents indefinite spin extrapolation
+  double yaw_damping_alpha = declare_parameter("ekf.yaw_damping_alpha", 0.98);
   // f - Process function
-  auto f = [this](const Eigen::VectorXd & x) {
+  auto f = [this, yaw_damping_alpha](const Eigen::VectorXd & x) {
     Eigen::VectorXd x_new = x;
     x_new(0) += x(1) * dt_;
     x_new(2) += x(3) * dt_;
     x_new(4) += x(5) * dt_;
-    x_new(6) += x(7) * dt_;
+    double damped_vyaw = x(7) * std::pow(yaw_damping_alpha, dt_ / (1.0 / 30.0));
+    x_new(6) += damped_vyaw * dt_;
+    x_new(7) = damped_vyaw;
     return x_new;
   };
   // J_f - Jacobian of process function
-  auto j_f = [this](const Eigen::VectorXd &) {
+  auto j_f = [this, yaw_damping_alpha](const Eigen::VectorXd &) {
+    double a = std::pow(yaw_damping_alpha, dt_ / (1.0 / 30.0));
     Eigen::MatrixXd f(9, 9);
     // clang-format off
-    f <<  1,   dt_, 0,   0,   0,   0,   0,   0,   0,
-          0,   1,   0,   0,   0,   0,   0,   0,   0,
-          0,   0,   1,   dt_, 0,   0,   0,   0,   0, 
-          0,   0,   0,   1,   0,   0,   0,   0,   0,
-          0,   0,   0,   0,   1,   dt_, 0,   0,   0,
-          0,   0,   0,   0,   0,   1,   0,   0,   0,
-          0,   0,   0,   0,   0,   0,   1,   dt_, 0,
-          0,   0,   0,   0,   0,   0,   0,   1,   0,
-          0,   0,   0,   0,   0,   0,   0,   0,   1;
+    f <<  1,   dt_, 0,   0,   0,   0,   0,   0,      0,
+          0,   1,   0,   0,   0,   0,   0,   0,      0,
+          0,   0,   1,   dt_, 0,   0,   0,   0,      0,
+          0,   0,   0,   1,   0,   0,   0,   0,      0,
+          0,   0,   0,   0,   1,   dt_, 0,   0,      0,
+          0,   0,   0,   0,   0,   1,   0,   0,      0,
+          0,   0,   0,   0,   0,   0,   1,   a*dt_,  0,
+          0,   0,   0,   0,   0,   0,   0,   a,      0,
+          0,   0,   0,   0,   0,   0,   0,   0,      1;
     // clang-format on
     return f;
   };
@@ -66,23 +81,23 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
     Eigen::MatrixXd h(4, 9);
     double yaw = x(6), r = x(8);
     // clang-format off
-    //    xc   v_xc yc   v_yc za   v_za yaw         v_yaw r
-    h <<  1,   0,   0,   0,   0,   0,   r*sin(yaw), 0,   -cos(yaw),
-          0,   0,   1,   0,   0,   0,   -r*cos(yaw),0,   -sin(yaw),
-          0,   0,   0,   0,   1,   0,   0,          0,   0,
-          0,   0,   0,   0,   0,   0,   1,          0,   0;
+    //    xc   v_xc yc   v_yc za   v_za yaw          v_yaw r
+    h <<  1,   0,   0,   0,   0,   0,   r*sin(yaw),  0,   -cos(yaw),
+          0,   0,   1,   0,   0,   0,  -r*cos(yaw),  0,   -sin(yaw),
+          0,   0,   0,   0,   1,   0,   0,            0,   0,
+          0,   0,   0,   0,   0,   0,   1,            0,   0;
     // clang-format on
     return h;
   };
   // update_Q - process noise covariance matrix
-  s2qxyz_ = declare_parameter("ekf.sigma2_q_xyz", 20.0);
-  s2qyaw_ = declare_parameter("ekf.sigma2_q_yaw", 100.0);
-  s2qr_ = declare_parameter("ekf.sigma2_q_r", 800.0);
+  s2qxyz_ = declare_parameter("ekf.sigma2_q_xyz", 5.0);
+  s2qyaw_ = declare_parameter("ekf.sigma2_q_yaw", 10.0);
+  s2qr_   = declare_parameter("ekf.sigma2_q_r",   2.0);
   auto u_q = [this]() {
     Eigen::MatrixXd q(9, 9);
     double t = dt_, x = s2qxyz_, y = s2qyaw_, r = s2qr_;
     double q_x_x = pow(t, 4) / 4 * x, q_x_vx = pow(t, 3) / 2 * x, q_vx_vx = pow(t, 2) * x;
-    double q_y_y = pow(t, 4) / 4 * y, q_y_vy = pow(t, 3) / 2 * x, q_vy_vy = pow(t, 2) * y;
+    double q_y_y = pow(t, 4) / 4 * y, q_y_vy = pow(t, 3) / 2 * y, q_vy_vy = pow(t, 2) * y;
     double q_r = pow(t, 4) / 4 * r;
     // clang-format off
     //    xc      v_xc    yc      v_yc    za      v_za    yaw     v_yaw   r
@@ -98,18 +113,23 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
     // clang-format on
     return q;
   };
-  // update_R - measurement noise covariance matrix
-  r_xyz_factor = declare_parameter("ekf.r_xyz_factor", 0.05);
-  r_yaw = declare_parameter("ekf.r_yaw", 0.02);
+  // update_R - distance-dependent measurement noise covariance matrix
+  r_xyz_base_  = declare_parameter("ekf.r_xyz_base",  0.005);
+  r_xyz_slope_ = declare_parameter("ekf.r_xyz_slope", 0.03);
+  r_yaw_base_  = declare_parameter("ekf.r_yaw_base",  0.015);
+  r_yaw_slope_ = declare_parameter("ekf.r_yaw_slope", 0.002);
   auto u_r = [this](const Eigen::VectorXd & z) {
     Eigen::DiagonalMatrix<double, 4> r;
-    double x = r_xyz_factor;
-    r.diagonal() << abs(x * z[0]), abs(x * z[1]), abs(x * z[2]), r_yaw;
+    double dist = std::sqrt(z[0]*z[0] + z[1]*z[1] + z[2]*z[2]);
+    double ps = r_xyz_base_ + r_xyz_slope_ * dist;
+    double ys = r_yaw_base_ + r_yaw_slope_ * dist;
+    r.diagonal() << ps*ps, ps*ps, ps*ps, ys*ys;
     return r;
   };
-  // P - error estimate covariance matrix
+  // P - initial error covariance
   Eigen::DiagonalMatrix<double, 9> p0;
-  p0.setIdentity();
+  //       xc    v_xc  yc    v_yc  za    v_za  yaw   v_yaw  r
+  p0.diagonal() << 0.1, 1.0, 0.1, 1.0, 0.1, 0.2, 0.1, 3.0, 0.003;
   tracker_->ekf = ExtendedKalmanFilter{f, h, j_f, j_h, u_q, u_r, p0};
 
   // Reset tracker service
@@ -153,9 +173,11 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   // Measurement publisher (for debug usage)
   info_pub_ = this->create_publisher<auto_aim_interfaces::msg::TrackerInfo>("/tracker/info", 10);
 
-  // Publisher
+  // Publisher — RELIABLE so the trajectory solver never misses a target update
+  auto target_qos = rclcpp::SensorDataQoS()
+    .reliability(rclcpp::ReliabilityPolicy::Reliable);
   target_pub_ = this->create_publisher<auto_aim_interfaces::msg::Target>(
-    "/tracker/target", rclcpp::SensorDataQoS());
+    "/tracker/target", target_qos);
 
   // Optimal BBox Publisher
   optimal_bbox_pub_ = this->create_publisher<vision_msgs::msg::Detection2D>(
@@ -232,21 +254,27 @@ void ArmorTrackerNode::armorsCallback(
     // Set classification result for debug
     armor_obj.classfication_result = armor_obj.number;
 
-    // Construct lights (approximated)
+    // Construct lights (approximated from bbox).
+    // YOLO bbox edges overshoot the actual light-bar centers by ~15% due to
+    // padding and the non-light area between the bars. Scale inward to reduce
+    // the systematic PnP yaw/position bias (~8 cm at 5 m without correction).
+    const float light_ratio = static_cast<float>(light_ratio_);
+    const float lx = center_x - light_ratio * width / 2;
+    const float rx = center_x + light_ratio * width / 2;
+
     // Left light
-    armor_obj.left_light.center = cv::Point2f(center_x - width / 2, center_y);
-    // armor_obj.left_light.size = cv::Size2f(width / 10, height);  // assume light width is small
-    // armor_obj.left_light.angle = 90;                             // upright
-    // Calculate light corners (top/bottom)
-    armor_obj.left_light.top = cv::Point2f(center_x - width / 2, center_y - height / 2);
-    armor_obj.left_light.bottom = cv::Point2f(center_x - width / 2, center_y + height / 2);
+    armor_obj.left_light.center = cv::Point2f(lx, center_y);
+    armor_obj.left_light.size = cv::Size2f(width / 10, height);
+    armor_obj.left_light.angle = 90;
+    armor_obj.left_light.top    = cv::Point2f(lx, center_y - height / 2);
+    armor_obj.left_light.bottom = cv::Point2f(lx, center_y + height / 2);
 
     // Right light
-    armor_obj.right_light.center = cv::Point2f(center_x + width / 2, center_y);
-    // armor_obj.right_light.size = cv::Size2f(width / 10, height);
-    // armor_obj.right_light.angle = 90;
-    armor_obj.right_light.top = cv::Point2f(center_x + width / 2, center_y - height / 2);
-    armor_obj.right_light.bottom = cv::Point2f(center_x + width / 2, center_y + height / 2);
+    armor_obj.right_light.center = cv::Point2f(rx, center_y);
+    armor_obj.right_light.size = cv::Size2f(width / 10, height);
+    armor_obj.right_light.angle = 90;
+    armor_obj.right_light.top    = cv::Point2f(rx, center_y - height / 2);
+    armor_obj.right_light.bottom = cv::Point2f(rx, center_y + height / 2);
 
     cv::Mat rvec, tvec;
     bool success = pnp_solver_->solvePnP(armor_obj, rvec, tvec);
@@ -289,24 +317,13 @@ void ArmorTrackerNode::armorsCallback(
     ps.pose = armor.pose;
     try {
       armor.pose = tf2_buffer_->transform(ps, target_frame_).pose;
-    } catch (const tf2::ExtrapolationException & ex) {
-      RCLCPP_ERROR(get_logger(), "Error while transforming %s", ex.what());
+    } catch (const tf2::TransformException & ex) {
+      RCLCPP_ERROR(get_logger(), "TF2 error: %s", ex.what());
       return;
     }
   }
 
-  // Filter abnormal armors
-  armors_ptr->armors.erase(
-    std::remove_if(
-      armors_ptr->armors.begin(), armors_ptr->armors.end(),
-      [this, &detection_indices](const auto_aim_interfaces::msg::Armor & armor) {
-        // We need to keep detection_indices in sync. remove_if combined with erase is hard to sync.
-        // So we use a manual loop instead.
-        return false;
-      }),
-    armors_ptr->armors.end());
-
-  // Manual filter to keep sync
+  // Filter abnormal armors (keep detection_indices in sync)
   auto & armors_vec = armors_ptr->armors;
   for (size_t i = 0; i < armors_vec.size(); /* no increment */) {
     auto & armor = armors_vec[i];
@@ -332,22 +349,20 @@ void ArmorTrackerNode::armorsCallback(
     tracker_->init(armors_ptr);
     target_msg.tracking = false;
   } else {
-    dt_ = (time - last_time_).seconds();
-    if (dt_ < 1e-9) {
-      // Avoid division by zero or extremely small dt causing overflow
-      return;
-    }
+    dt_ = std::min(std::max((time - last_time_).seconds(), 0.01), 0.10);
     tracker_->lost_thres = static_cast<int>(lost_time_thres_ / dt_);
     tracker_->update(armors_ptr);
 
-    // Publish Info
+    // Publish info
     info_msg.position_diff = tracker_->info_position_diff;
-    info_msg.yaw_diff = tracker_->info_yaw_diff;
-    info_msg.position.x = tracker_->measurement(0);
-    info_msg.position.y = tracker_->measurement(1);
-    info_msg.position.z = tracker_->measurement(2);
-    info_msg.yaw = tracker_->measurement(3);
+    info_msg.yaw_diff      = tracker_->info_yaw_diff;
+    info_msg.position.x    = tracker_->measurement(0);
+    info_msg.position.y    = tracker_->measurement(1);
+    info_msg.position.z    = tracker_->measurement(2);
+    info_msg.yaw           = tracker_->measurement(3);
     info_pub_->publish(info_msg);
+
+    target_msg.tracker_state = static_cast<uint8_t>(tracker_->tracker_state);
 
     if (tracker_->tracker_state == Tracker::DETECTING) {
       target_msg.tracking = false;
@@ -355,9 +370,8 @@ void ArmorTrackerNode::armorsCallback(
       tracker_->tracker_state == Tracker::TRACKING ||
       tracker_->tracker_state == Tracker::TEMP_LOST) {
       target_msg.tracking = true;
-      // Fill target message
       const auto & state = tracker_->target_state;
-      target_msg.id = tracker_->tracked_id;
+      target_msg.id         = tracker_->tracked_id;
       target_msg.armors_num = static_cast<int>(tracker_->tracked_armors_num);
       target_msg.position.x = state(0);
       target_msg.velocity.x = state(1);
@@ -365,11 +379,12 @@ void ArmorTrackerNode::armorsCallback(
       target_msg.velocity.y = state(3);
       target_msg.position.z = state(4);
       target_msg.velocity.z = state(5);
-      target_msg.yaw = state(6);
-      target_msg.v_yaw = state(7);
-      target_msg.radius_1 = state(8);
-      target_msg.radius_2 = tracker_->another_r;
-      target_msg.dz = tracker_->dz;
+      target_msg.yaw        = state(6);
+      target_msg.v_yaw      = state(7);
+      target_msg.radius_1   = state(8);
+      target_msg.radius_2   = tracker_->another_r;
+      target_msg.dz         = tracker_->dz;
+      target_msg.v_yaw_variance = tracker_->ekf.getVariance(7);
     }
   }
 
@@ -377,9 +392,8 @@ void ArmorTrackerNode::armorsCallback(
   vision_msgs::msg::Detection2D optimal_bbox;
   optimal_bbox.header = detection_msg->header;
   if (target_msg.tracking) {
-    // Find the tracked armor in the armor list
-    size_t matched_idx = -1;
-    double min_dist = 1e-3;  // strict threshold
+    size_t matched_idx = static_cast<size_t>(-1);
+    double min_dist = 1e-3;
     for (size_t i = 0; i < armors_ptr->armors.size(); i++) {
       const auto & armor = armors_ptr->armors[i];
       double dx = armor.pose.position.x - tracker_->tracked_armor.pose.position.x;
@@ -391,8 +405,7 @@ void ArmorTrackerNode::armorsCallback(
         break;
       }
     }
-
-    if (matched_idx != (size_t)-1) {
+    if (matched_idx != static_cast<size_t>(-1)) {
       size_t original_detection_idx = detection_indices[matched_idx];
       if (original_detection_idx < detection_msg->detections.size()) {
         optimal_bbox = detection_msg->detections[original_detection_idx];

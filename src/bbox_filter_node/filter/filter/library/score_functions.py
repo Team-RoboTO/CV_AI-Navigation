@@ -4,11 +4,27 @@ from math import sqrt
 # --- Ideal Aspect Ratios for Robomaster Armor Plates ---
 # Small armor: ~55mm height, 135mm width -> aspect ratio ~2.45
 # Large armor: ~55mm height, 225mm width -> aspect ratio ~4.09
-# We can use these as a reference.
 IDEAL_ASPECT_RATIO_SMALL = 2.45
 IDEAL_ASPECT_RATIO_LARGE = 4.09
 
-def _get_centered(detection: Detection2D, image_width: int, image_height: int) -> float:
+
+def _get_close(detection: Detection2D) -> float:
+    """
+    Computes a score based on the 3D distance to the detected armor.
+    Closer targets score higher (closer to 0), far targets score lower (towards -1).
+    Returns a value in [-1, 0].
+    """
+    if not detection.results:
+        return 0.0
+    pos = detection.results[0].pose.pose.position
+    dist = sqrt(pos.x ** 2 + pos.y ** 2 + pos.z ** 2)
+    # Normalize: 0m -> 0, 10m -> -1
+    max_dist = 10.0
+    score = -min(dist / max_dist, 1.0)
+    return score
+
+
+def _get_centered(detection: Detection2D, image_width: int = 640, image_height: int = 480) -> float:
     """
     Computes a score based on the detection's distance from the image center.
     A lower distance results in a higher score (closer to 0).
@@ -21,27 +37,26 @@ def _get_centered(detection: Detection2D, image_width: int, image_height: int) -
 
     dist = sqrt((x - center_x) ** 2 + (y - center_y) ** 2)
     max_dist = sqrt(center_x**2 + center_y**2)
-    
+
     # Normalize to a range of [-1, 0]
     score = -dist / max_dist
     return score
 
 
-def _get_wide(detection: Detection2D, image_width: int, image_height: int) -> float:
+def _get_wide(detection: Detection2D, image_width: int = 640, image_height: int = 480) -> float:
     """
     Computes a score based on the bounding box area.
     A larger area results in a higher score.
     The score is positive, ranging from 0 to 1.
     """
     width = detection.bbox.size_x  # width
-    height = detection.bbox.size_y # height
+    height = detection.bbox.size_y  # height
     wide = width * height
     max_area = image_width * image_height
-    
+
     # Normalize to a range of [0, 1]
     score = wide / max_area
     return score
-
 
 
 def _get_fract_sizes(detection: Detection2D) -> float:
@@ -52,7 +67,7 @@ def _get_fract_sizes(detection: Detection2D) -> float:
     Score is in range [0, 1].
     """
     width = detection.bbox.size_x  # width
-    height = detection.bbox.size_y # height
+    height = detection.bbox.size_y  # height
 
     if height == 0:
         return 0.0
@@ -70,4 +85,3 @@ def _get_fract_sizes(detection: Detection2D) -> float:
     # We use an exponential decay to penalize deviations more sharply.
     score = (1.0 - min_error) ** 2 if min_error <= 1.0 else 0.0
     return score
-    
