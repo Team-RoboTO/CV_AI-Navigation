@@ -3,3 +3,8 @@
 /workspace.xml
 # Editor-based HTTP Client requests
 /httpRequests/
+/build/
+/install/
+/log/
+/run/
+/tmp/
