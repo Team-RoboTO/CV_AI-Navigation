@@ -26,7 +26,7 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
 
   // Tracker
   double max_match_distance = this->declare_parameter("tracker.max_match_distance", 0.15);
-  double max_match_yaw_diff = this->declare_parameter("tracker.max_match_yaw_diff", 1.0);
+  double max_match_yaw_diff = this->declare_parameter("tracker.max_match_yaw_diff", 3);
   tracker_ = std::make_unique<Tracker>(max_match_distance, max_match_yaw_diff);
   tracker_->tracking_thres = this->declare_parameter("tracker.tracking_thres", 5);
   lost_time_thres_ = this->declare_parameter("tracker.lost_time_thres", 0.3);
@@ -407,6 +407,20 @@ void ArmorTrackerNode::armorsCallback(
 
   // Filter abnormal armors (keep detection_indices in sync)
   auto & armors_vec = armors_ptr->armors;
+
+  // Log yaw for all detections (debug)
+  for (size_t i = 0; i < armors_vec.size(); i++) {
+    const auto & a = armors_vec[i];
+    tf2::Quaternion q;
+    tf2::fromMsg(a.pose.orientation, q);
+    double roll, pitch, yaw;
+    tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
+    RCLCPP_INFO(get_logger(),
+      "Det[%zu] id=%s yaw=%.3f pos=(%.2f, %.2f, %.2f)",
+      i, a.number.c_str(), yaw,
+      a.pose.position.x, a.pose.position.y, a.pose.position.z);
+  }
+
   for (size_t i = 0; i < armors_vec.size(); /* no increment */) {
     auto & armor = armors_vec[i];
     if (

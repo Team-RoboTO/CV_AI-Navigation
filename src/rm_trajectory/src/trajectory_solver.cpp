@@ -140,7 +140,7 @@ void TrajectorySolverNode::targetCallback(
   // Acceleration estimation (EMA over velocity differences)
   double ax = 0.0, ay = 0.0, az = 0.0;
   if (has_prev_target_) {
-    double dt_tgt = (msg->header.stamp - prev_target_time_).seconds();
+    double dt_tgt = (rclcpp::Time(msg->header.stamp) - prev_target_time_).seconds();
     if (dt_tgt > 0.005 && dt_tgt < 0.2) {
       auto clamp = [this](double val) {
         return std::max(-max_accel_, std::min(val, max_accel_));

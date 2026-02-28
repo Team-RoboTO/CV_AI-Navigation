@@ -206,7 +206,7 @@ def generate_launch_description():
         package='isaac_ros_dnn_image_encoder',
         plugin='nvidia::isaac_ros::dnn_inference::DnnImageEncoderNode',
         remappings=[('encoded_tensor', 'tensor_pub'),
-                    ('image', '/image')],
+                    ('image', '/camera/camera/color/image_raw')],
         parameters=[{
             'input_image_width': 640,
             'input_image_height': 480,
@@ -265,13 +265,13 @@ def generate_launch_description():
         name='armor_tracker',
         remappings=[
             ('/detector/armors', '/detections_output'),
-            ('/camera_info', '/camera_info')
+            ('/camera_info', '/camera/camera/color/camera_info')
         ],
         parameters=[
             {'target_frame': 'odom'},
             {'max_armor_distance': 10.0},
             {'tracker.max_match_distance': 0.60},
-            {'tracker.max_match_yaw_diff': 2.0},
+            {'tracker.max_match_yaw_diff': 3},
             {'tracker.tracking_thres': 2},
             {'tracker.lost_time_thres': 1.0},
             # EKF parameters

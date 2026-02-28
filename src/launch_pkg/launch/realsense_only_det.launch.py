@@ -123,7 +123,7 @@ def generate_launch_description():
         name='armor_tracker',
         remappings=[
             ('/detector/armors', '/detections_output'),
-            ('/camera_info', '/color/camera_info')
+            ('/camera_info', '/camera/camera/color/camera_info')
         ],
         parameters=[
             {'target_frame': 'odom'},
