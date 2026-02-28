@@ -52,13 +52,15 @@ public:
 
   double info_position_diff;
   double info_yaw_diff;
+  double info_yaw_innov_signed = 0.0;
+  Eigen::Vector3d info_position_innov = Eigen::Vector3d::Zero();
 
   Eigen::VectorXd measurement;
 
   Eigen::VectorXd target_state;
 
   // To store another pair of armors message
-  double dz, another_r;
+  double dz = 0.0, another_r = 0.26;
 
 private:
   void initEKF(const Armor & a);
@@ -74,10 +76,10 @@ private:
   double max_match_distance_;
   double max_match_yaw_diff_;
 
-  int detect_count_;
-  int lost_count_;
+  int detect_count_ = 0;
+  int lost_count_ = 0;
 
-  double last_yaw_;
+  double last_yaw_ = 0.0;
 };
 
 }  // namespace rm_auto_aim

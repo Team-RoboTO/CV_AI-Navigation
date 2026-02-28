@@ -18,6 +18,8 @@ namespace rm_auto_aim
 Tracker::Tracker(double max_match_distance, double max_match_yaw_diff)
 : tracker_state(LOST),
   tracked_id(std::string("")),
+  info_position_diff(0.0),
+  info_yaw_diff(0.0),
   measurement(Eigen::VectorXd::Zero(4)),
   target_state(Eigen::VectorXd::Zero(9)),
   max_match_distance_(max_match_distance),
@@ -67,6 +69,7 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
     auto predicted_position = getArmorPositionFromState(ekf_prediction);
     double min_position_diff = DBL_MAX;
     double yaw_diff = DBL_MAX;
+    double yaw_innov_signed = 0.0;
     for (const auto & armor : armors_msg->armors) {
       // Only consider armors with the same id
       if (armor.number == tracked_id) {
@@ -81,15 +84,21 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
           // Find the closest armor
           min_position_diff = position_diff;
           double measured_yaw = orientationToYaw(armor.pose.orientation);
-          yaw_diff = std::abs(angles::shortest_angular_distance(ekf_prediction(6), measured_yaw));
+          yaw_innov_signed = angles::shortest_angular_distance(ekf_prediction(6), measured_yaw);
+          yaw_diff = std::abs(yaw_innov_signed);
           tracked_armor = armor;
         }
       }
     }
 
-    // Store tracker info
-    info_position_diff = min_position_diff;
-    info_yaw_diff = yaw_diff;
+    // Store tracker info (only update when we found same-id armors)
+    if (same_id_armors_count > 0) {
+      info_position_diff = min_position_diff;
+      info_yaw_diff = yaw_diff;
+      info_yaw_innov_signed = yaw_innov_signed;
+      auto p = tracked_armor.pose.position;
+      info_position_innov = Eigen::Vector3d(p.x, p.y, p.z) - predicted_position;
+    }
 
     // Check if the distance and yaw difference of closest armor are within the threshold
     if (min_position_diff < max_match_distance_ && yaw_diff < max_match_yaw_diff_) {
@@ -105,6 +114,7 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
       // Matched armor not found, but there is only one armor with the same id
       // and yaw has jumped, take this case as the target is spinning and armor jumped
       handleArmorJump(same_id_armor);
+      matched = true;
     } else {
       // No matched armor found
       RCLCPP_WARN(rclcpp::get_logger("armor_tracker"), "No matched armor found!");
@@ -126,6 +136,8 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
   if (std::abs(target_state(7)) > 15.0) {
     target_state(7) = std::copysign(15.0, target_state(7));
     ekf.setState(target_state);
+    ekf.resetCovariance();
+    RCLCPP_WARN(rclcpp::get_logger("armor_tracker"), "v_yaw clamped — covariance reset");
   }
 
   // Tracking state machine
@@ -215,7 +227,9 @@ void Tracker::handleArmorJump(const Armor & current_armor)
     dz = target_state(4) - current_armor.pose.position.z;
     target_state(4) = current_armor.pose.position.z;
     std::swap(target_state(8), another_r);
+    another_r = std::max(0.12, std::min(another_r, 0.4));
   }
+  info_yaw_innov_signed = 0.0;
   RCLCPP_WARN(rclcpp::get_logger("armor_tracker"), "Armor jump!");
 
   // If position difference is larger than max_match_distance_,
@@ -231,6 +245,7 @@ void Tracker::handleArmorJump(const Armor & current_armor)
     target_state(3) = 0;                   // vyc
     target_state(4) = p.z;                 // za
     target_state(5) = 0;                   // vza
+    ekf.resetCovariance();
     RCLCPP_ERROR(rclcpp::get_logger("armor_tracker"), "Reset State!");
   }
 

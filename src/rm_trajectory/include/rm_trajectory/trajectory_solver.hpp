@@ -36,11 +36,21 @@ private:
   double time_bias_alpha_; // EMA smoothing factor for time_bias_
   double min_fire_dist_;   // Minimum engagement range (metres)
   double max_fire_dist_;   // Maximum engagement range (metres)
-  double max_spin_rate_;              // Slow-target gate: block if |v_yaw| >= this (rad/s)
-  double min_spin_rate_for_predictor_; // Above this, use armor-window predictor (rad/s)
   double angular_window_;             // Half-width of armor face window (rad)
 
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr twist_pub_;
+
+  // Acceleration estimation from consecutive target messages
+  bool has_prev_target_ = false;
+  rclcpp::Time prev_target_time_;
+  double prev_vx_ = 0.0, prev_vy_ = 0.0, prev_vz_ = 0.0;
+  double ax_ema_ = 0.0, ay_ema_ = 0.0, az_ema_ = 0.0;
+  double accel_ema_alpha_;
+  double max_accel_;
+
+  // Latency outlier rejection
+  double time_bias_var_ = 0.001;
+  double latency_gate_sigma_;
 };
 
 } // namespace rm_auto_aim

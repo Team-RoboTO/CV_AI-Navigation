@@ -35,34 +35,50 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   // xa = x_armor, xc = x_robot_center
   // state: xc, v_xc, yc, v_yc, za, v_za, yaw, v_yaw, r
   // measurement: xa, ya, za, yaw
-  // v_yaw damping: models friction-induced spin deceleration (alpha^(dt/T))
-  // alpha=0.98 at 30Hz ≈ half-life ~1.1s — prevents indefinite spin extrapolation
-  double yaw_damping_alpha = declare_parameter("ekf.yaw_damping_alpha", 0.98);
+  // Velocity damping: models friction/deceleration as v_new = alpha^(dt/T) * v
+  // T = 1/30 (reference period), so alpha is "per-frame decay at 30Hz"
+  // alpha=0.95 → half-life ~0.45s (linear), alpha=0.98 → half-life ~1.1s (yaw)
+  xyz_damping_alpha_base_ = declare_parameter("ekf.xyz_damping_alpha", 0.95);
+  yaw_damping_alpha_base_ = declare_parameter("ekf.yaw_damping_alpha", 0.95);
+  coast_damping_factor_   = declare_parameter("ekf.coast_damping_factor", 0.85);
+  damping_innov_threshold_ = declare_parameter("ekf.damping_innov_threshold", 0.10);
+  yaw_innov_threshold_    = declare_parameter("ekf.yaw_innov_threshold", 0.15);
+  xyz_damping_alpha_ = xyz_damping_alpha_base_;
+  yaw_damping_alpha_ = yaw_damping_alpha_base_;
   // f - Process function
-  auto f = [this, yaw_damping_alpha](const Eigen::VectorXd & x) {
+  auto f = [this](const Eigen::VectorXd & x) {
     Eigen::VectorXd x_new = x;
-    x_new(0) += x(1) * dt_;
-    x_new(2) += x(3) * dt_;
-    x_new(4) += x(5) * dt_;
-    double damped_vyaw = x(7) * std::pow(yaw_damping_alpha, dt_ / (1.0 / 30.0));
+    double b = std::pow(xyz_damping_alpha_, dt_ / (1.0 / 30.0));
+    double a = std::pow(yaw_damping_alpha_, dt_ / (1.0 / 30.0));
+    double damped_vx = x(1) * b;
+    double damped_vy = x(3) * b;
+    double damped_vz = x(5) * b;
+    double damped_vyaw = x(7) * a;
+    x_new(0) += damped_vx * dt_;
+    x_new(1) = damped_vx;
+    x_new(2) += damped_vy * dt_;
+    x_new(3) = damped_vy;
+    x_new(4) += damped_vz * dt_;
+    x_new(5) = damped_vz;
     x_new(6) += damped_vyaw * dt_;
     x_new(7) = damped_vyaw;
     return x_new;
   };
   // J_f - Jacobian of process function
-  auto j_f = [this, yaw_damping_alpha](const Eigen::VectorXd &) {
-    double a = std::pow(yaw_damping_alpha, dt_ / (1.0 / 30.0));
+  auto j_f = [this](const Eigen::VectorXd &) {
+    double b = std::pow(xyz_damping_alpha_, dt_ / (1.0 / 30.0));
+    double a = std::pow(yaw_damping_alpha_, dt_ / (1.0 / 30.0));
     Eigen::MatrixXd f(9, 9);
     // clang-format off
-    f <<  1,   dt_, 0,   0,   0,   0,   0,   0,      0,
-          0,   1,   0,   0,   0,   0,   0,   0,      0,
-          0,   0,   1,   dt_, 0,   0,   0,   0,      0,
-          0,   0,   0,   1,   0,   0,   0,   0,      0,
-          0,   0,   0,   0,   1,   dt_, 0,   0,      0,
-          0,   0,   0,   0,   0,   1,   0,   0,      0,
-          0,   0,   0,   0,   0,   0,   1,   a*dt_,  0,
-          0,   0,   0,   0,   0,   0,   0,   a,      0,
-          0,   0,   0,   0,   0,   0,   0,   0,      1;
+    f <<  1,   b*dt_, 0,   0,      0,   0,      0,   0,      0,
+          0,   b,     0,   0,      0,   0,      0,   0,      0,
+          0,   0,     1,   b*dt_,  0,   0,      0,   0,      0,
+          0,   0,     0,   b,      0,   0,      0,   0,      0,
+          0,   0,     0,   0,      1,   b*dt_,  0,   0,      0,
+          0,   0,     0,   0,      0,   b,      0,   0,      0,
+          0,   0,     0,   0,      0,   0,      1,   a*dt_,  0,
+          0,   0,     0,   0,      0,   0,      0,   a,      0,
+          0,   0,     0,   0,      0,   0,      0,   0,      1;
     // clang-format on
     return f;
   };
@@ -131,6 +147,12 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   //       xc    v_xc  yc    v_yc  za    v_za  yaw   v_yaw  r
   p0.diagonal() << 0.1, 1.0, 0.1, 1.0, 0.1, 0.2, 0.1, 3.0, 0.003;
   tracker_->ekf = ExtendedKalmanFilter{f, h, j_f, j_h, u_q, u_r, p0};
+
+  // Covariance upper bounds — safety net against P explosion during TEMP_LOST
+  Eigen::VectorXd max_cov(9);
+  //          xc    v_xc   yc    v_yc   za    v_za   yaw    v_yaw   r
+  max_cov << 1.0,  10.0,  1.0,  10.0,  1.0,  2.0,   1.0,   30.0,  0.03;
+  tracker_->ekf.max_covariance = max_cov;
 
   // Reset tracker service
   using std::placeholders::_1;
@@ -211,11 +233,66 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   armor_marker_.color.a = 1.0;
   armor_marker_.color.r = 1.0;
   marker_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("/tracker/marker", 10);
+
+  // Dynamic TF from gimbal feedback
+  tf2_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
+  gimbal_yaw_ = 0.0;
+  gimbal_pitch_ = 0.0;
+  gimbal_height_ = declare_parameter("gimbal.height", 0.5);
+  yaw_sign_      = declare_parameter("gimbal.yaw_sign", 1.0);
+  pitch_sign_    = declare_parameter("gimbal.pitch_sign", 1.0);
+  micro_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
+    "/micro_pose", rclcpp::SensorDataQoS(),
+    std::bind(&ArmorTrackerNode::microPoseCallback, this, std::placeholders::_1));
+}
+
+void ArmorTrackerNode::microPoseCallback(
+  const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg)
+{
+  // Extract gimbal angles from the lower computer.
+  // cmd_vel_subscriber stores: position.x = -pitch, position.y = -yaw (radians)
+  gimbal_yaw_   = yaw_sign_ * msg->pose.position.y;
+  gimbal_pitch_ = pitch_sign_ * msg->pose.position.x;
+  broadcastGimbalTF(msg->header.stamp);
+}
+
+void ArmorTrackerNode::broadcastGimbalTF(const rclcpp::Time & stamp)
+{
+  // T(odom → camera) = Translate(0,0,height) × R_z(yaw) × R_y(pitch) × R_convention
+  // R_convention = RPY(-π/2, 0, -π/2) matches the old static TF when yaw=pitch=0
+  tf2::Quaternion q_yaw, q_pitch, q_convention;
+  q_yaw.setRPY(0, 0, gimbal_yaw_);
+  q_pitch.setRPY(0, gimbal_pitch_, 0);
+  q_convention.setRPY(-M_PI / 2.0, 0, -M_PI / 2.0);
+
+  tf2::Quaternion q_final = q_yaw * q_pitch * q_convention;
+  q_final.normalize();
+
+  geometry_msgs::msg::TransformStamped t;
+  t.header.stamp = stamp;
+  t.header.frame_id = "odom";
+  t.child_frame_id = "camera_color_optical_frame";
+  t.transform.translation.x = 0.0;
+  t.transform.translation.y = 0.0;
+  t.transform.translation.z = gimbal_height_;
+  t.transform.rotation = tf2::toMsg(q_final);
+
+  // Write directly into our own buffer so the transform is available immediately
+  // for the lookupTransform() call later in this same callback.
+  // The broadcast still publishes on /tf for other nodes (e.g. rviz, tf2_echo).
+  tf2_buffer_->setTransform(t, "armor_tracker");
+  tf2_broadcaster_->sendTransform(t);
 }
 
 void ArmorTrackerNode::armorsCallback(
   const vision_msgs::msg::Detection2DArray::ConstSharedPtr detection_msg)
 {
+  // Always broadcast gimbal TF so the transform is available for this frame.
+  // When /micro_pose is active, angles update at 100Hz via microPoseCallback.
+  // When /micro_pose is absent or dies, this keeps TF alive at detection rate
+  // using last-known angles (0,0 at startup = old static TF equivalent).
+  broadcastGimbalTF(detection_msg->header.stamp);
+
   // Convert 2D detections to Armors message
   auto_aim_interfaces::msg::Armors armors_msg;
   armors_msg.header = detection_msg->header;
@@ -233,12 +310,17 @@ void ArmorTrackerNode::armorsCallback(
   size_t detection_idx = 0;
   for (const auto & detection : detection_msg->detections) {
     auto_aim_interfaces::msg::Armor armor_msg;
-    // Extract bbox
+    // Extract bbox (decoder outputs coordinates in real image space)
     auto center_x = detection.bbox.center.position.x;
-    // scala le coordinate y dal tensore 640x640 all'immagine reale 640x480
-    auto center_y = detection.bbox.center.position.y * 0.75; 
+    auto center_y = detection.bbox.center.position.y;
     auto width = detection.bbox.size_x;
-    auto height = detection.bbox.size_y * 0.75;
+    auto height = detection.bbox.size_y;
+
+    // Skip degenerate detections (avoids divide-by-zero below)
+    if (height < 1.0 || width < 1.0) {
+      detection_idx++;
+      continue;
+    }
 
     // Create a fake Armor object for PnP
     // We assume the bbox covers the armor lights
@@ -328,7 +410,7 @@ void ArmorTrackerNode::armorsCallback(
   for (size_t i = 0; i < armors_vec.size(); /* no increment */) {
     auto & armor = armors_vec[i];
     if (
-      abs(armor.pose.position.z) > 1.2 ||
+      std::abs(armor.pose.position.z) > 1.2 ||
       Eigen::Vector2d(armor.pose.position.x, armor.pose.position.y).norm() > max_armor_distance_) {
       armors_vec.erase(armors_vec.begin() + i);
       detection_indices.erase(detection_indices.begin() + i);
@@ -351,15 +433,63 @@ void ArmorTrackerNode::armorsCallback(
   } else {
     dt_ = std::min(std::max((time - last_time_).seconds(), 0.01), 0.10);
     tracker_->lost_thres = static_cast<int>(lost_time_thres_ / dt_);
+
+    // Adaptive velocity damping: adjust alpha based on tracker state and innovation
+    if (tracker_->tracker_state == Tracker::TRACKING) {
+      // Position: overshoot-aware damping
+      Eigen::Vector3d vel(
+        tracker_->target_state(1),
+        tracker_->target_state(3),
+        tracker_->target_state(5));
+      double speed = vel.norm();
+      double dot = tracker_->info_position_innov.dot(vel);
+      bool pos_overshoot = (dot < 0.0) && (speed > 0.3);
+
+      if (pos_overshoot) {
+        double pos_scale = std::min(tracker_->info_position_diff / damping_innov_threshold_, 1.0);
+        xyz_damping_alpha_ = 1.0 - pos_scale * (1.0 - xyz_damping_alpha_base_);
+      } else if (speed > 0.3) {
+        // Steady motion or acceleration: no damping
+        xyz_damping_alpha_ = 1.0;
+      } else {
+        xyz_damping_alpha_ = xyz_damping_alpha_base_;
+      }
+
+      // Yaw: overshoot-aware (decoupled from position)
+      double v_yaw = tracker_->target_state(7);
+      double yaw_innov = tracker_->info_yaw_innov_signed;
+      bool overshoot = (yaw_innov * v_yaw < 0) && (std::abs(v_yaw) > 0.5);
+
+      if (overshoot) {
+        double yaw_scale = std::min(tracker_->info_yaw_diff / yaw_innov_threshold_, 1.0);
+        double min_alpha = yaw_damping_alpha_base_ * coast_damping_factor_;
+        yaw_damping_alpha_ = 1.0 - yaw_scale * (1.0 - min_alpha);
+      } else if (std::abs(v_yaw) > 0.5) {
+        // Steady spin or accelerating: no damping, let EKF track freely
+        yaw_damping_alpha_ = 1.0;
+      } else {
+        // Low/no spin: base damping
+        yaw_damping_alpha_ = yaw_damping_alpha_base_;
+      }
+    } else if (tracker_->tracker_state == Tracker::TEMP_LOST) {
+      xyz_damping_alpha_ = xyz_damping_alpha_base_ * coast_damping_factor_;
+      yaw_damping_alpha_ = yaw_damping_alpha_base_ * coast_damping_factor_;
+    } else {
+      xyz_damping_alpha_ = xyz_damping_alpha_base_;
+      yaw_damping_alpha_ = yaw_damping_alpha_base_;
+    }
+
     tracker_->update(armors_ptr);
 
     // Publish info
-    info_msg.position_diff = tracker_->info_position_diff;
-    info_msg.yaw_diff      = tracker_->info_yaw_diff;
-    info_msg.position.x    = tracker_->measurement(0);
-    info_msg.position.y    = tracker_->measurement(1);
-    info_msg.position.z    = tracker_->measurement(2);
-    info_msg.yaw           = tracker_->measurement(3);
+    info_msg.position_diff    = tracker_->info_position_diff;
+    info_msg.yaw_diff         = tracker_->info_yaw_diff;
+    info_msg.position.x       = tracker_->measurement(0);
+    info_msg.position.y       = tracker_->measurement(1);
+    info_msg.position.z       = tracker_->measurement(2);
+    info_msg.yaw              = tracker_->measurement(3);
+    info_msg.xyz_damping_alpha = xyz_damping_alpha_;
+    info_msg.yaw_damping_alpha = yaw_damping_alpha_;
     info_pub_->publish(info_msg);
 
     target_msg.tracker_state = static_cast<uint8_t>(tracker_->tracker_state);
@@ -393,7 +523,7 @@ void ArmorTrackerNode::armorsCallback(
   optimal_bbox.header = detection_msg->header;
   if (target_msg.tracking) {
     size_t matched_idx = static_cast<size_t>(-1);
-    double min_dist = 1e-3;
+    double min_dist = 0.2;  // 20cm — generous enough for PnP + TF floating-point drift
     for (size_t i = 0; i < armors_ptr->armors.size(); i++) {
       const auto & armor = armors_ptr->armors[i];
       double dx = armor.pose.position.x - tracker_->tracked_armor.pose.position.x;
@@ -401,8 +531,8 @@ void ArmorTrackerNode::armorsCallback(
       double dz = armor.pose.position.z - tracker_->tracked_armor.pose.position.z;
       double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
       if (dist < min_dist) {
+        min_dist = dist;
         matched_idx = i;
-        break;
       }
     }
     if (matched_idx != static_cast<size_t>(-1)) {
@@ -489,7 +619,10 @@ void ArmorTrackerNode::publishMarkers(const auto_aim_interfaces::msg::Target & t
     angular_v_marker_.action = visualization_msgs::msg::Marker::DELETE;
 
     armor_marker_.action = visualization_msgs::msg::Marker::DELETE;
-    marker_array.markers.emplace_back(armor_marker_);
+    for (int i = 0; i < 4; i++) {
+      armor_marker_.id = i;
+      marker_array.markers.emplace_back(armor_marker_);
+    }
   }
 
   marker_array.markers.emplace_back(position_marker_);

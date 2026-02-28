@@ -24,14 +24,14 @@ class VisualizerNode(Node):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # sottoscrizioni
-        self.create_subscription(Image, '/camera/camera/color/image_raw', self.img_cb, 10)
-        self.create_subscription(CameraInfo, '/camera/camera/color/camera_info', self.info_cb, 10)
+        self.create_subscription(Image, '/image', self.img_cb, 10)
+        self.create_subscription(CameraInfo, '/camera_info', self.info_cb, 10)
         self.create_subscription(Detection2DArray, '/detections_output', self.bbox_cb, 10)
         self.create_subscription(Marker, '/trajectory/marker', self.marker_cb, 10)
         
         # publisher
         self.pub = self.create_publisher(Image, '/annotated_image', 10)
-        self.get_logger().info("debgu")
+        self.get_logger().info("VisualizerNode started")
 
     def info_cb(self, msg):
         self.camera_info = msg
@@ -57,9 +57,9 @@ class VisualizerNode(Node):
         if self.latest_detections is not None:
             for det in self.latest_detections.detections:
                 cx = int(det.bbox.center.position.x)
-                cy = int(det.bbox.center.position.y * 0.75)
+                cy = int(det.bbox.center.position.y)
                 w = int(det.bbox.size_x)
-                h = int(det.bbox.size_y * 0.75)
+                h = int(det.bbox.size_y)
                 
                 pt1 = (cx - w//2, cy - h//2)
                 pt2 = (cx + w//2, cy + h//2)

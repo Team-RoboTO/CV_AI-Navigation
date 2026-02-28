@@ -14,6 +14,7 @@ ExtendedKalmanFilter::ExtendedKalmanFilter(
   update_Q(u_q),
   update_R(u_r),
   P_post(P0),
+  P0_(P0),
   n(P0.rows()),
   I(Eigen::MatrixXd::Identity(n, n)),
   x_pri(n),
@@ -22,6 +23,8 @@ ExtendedKalmanFilter::ExtendedKalmanFilter(
 }
 
 void ExtendedKalmanFilter::setState(const Eigen::VectorXd & x0) { x_post = x0; }
+
+void ExtendedKalmanFilter::resetCovariance() { P_post = P0_; }
 
 Eigen::MatrixXd ExtendedKalmanFilter::predict()
 {
@@ -34,6 +37,17 @@ Eigen::MatrixXd ExtendedKalmanFilter::predict()
   x_post = x_pri;
   P_post = P_pri;
 
+  // Enforce covariance upper bounds to prevent P explosion during TEMP_LOST
+  if (max_covariance.size() == n) {
+    for (int i = 0; i < n; i++) {
+      if (P_post(i, i) > max_covariance(i)) {
+        double scale = std::sqrt(max_covariance(i) / P_post(i, i));
+        P_post.row(i) *= scale;
+        P_post.col(i) *= scale;
+      }
+    }
+  }
+
   return x_pri;
 }
 
@@ -43,20 +57,25 @@ Eigen::MatrixXd ExtendedKalmanFilter::update(const Eigen::VectorXd & z)
 
   Eigen::MatrixXd S = H * P_pri * H.transpose() + R;
 
-  // Check for near-singular innovation covariance — fall back to prediction if ill-conditioned
-  double det = S.determinant();
-  if (std::abs(det) < 1e-12) {
-    // Matrix is near-singular; skip update, keep prediction
+  // LDLT decomposition: O(n^2) solve, built-in positive-definiteness check
+  Eigen::LDLT<Eigen::MatrixXd> S_ldlt(S);
+  if (S_ldlt.info() != Eigen::Success || !S_ldlt.isPositive()) {
     x_post = x_pri;
     P_post = P_pri;
     return x_post;
   }
 
-  K = P_pri * H.transpose() * S.inverse();
+  // Solve S * K^T = H * P_pri for K (avoids explicit inverse)
+  K = S_ldlt.solve(H * P_pri.transpose()).transpose();
+
   x_post = x_pri + K * (z - h(x_pri));
+
   // Joseph form for numerical stability
   Eigen::MatrixXd IKH = I - K * H;
   P_post = IKH * P_pri * IKH.transpose() + K * R * K.transpose();
+
+  // Enforce symmetry to prevent drift from floating-point accumulation
+  P_post = (P_post + P_post.transpose()) * 0.5;
 
   return x_post;
 }

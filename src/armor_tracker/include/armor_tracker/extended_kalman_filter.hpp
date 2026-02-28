@@ -23,6 +23,9 @@ public:
   // Set the initial state
   void setState(const Eigen::VectorXd & x0);
 
+  // Reset P_post to initial covariance (call after hard state resets)
+  void resetCovariance();
+
   // Compute a predicted state
   Eigen::MatrixXd predict();
 
@@ -31,6 +34,9 @@ public:
 
   // Get posterior variance of a single state element
   double getVariance(int idx) const { return P_post(idx, idx); }
+
+  // Per-state covariance upper bounds (set externally; empty = no clamping)
+  Eigen::VectorXd max_covariance;
 
 private:
   // Process nonlinear vector function
@@ -54,6 +60,8 @@ private:
   Eigen::MatrixXd P_pri;
   // Posteriori error estimate covariance matrix
   Eigen::MatrixXd P_post;
+  // Initial covariance (for resetCovariance)
+  Eigen::MatrixXd P0_;
 
   // Kalman gain
   Eigen::MatrixXd K;

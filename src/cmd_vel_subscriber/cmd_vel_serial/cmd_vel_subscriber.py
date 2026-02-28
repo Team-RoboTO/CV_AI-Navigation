@@ -37,27 +37,38 @@ class CmdVelSubscriber(Node):
         self.buffer_lock = threading.Lock()
 
         self.timer = self.create_timer(0.01, self.publish_to_serial)
-        self.serial_port = serial.Serial(
-            port="/dev/ttyUSB0",
-            baudrate=115200,
-            bytesize=serial.EIGHTBITS,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_ONE
-        )
-        time.sleep(1)
+        self.serial_port = None
+        self._connect_serial()
 
         self.micro_publisher = self.create_publisher(
             PoseStamped,
             "/micro_pose",
             10)
 
-        self.get_logger().info("Serial port opened")
+    def _connect_serial(self):
+        try:
+            self.serial_port = serial.Serial(
+                port="/dev/ttyUSB0",
+                baudrate=115200,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE
+            )
+            time.sleep(1)
+            self.get_logger().info("Serial port opened")
+        except serial.SerialException as e:
+            self.get_logger().warn(f"Serial connect failed: {e}, will retry")
+            self.serial_port = None
 
     def listener_callback(self, msg):
         with self.buffer_lock:
             self.latest_cmd_vel = msg
 
     def publish_to_serial(self):
+        if self.serial_port is None or not self.serial_port.is_open:
+            self._connect_serial()
+            return
+
         with self.buffer_lock:
             if self.latest_cmd_vel is not None:
                 # angular.x = fire command (0/1), angular.y = pitch (deg), angular.z = yaw (deg)
@@ -66,36 +77,44 @@ class CmdVelSubscriber(Node):
                 self.yaw = -(self.latest_cmd_vel.angular.z)
                 self.latest_cmd_vel = None
 
-        # TX: [yaw, pitch, shoot_frequency, 0.0, 0.0]
-        formatted_data = format_float(
-            np.array([self.yaw, self.pitch, self.shoot_frequency, 0.0, 0.0],
-                     dtype=np.float32))
-        self.serial_port.write(formatted_data)
+        try:
+            # TX: [yaw, pitch, shoot_frequency, 0.0, 0.0]
+            formatted_data = format_float(
+                np.array([self.yaw, self.pitch, self.shoot_frequency, 0.0, 0.0],
+                         dtype=np.float32))
+            self.serial_port.write(formatted_data)
 
-        # RX: read feedback from lower computer
-        in_waiting = self.serial_port.in_waiting
-        if in_waiting >= PACKET_SIZE:
-            var = self.serial_port.read(PACKET_SIZE)
-            # Discard any extra stale bytes
-            leftover = self.serial_port.in_waiting
-            if leftover > 0:
-                self.serial_port.read(leftover)
+            # RX: read feedback from lower computer
+            in_waiting = self.serial_port.in_waiting
+            if in_waiting >= PACKET_SIZE:
+                var = self.serial_port.read(PACKET_SIZE)
+                # Discard any extra stale bytes
+                leftover = self.serial_port.in_waiting
+                if leftover > 0:
+                    self.serial_port.read(leftover)
 
+                try:
+                    yaw = struct.unpack('<f', bytes(var[:4]))[0]
+                    pitch = struct.unpack('<f', bytes(var[4:8]))[0]
+                except struct.error:
+                    return
+
+                pose_stamped = PoseStamped()
+                pose_stamped.header.stamp = self.get_clock().now().to_msg()
+                pose_stamped.pose.position.x = -pitch
+                pose_stamped.pose.position.y = -yaw
+                pose_stamped.pose.position.z = 0.0
+                self.micro_publisher.publish(pose_stamped)
+        except serial.SerialException as e:
+            self.get_logger().warn(f"Serial error: {e}, reconnecting...")
             try:
-                yaw = struct.unpack('<f', bytes(var[:4]))[0]
-                pitch = struct.unpack('<f', bytes(var[4:8]))[0]
-            except struct.error:
-                return
-
-            pose_stamped = PoseStamped()
-            pose_stamped.header.stamp = self.get_clock().now().to_msg()
-            pose_stamped.pose.position.x = -pitch
-            pose_stamped.pose.position.y = -yaw
-            pose_stamped.pose.position.z = 0.0
-            self.micro_publisher.publish(pose_stamped)
+                self.serial_port.close()
+            except Exception:
+                pass
+            self.serial_port = None
 
     def destroy_node(self):
-        if self.serial_port.is_open:
+        if self.serial_port is not None and self.serial_port.is_open:
             self.serial_port.close()
         super().destroy_node()
 

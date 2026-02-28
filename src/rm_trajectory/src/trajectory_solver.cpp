@@ -19,9 +19,10 @@ TrajectorySolverNode::TrajectorySolverNode(const rclcpp::NodeOptions &options)
   time_bias_alpha_ = this->declare_parameter("time_bias_alpha",  0.35);
   min_fire_dist_   = this->declare_parameter("min_fire_dist",    0.5);
   max_fire_dist_   = this->declare_parameter("max_fire_dist",   10.0);
-  max_spin_rate_               = this->declare_parameter("max_spin_rate",                4.0);
-  min_spin_rate_for_predictor_ = this->declare_parameter("min_spin_rate_for_predictor", 1.5);
   angular_window_              = this->declare_parameter("angular_window",               0.09);
+  accel_ema_alpha_ = this->declare_parameter("accel_ema_alpha", 0.3);
+  max_accel_       = this->declare_parameter("max_accel",       6.0);
+  latency_gate_sigma_ = this->declare_parameter("latency_gate_sigma", 2.5);
 
   // Match RELIABLE QoS used by armor_tracker's target publisher
   auto target_qos = rclcpp::SensorDataQoS()
@@ -35,7 +36,7 @@ TrajectorySolverNode::TrajectorySolverNode(const rclcpp::NodeOptions &options)
       "/tracker/cmd_gimbal", rclcpp::SensorDataQoS());
 
   twist_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(
-      "/cmd_vel", rclcpp::SensorDataQoS());
+      "/cmd_vel", rclcpp::SystemDefaultsQoS());
 
   marker_pub_ = this->create_publisher<visualization_msgs::msg::Marker>(
       "/trajectory/marker", 10);
@@ -96,94 +97,150 @@ std::pair<double, double> TrajectorySolverNode::solveTrajectory(
 void TrajectorySolverNode::targetCallback(
     const auto_aim_interfaces::msg::Target::SharedPtr msg)
 {
-  if (!msg->tracking) return;
+  if (!msg->tracking) {
+    // Publish safe command: fire off, zero angles
+    auto_aim_interfaces::msg::GimbalCmd cmd;
+    cmd.header = msg->header;
+    cmd.fire_cmd = false;
+    cmd_pub_->publish(cmd);
+
+    has_prev_target_ = false;
+    ax_ema_ = 0.0; ay_ema_ = 0.0; az_ema_ = 0.0;
+
+    geometry_msgs::msg::Twist twist;
+    twist.angular.x = 0.0;  // fire off
+    twist_pub_->publish(twist);
+    return;
+  }
 
   // Suppress fire during TEMP_LOST — EKF is coasting without measurements
   bool temp_lost = (msg->tracker_state == auto_aim_interfaces::msg::Target::TEMP_LOST);
 
-  // H4: Adaptive latency compensation — EMA over measured pipeline delay
+  // H4: Adaptive latency compensation — EMA with outlier rejection
   double measured_latency = (this->now() - msg->header.stamp).seconds();
   if (measured_latency > 0.0 && measured_latency < 0.5) {
-    time_bias_ = time_bias_alpha_ * measured_latency
-                 + (1.0 - time_bias_alpha_) * time_bias_;
+    double residual = measured_latency - time_bias_;
+    double sigma = std::sqrt(std::max(time_bias_var_, 1e-8));
+    // Reject outlier spikes (GPU thermal throttle, USB stall)
+    if (std::abs(residual) < latency_gate_sigma_ * sigma) {
+      time_bias_ = time_bias_alpha_ * measured_latency
+                   + (1.0 - time_bias_alpha_) * time_bias_;
+    }
+    // Always update variance (tracks spread even during rejection)
+    time_bias_var_ = time_bias_alpha_ * (residual * residual)
+                     + (1.0 - time_bias_alpha_) * time_bias_var_;
   }
 
   double xc = msg->position.x, yc = msg->position.y, za = msg->position.z;
   double vx = msg->velocity.x, vy = msg->velocity.y, vz = msg->velocity.z;
 
+  // Acceleration estimation (EMA over velocity differences)
+  double ax = 0.0, ay = 0.0, az = 0.0;
+  if (has_prev_target_) {
+    double dt_tgt = (msg->header.stamp - prev_target_time_).seconds();
+    if (dt_tgt > 0.005 && dt_tgt < 0.2) {
+      auto clamp = [this](double val) {
+        return std::max(-max_accel_, std::min(val, max_accel_));
+      };
+      ax_ema_ = accel_ema_alpha_ * clamp((vx - prev_vx_) / dt_tgt)
+                + (1.0 - accel_ema_alpha_) * ax_ema_;
+      ay_ema_ = accel_ema_alpha_ * clamp((vy - prev_vy_) / dt_tgt)
+                + (1.0 - accel_ema_alpha_) * ay_ema_;
+      az_ema_ = accel_ema_alpha_ * clamp((vz - prev_vz_) / dt_tgt)
+                + (1.0 - accel_ema_alpha_) * az_ema_;
+    }
+  }
+  ax = ax_ema_; ay = ay_ema_; az = az_ema_;
+  has_prev_target_ = true;
+  prev_target_time_ = msg->header.stamp;
+  prev_vx_ = vx; prev_vy_ = vy; prev_vz_ = vz;
+
   // --- Pass 1: estimate flight time from center position ---
-  double dist_center = std::sqrt(xc * xc + yc * yc);
+  double dist_center = std::sqrt(xc * xc + yc * yc + za * za);
+  if (bullet_speed_ < 1e-3) {
+    RCLCPP_WARN(this->get_logger(), "bullet_speed is near zero, skipping");
+    return;
+  }
   double t0 = dist_center / bullet_speed_;
   double pt = t0 + time_bias_;
 
-  // Predict center position at impact
-  double cx = xc + vx * pt;
-  double cy = yc + vy * pt;
-  double cz = za + vz * pt;
-
-  // Predict yaw at impact
-  double yaw_at_impact = msg->yaw + msg->v_yaw * pt;
-
-  // --- Pass 2: find the best-facing armor face and aim at it ---
+  // --- Pass 2: find best-facing armor face, verify with actual flight time ---
   int n_faces = std::max(msg->armors_num, 1);
   double face_spacing = 2.0 * M_PI / n_faces;
-  double bearing = std::atan2(cy, cx);
 
-  double best_diff = M_PI;
-  int best_face = 0;
-  for (int i = 0; i < n_faces; i++) {
-    double face_yaw = yaw_at_impact + i * face_spacing;
-    double diff = std::abs(angles::shortest_angular_distance(bearing, face_yaw));
-    if (diff < best_diff) {
-      best_diff = diff;
-      best_face = i;
+  auto findBestFace = [&](double predict_time) -> int {
+    double pred_yaw = msg->yaw + msg->v_yaw * predict_time;
+    double pred_cx = xc + vx * predict_time + 0.5 * ax * predict_time * predict_time;
+    double pred_cy = yc + vy * predict_time + 0.5 * ay * predict_time * predict_time;
+    double bear = std::atan2(pred_cy, pred_cx);
+    double best_d = M_PI;
+    int best_f = 0;
+    for (int i = 0; i < n_faces; i++) {
+      double fy = pred_yaw + i * face_spacing;
+      double d = std::abs(angles::shortest_angular_distance(bear, fy));
+      if (d < best_d) { best_d = d; best_f = i; }
+    }
+    return best_f;
+  };
+
+  int best_face = findBestFace(pt);
+  double pitch = 0.0, t_flight = 0.0;
+  double tx = 0.0, ty = 0.0, tz = 0.0;
+  double ground_dist = 0.0, yaw = 0.0;
+
+  for (int pass = 0; pass < 2; pass++) {
+    double total_t = (pass == 0) ? pt : (t_flight + time_bias_);
+    double yaw_at = msg->yaw + msg->v_yaw * total_t;
+    double face_yaw = yaw_at + best_face * face_spacing;
+    bool is_current_pair = (best_face % 2 == 0);
+    double r = is_current_pair ? msg->radius_1 : msg->radius_2;
+    double dz_offset = (n_faces == 4 && !is_current_pair) ? msg->dz : 0.0;
+
+    double pcx = xc + vx * total_t + 0.5 * ax * total_t * total_t;
+    double pcy = yc + vy * total_t + 0.5 * ay * total_t * total_t;
+    double pcz = za + vz * total_t + 0.5 * az * total_t * total_t;
+
+    tx = pcx - r * std::cos(face_yaw);
+    ty = pcy - r * std::sin(face_yaw);
+    tz = pcz + dz_offset;
+
+    ground_dist = std::sqrt(tx * tx + ty * ty);
+    yaw = std::atan2(ty, tx);
+
+    auto result = solveTrajectory(ground_dist, tz, bullet_speed_);
+    pitch = result.first;
+    t_flight = result.second;
+
+    if (pass == 0) {
+      int recheck_face = findBestFace(t_flight + time_bias_);
+      if (recheck_face == best_face) break;  // Face consistent, done
+      best_face = recheck_face;
     }
   }
-
-  // Compute face position: xa = xc - r * cos(yaw), ya = yc - r * sin(yaw)
-  double face_yaw = yaw_at_impact + best_face * face_spacing;
-  bool is_current_pair = (best_face % 2 == 0);
-  double r = is_current_pair ? msg->radius_1 : msg->radius_2;
-  double dz_offset = (n_faces == 4 && !is_current_pair) ? msg->dz : 0.0;
-
-  double tx = cx - r * std::cos(face_yaw);
-  double ty = cy - r * std::sin(face_yaw);
-  double tz = cz + dz_offset;
-
-  double ground_dist = std::sqrt(tx * tx + ty * ty);
-  double yaw = std::atan2(ty, tx);
-
-  auto result = solveTrajectory(ground_dist, tz, bullet_speed_);
-  double pitch = result.first;
 
   double range = std::sqrt(tx * tx + ty * ty + tz * tz);
   bool dist_ok = (range >= min_fire_dist_) && (range <= max_fire_dist_);
 
-  // Fire gate: check if armor face is within angular window
+  // Fire gate: unified check for all spin rates
   bool in_range = false;
   if (dist_ok && !temp_lost) {
-    double abs_v_yaw = std::abs(msg->v_yaw);
-    if (abs_v_yaw < min_spin_rate_for_predictor_) {
-      // Slow / stopped target: original hard gate
-      in_range = (abs_v_yaw < max_spin_rate_);
-    } else {
-      // Fast-spinning target: use best_diff from face selection above
-      // Re-compute with refined flight time from face-aimed trajectory
-      double t_flight = result.second;
-      double refined_yaw_at_impact = msg->yaw + msg->v_yaw * t_flight;
-      double min_diff = M_PI;
-      for (int i = 0; i < n_faces; i++) {
-        double fy = refined_yaw_at_impact + i * face_spacing;
-        double diff = std::abs(angles::shortest_angular_distance(yaw, fy));
-        if (diff < min_diff) min_diff = diff;
-      }
+    double final_yaw = msg->yaw + msg->v_yaw * (t_flight + time_bias_);
 
-      // Scale angular window by v_yaw confidence (SNR gate)
-      double sigma_vyaw = std::sqrt(std::max(msg->v_yaw_variance, 1e-6));
-      double yaw_uncertainty = sigma_vyaw * t_flight;
-      double effective_window = angular_window_ + yaw_uncertainty;
-      in_range = (min_diff < effective_window);
+    // Find closest face alignment at impact time
+    double min_face_diff = M_PI;
+    for (int i = 0; i < n_faces; i++) {
+      double fy = final_yaw + i * face_spacing;
+      double diff = std::abs(angles::shortest_angular_distance(yaw, fy));
+      if (diff < min_face_diff) min_face_diff = diff;
     }
+
+    // Variance-based window, capped to physical limits
+    double sigma_vyaw = std::sqrt(std::max(msg->v_yaw_variance, 1e-6));
+    double yaw_uncertainty = sigma_vyaw * (t_flight + time_bias_);
+    double max_window = face_spacing * 0.5;  // Can't exceed half the face spacing
+    double effective_window = std::min(angular_window_ + yaw_uncertainty, max_window);
+
+    in_range = (min_face_diff < effective_window);
   }
 
   auto_aim_interfaces::msg::GimbalCmd cmd;

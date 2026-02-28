@@ -6,8 +6,10 @@
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/create_timer_ros.h>
 #include <tf2_ros/message_filter.h>
+#include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
 
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <std_srvs/srv/trigger.hpp>
@@ -39,6 +41,10 @@ private:
   void armorsCallback(const vision_msgs::msg::Detection2DArray::ConstSharedPtr armors_ptr);
 
   void publishMarkers(const auto_aim_interfaces::msg::Target & target_msg);
+
+  // Gimbal TF
+  void microPoseCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg);
+  void broadcastGimbalTF(const rclcpp::Time & stamp);
 
   // Maximum allowable armor distance in the XOY plane
   double max_armor_distance_;
@@ -77,6 +83,21 @@ private:
   // Publisher
   rclcpp::Publisher<auto_aim_interfaces::msg::Target>::SharedPtr target_pub_;
   rclcpp::Publisher<vision_msgs::msg::Detection2D>::SharedPtr optimal_bbox_pub_;
+
+  // Adaptive velocity damping
+  double xyz_damping_alpha_;          // current effective value (updated each frame)
+  double yaw_damping_alpha_;          // current effective value
+  double xyz_damping_alpha_base_;     // from parameter (0.95)
+  double yaw_damping_alpha_base_;     // from parameter (0.98)
+  double coast_damping_factor_;       // TEMP_LOST multiplier (0.85)
+  double damping_innov_threshold_;    // position_diff threshold (0.10m)
+  double yaw_innov_threshold_;       // yaw innovation threshold for overshoot damping (rad)
+
+  // Dynamic TF from gimbal feedback
+  std::shared_ptr<tf2_ros::TransformBroadcaster> tf2_broadcaster_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr micro_pose_sub_;
+  double gimbal_yaw_, gimbal_pitch_;
+  double gimbal_height_, yaw_sign_, pitch_sign_;
 
   // Visualization marker publisher
   visualization_msgs::msg::Marker position_marker_;
