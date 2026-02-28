@@ -245,6 +245,7 @@ void Tracker::handleArmorJump(const Armor & current_armor)
     target_state(3) = 0;                   // vyc
     target_state(4) = p.z;                 // za
     target_state(5) = 0;                   // vza
+    target_state(7) = 0;                   // v_yaw
     ekf.resetCovariance();
     RCLCPP_ERROR(rclcpp::get_logger("armor_tracker"), "Reset State!");
   }

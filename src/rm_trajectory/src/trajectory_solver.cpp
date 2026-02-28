@@ -101,6 +101,9 @@ void TrajectorySolverNode::targetCallback(
     // Publish safe command: fire off, zero angles
     auto_aim_interfaces::msg::GimbalCmd cmd;
     cmd.header = msg->header;
+    cmd.pitch    = 0.0;
+    cmd.yaw      = 0.0;
+    cmd.distance = 0.0;
     cmd.fire_cmd = false;
     cmd_pub_->publish(cmd);
 
@@ -142,12 +145,14 @@ void TrajectorySolverNode::targetCallback(
       auto clamp = [this](double val) {
         return std::max(-max_accel_, std::min(val, max_accel_));
       };
-      ax_ema_ = accel_ema_alpha_ * clamp((vx - prev_vx_) / dt_tgt)
-                + (1.0 - accel_ema_alpha_) * ax_ema_;
-      ay_ema_ = accel_ema_alpha_ * clamp((vy - prev_vy_) / dt_tgt)
-                + (1.0 - accel_ema_alpha_) * ay_ema_;
-      az_ema_ = accel_ema_alpha_ * clamp((vz - prev_vz_) / dt_tgt)
-                + (1.0 - accel_ema_alpha_) * az_ema_;
+      // Time-adjusted alpha: consistent bandwidth regardless of frame rate
+      double alpha_dt = 1.0 - std::pow(1.0 - accel_ema_alpha_, dt_tgt / (1.0 / 30.0));
+      ax_ema_ = alpha_dt * clamp((vx - prev_vx_) / dt_tgt)
+                + (1.0 - alpha_dt) * ax_ema_;
+      ay_ema_ = alpha_dt * clamp((vy - prev_vy_) / dt_tgt)
+                + (1.0 - alpha_dt) * ay_ema_;
+      az_ema_ = alpha_dt * clamp((vz - prev_vz_) / dt_tgt)
+                + (1.0 - alpha_dt) * az_ema_;
     }
   }
   ax = ax_ema_; ay = ay_ema_; az = az_ema_;
@@ -216,6 +221,18 @@ void TrajectorySolverNode::targetCallback(
       if (recheck_face == best_face) break;  // Face consistent, done
       best_face = recheck_face;
     }
+  }
+
+  // Guard: solveTrajectory returns (0,0) when ground_dist ≈ 0
+  if (t_flight < 1e-6) {
+    auto_aim_interfaces::msg::GimbalCmd cmd;
+    cmd.header = msg->header;
+    cmd.pitch    = 0.0;
+    cmd.yaw      = 0.0;
+    cmd.distance = 0.0;
+    cmd.fire_cmd = false;
+    cmd_pub_->publish(cmd);
+    return;
   }
 
   double range = std::sqrt(tx * tx + ty * ty + tz * tz);

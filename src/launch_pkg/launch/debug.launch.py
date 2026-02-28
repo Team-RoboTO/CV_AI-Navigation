@@ -168,7 +168,7 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch_ros.actions import ComposableNodeContainer, Node
+from launch_ros.actions import ComposableNodeContainer
 from launch_ros.descriptions import ComposableNode
 from launch.actions import TimerAction
 
@@ -206,7 +206,7 @@ def generate_launch_description():
         package='isaac_ros_dnn_image_encoder',
         plugin='nvidia::isaac_ros::dnn_inference::DnnImageEncoderNode',
         remappings=[('encoded_tensor', 'tensor_pub'),
-                    ('image', '/camera/camera/color/image_raw')],
+                    ('image', '/image')],
         parameters=[{
             'input_image_width': 640,
             'input_image_height': 480,
@@ -246,13 +246,13 @@ def generate_launch_description():
         package='isaac_ros_yolov8',
         plugin='nvidia::isaac_ros::yolov8::YoloV8DecoderNode',
         parameters=[{
-            'confidence_threshold': 0.10, # !!!!!!DA CAMBIARE DOPO TEST!!!!!!
+            'confidence_threshold': 0.10, # da cambiare dopo test
             'nms_threshold': 0.45,
-            'num_classes': 4,
+            'num_classes': 5,
             'in_width': 640.0,
             'in_height': 640.0,
             'out_width': 640.0,
-            'out_height': 488.0,
+            'out_height': 480.0,
             'tf_frame_id': 'camera_color_optical_frame'
         }],
         remappings=[('detections', '/detections_output')]
@@ -265,12 +265,10 @@ def generate_launch_description():
         name='armor_tracker',
         remappings=[
             ('/detector/armors', '/detections_output'),
-            ('/camera_info', '/camera/camera/color/camera_info')
+            ('/camera_info', '/camera_info')
         ],
         parameters=[
-            # ATTENZIONE! parametri sotto cambiati per fase testing!!!
             {'target_frame': 'odom'},
-            {'tracker.tracking_thres': 0},   # !!!!!!DA TOGLIERE DOPO TEST!!!!!!
             {'max_armor_distance': 10.0},
             {'tracker.max_match_distance': 0.60},
             {'tracker.max_match_yaw_diff': 2.0},
@@ -279,7 +277,16 @@ def generate_launch_description():
             # EKF parameters
             {'ekf.sigma2_q_xyz': 20.0},
             {'ekf.sigma2_q_yaw': 100.0},
-            {'ekf.sigma2_q_r': 800.0}
+            {'ekf.sigma2_q_r': 800.0},
+            {'ekf.xyz_damping_alpha': 0.95},
+            {'ekf.yaw_damping_alpha': 0.95},
+            {'ekf.coast_damping_factor': 0.85},
+            {'ekf.damping_innov_threshold': 0.10},
+            {'ekf.yaw_innov_threshold': 0.15},
+            # Gimbal TF parameters
+            {'gimbal.height': 0.5},
+            {'gimbal.yaw_sign': 1.0},
+            {'gimbal.pitch_sign': 1.0},
         ],
         extra_arguments=[{'use_intra_process_comms': True}]
     )
@@ -293,19 +300,18 @@ def generate_launch_description():
             {'bullet_speed': 25.0},
             {'gravity': 9.8},
             {'k': 0.01},
-            {'time_bias': 0.05}
+            {'time_bias': 0.05},
+            {'time_bias_alpha': 0.35},
+            {'min_fire_dist': 0.5},
+            {'max_fire_dist': 10.0},
+            {'angular_window': 0.09},
+            {'accel_ema_alpha': 0.3},
+            {'max_accel': 6.0},
+            {'latency_gate_sigma': 2.5},
         ],
         extra_arguments=[{'use_intra_process_comms': True}]
     )
     
-    static_tf_node = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        name='odom_to_camera_tf',
-        # ruota il frame standard (-90 su yaw e roll) per farlo coincidere con la lente
-        arguments=['0', '0', '0.5', '-1.5708', '0', '-1.5708', 'odom', 'camera_color_optical_frame']
-    )
-
     container = ComposableNodeContainer(
         name='biggest_container',
         namespace='very_big',
@@ -324,9 +330,8 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        static_tf_node,
         TimerAction(
-            period=2.0,                  # <--- Aspetta 2 secondi esatti
-            actions=[container]          # <--- POI lancia il container pesante
+            period=2.0,
+            actions=[container]
         )
     ])

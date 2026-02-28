@@ -41,7 +41,7 @@ Eigen::MatrixXd ExtendedKalmanFilter::predict()
   if (max_covariance.size() == n) {
     for (int i = 0; i < n; i++) {
       if (P_post(i, i) > max_covariance(i)) {
-        double scale = std::sqrt(max_covariance(i) / P_post(i, i));
+        double scale = std::sqrt(max_covariance(i) / std::max(P_post(i, i), 1e-10));
         P_post.row(i) *= scale;
         P_post.col(i) *= scale;
       }

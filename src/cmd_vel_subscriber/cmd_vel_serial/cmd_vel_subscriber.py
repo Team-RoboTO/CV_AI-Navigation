@@ -36,6 +36,9 @@ class CmdVelSubscriber(Node):
         self.latest_cmd_vel = None
         self.buffer_lock = threading.Lock()
 
+        self.declare_parameter('serial_port', '/dev/ttyUSB0')
+        self.serial_port_name = self.get_parameter('serial_port').get_parameter_value().string_value
+
         self.timer = self.create_timer(0.01, self.publish_to_serial)
         self.serial_port = None
         self._connect_serial()
@@ -48,7 +51,7 @@ class CmdVelSubscriber(Node):
     def _connect_serial(self):
         try:
             self.serial_port = serial.Serial(
-                port="/dev/ttyUSB0",
+                port=self.serial_port_name,
                 baudrate=115200,
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,

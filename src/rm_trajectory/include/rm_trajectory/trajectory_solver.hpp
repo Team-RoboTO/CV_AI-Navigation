@@ -49,7 +49,7 @@ private:
   double max_accel_;
 
   // Latency outlier rejection
-  double time_bias_var_ = 0.001;
+  double time_bias_var_ = 0.01;
   double latency_gate_sigma_;
 };
 
