@@ -43,40 +43,52 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   yaw_innov_threshold_    = declare_parameter("ekf.yaw_innov_threshold", 0.15);
   xyz_damping_alpha_ = xyz_damping_alpha_base_;
   yaw_damping_alpha_ = yaw_damping_alpha_base_;
-  // f - Process function
+  // --- f: EKF Process Function ---
+  // Predicts the next state from the current state using a damped constant-velocity model.
+  // Each axis follows: pos += v*dt,  v_new = v * alpha^(dt/T_ref)
+  // where T_ref=1/30s normalizes the decay so alpha is "per-frame at 30Hz" regardless of dt.
+  // r (radius) is constant — it only changes on armor-jump events handled in Tracker::update().
   auto f = [this](const Eigen::VectorXd & x) {
     Eigen::VectorXd x_new = x;
-    double b = std::pow(xyz_damping_alpha_, dt_ / (1.0 / 30.0));
-    double a = std::pow(yaw_damping_alpha_, dt_ / (1.0 / 30.0));
-    double damped_vx = x(1) * b;
-    double damped_vy = x(3) * b;
-    double damped_vz = x(5) * b;
+    // Per-step decay factors, scaled to the actual dt so alpha is frame-rate independent.
+    double b = std::pow(xyz_damping_alpha_, dt_ / (1.0 / 30.0));  // XYZ velocity decay
+    double a = std::pow(yaw_damping_alpha_, dt_ / (1.0 / 30.0));  // Yaw velocity decay
+    double damped_vx   = x(1) * b;
+    double damped_vy   = x(3) * b;
+    double damped_vz   = x(5) * b;
     double damped_vyaw = x(7) * a;
-    x_new(0) += damped_vx * dt_;
-    x_new(1) = damped_vx;
-    x_new(2) += damped_vy * dt_;
-    x_new(3) = damped_vy;
-    x_new(4) += damped_vz * dt_;
-    x_new(5) = damped_vz;
-    x_new(6) += damped_vyaw * dt_;
-    x_new(7) = damped_vyaw;
+    // Integrate damped velocity into position for each axis.
+    x_new(0) += damped_vx * dt_;    // xc  += v_xc * dt
+    x_new(1) = damped_vx;           // v_xc = v_xc * b
+    x_new(2) += damped_vy * dt_;    // yc  += v_yc * dt
+    x_new(3) = damped_vy;           // v_yc = v_yc * b
+    x_new(4) += damped_vz * dt_;    // za  += v_za * dt
+    x_new(5) = damped_vz;           // v_za = v_za * b
+    x_new(6) += damped_vyaw * dt_;  // yaw += v_yaw * dt
+    x_new(7) = damped_vyaw;         // v_yaw = v_yaw * a
+    // x(8) = r remains unchanged (constant radius assumption)
     return x_new;
   };
-  // J_f - Jacobian of process function
+  // --- J_f: Jacobian of the Process Function ---
+  // The EKF linearizes f around the current state each step using this matrix.
+  // Because f is linear (constant-velocity + decay), J_f is exact (no approximation).
+  // Block structure: each axis [pos, vel] is a 2×2 block [1, b*dt; 0, b].
+  // Yaw uses decay 'a' instead of 'b'. Radius row/col = identity (r is constant).
   auto j_f = [this](const Eigen::VectorXd &) {
-    double b = std::pow(xyz_damping_alpha_, dt_ / (1.0 / 30.0));
-    double a = std::pow(yaw_damping_alpha_, dt_ / (1.0 / 30.0));
+    double b = std::pow(xyz_damping_alpha_, dt_ / (1.0 / 30.0));  // XYZ decay factor
+    double a = std::pow(yaw_damping_alpha_, dt_ / (1.0 / 30.0));  // Yaw decay factor
     Eigen::MatrixXd f(9, 9);
     // clang-format off
-    f <<  1,   b*dt_, 0,   0,      0,   0,      0,   0,      0,
-          0,   b,     0,   0,      0,   0,      0,   0,      0,
-          0,   0,     1,   b*dt_,  0,   0,      0,   0,      0,
-          0,   0,     0,   b,      0,   0,      0,   0,      0,
-          0,   0,     0,   0,      1,   b*dt_,  0,   0,      0,
-          0,   0,     0,   0,      0,   b,      0,   0,      0,
-          0,   0,     0,   0,      0,   0,      1,   a*dt_,  0,
-          0,   0,     0,   0,      0,   0,      0,   a,      0,
-          0,   0,     0,   0,      0,   0,      0,   0,      1;
+    //    xc     v_xc   yc     v_yc   za     v_za   yaw    v_yaw  r
+    f <<  1,   b*dt_, 0,   0,      0,   0,      0,   0,      0,   // d(xc)/d(*)
+          0,   b,     0,   0,      0,   0,      0,   0,      0,   // d(v_xc)/d(*)
+          0,   0,     1,   b*dt_,  0,   0,      0,   0,      0,   // d(yc)/d(*)
+          0,   0,     0,   b,      0,   0,      0,   0,      0,   // d(v_yc)/d(*)
+          0,   0,     0,   0,      1,   b*dt_,  0,   0,      0,   // d(za)/d(*)
+          0,   0,     0,   0,      0,   b,      0,   0,      0,   // d(v_za)/d(*)
+          0,   0,     0,   0,      0,   0,      1,   a*dt_,  0,   // d(yaw)/d(*)
+          0,   0,     0,   0,      0,   0,      0,   a,      0,   // d(v_yaw)/d(*)
+          0,   0,     0,   0,      0,   0,      0,   0,      1;   // d(r)/d(*) — constant
     // clang-format on
     return f;
   };
@@ -459,47 +471,73 @@ void ArmorTrackerNode::armorsCallback(
     dt_ = std::min(std::max((time - last_time_).seconds(), 0.01), 0.10);
     tracker_->lost_thres = static_cast<int>(lost_time_thres_ / dt_);
 
-    // Adaptive velocity damping: adjust alpha based on tracker state and innovation
+    // --- Adaptive Velocity Damping ---
+    // The EKF process model applies per-step velocity decay: v_new = alpha^(dt/T) * v_old.
+    // alpha=1.0 means no decay (track freely); alpha<1.0 attenuates velocity each step.
+    // We choose alpha dynamically each frame based on tracker state and innovation signal
+    // to balance responsiveness (track real motion) vs. stability (damp filter runaway).
     if (tracker_->tracker_state == Tracker::TRACKING) {
-      // Position: overshoot-aware damping
+
+      // --- Position damping (XYZ) ---
+      // Collect current EKF velocity estimate (v_xc, v_yc, v_za).
       Eigen::Vector3d vel(
         tracker_->target_state(1),
         tracker_->target_state(3),
         tracker_->target_state(5));
       double speed = vel.norm();
+
+      // Innovation = measurement - prediction. Its dot product with velocity tells us
+      // whether the filter is overshooting:
+      //   dot > 0: innovation and velocity agree → filter is still catching up (OK)
+      //   dot < 0: innovation opposes velocity   → filter overshot, correct by damping
       double dot = tracker_->info_position_innov.dot(vel);
-      bool pos_overshoot = (dot < 0.0) && (speed > 0.3);
+      bool pos_overshoot = (dot < 0.0) && (speed > 0.3);  // only act if speed is meaningful
 
       if (pos_overshoot) {
+        // Proportionally increase damping with innovation magnitude (capped at 1.0).
+        // At full scale (innov >= threshold), alpha drops to xyz_damping_alpha_base_,
+        // the strongest damping. Between 0 and threshold, alpha interpolates linearly.
         double pos_scale = std::min(tracker_->info_position_diff / damping_innov_threshold_, 1.0);
         xyz_damping_alpha_ = 1.0 - pos_scale * (1.0 - xyz_damping_alpha_base_);
       } else if (speed > 0.3) {
-        // Steady motion or acceleration: no damping
+        // Target is moving and filter is not overshooting: let it track freely.
         xyz_damping_alpha_ = 1.0;
       } else {
+        // Target is slow or stationary: apply base damping to prevent velocity drift.
         xyz_damping_alpha_ = xyz_damping_alpha_base_;
       }
 
-      // Yaw: overshoot-aware (decoupled from position)
+      // --- Yaw damping (decoupled from XYZ) ---
+      // Same overshoot logic applied independently to the spin axis.
+      // Signed innovation: positive means measured yaw > predicted yaw.
       double v_yaw = tracker_->target_state(7);
       double yaw_innov = tracker_->info_yaw_innov_signed;
+
+      // Overshoot: yaw_innov and v_yaw have opposite signs → filter spun past the target.
       bool overshoot = (yaw_innov * v_yaw < 0) && (std::abs(v_yaw) > 0.5);
 
       if (overshoot) {
+        // Scale damping with innovation magnitude.
+        // Floor is base * coast_factor so yaw never damps harder than TEMP_LOST coasting.
         double yaw_scale = std::min(tracker_->info_yaw_diff / yaw_innov_threshold_, 1.0);
         double min_alpha = yaw_damping_alpha_base_ * coast_damping_factor_;
         yaw_damping_alpha_ = 1.0 - yaw_scale * (1.0 - min_alpha);
       } else if (std::abs(v_yaw) > 0.5) {
-        // Steady spin or accelerating: no damping, let EKF track freely
+        // Steady spin or accelerating: no damping, let EKF track freely.
         yaw_damping_alpha_ = 1.0;
       } else {
-        // Low/no spin: base damping
+        // Low/no spin: apply base damping to prevent yaw velocity drift.
         yaw_damping_alpha_ = yaw_damping_alpha_base_;
       }
+
     } else if (tracker_->tracker_state == Tracker::TEMP_LOST) {
+      // No detection this frame: the EKF coasts using its last velocity estimate.
+      // Apply stronger damping (base * coast_factor) so velocities decay faster
+      // during blind frames, reducing prediction error when detection resumes.
       xyz_damping_alpha_ = xyz_damping_alpha_base_ * coast_damping_factor_;
       yaw_damping_alpha_ = yaw_damping_alpha_base_ * coast_damping_factor_;
     } else {
+      // DETECTING state: tracker is accumulating initial frames, use base damping.
       xyz_damping_alpha_ = xyz_damping_alpha_base_;
       yaw_damping_alpha_ = yaw_damping_alpha_base_;
     }
