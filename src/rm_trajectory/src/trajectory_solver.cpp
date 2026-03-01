@@ -51,6 +51,7 @@ TrajectorySolverNode::TrajectorySolverNode(const rclcpp::NodeOptions &options)
   // Match RELIABLE QoS used by armor_tracker's target publisher
   auto target_qos = rclcpp::SensorDataQoS()
       .reliability(rclcpp::ReliabilityPolicy::Reliable)
+      .durability(rclcpp::DurabilityPolicy::Volatile)
       .keep_last(30);
   target_sub_ = this->create_subscription<auto_aim_interfaces::msg::Target>(
       "/tracker/target", target_qos,
@@ -63,11 +64,11 @@ TrajectorySolverNode::TrajectorySolverNode(const rclcpp::NodeOptions &options)
 
   // /cmd_vel carries fire trigger (angular.x) + angles in degrees (y=pitch, z=yaw)
   twist_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(
-      "/cmd_vel", rclcpp::SystemDefaultsQoS());
+      "/cmd_vel", rclcpp::QoS(10).durability(rclcpp::DurabilityPolicy::Volatile));
 
   // Debug sphere showing predicted bullet impact point in RViz
   marker_pub_ = this->create_publisher<visualization_msgs::msg::Marker>(
-      "/trajectory/marker", 10);
+      "/trajectory/marker", rclcpp::QoS(10).durability(rclcpp::DurabilityPolicy::Volatile));
 }
 
 // ---------------------------------------------------------------------------

@@ -93,6 +93,9 @@ private:
   // PnP light-bar ratio (bbox → light-bar scaling)
   double light_ratio_;
 
+  // Letterbox padding Y offset (pixels)
+  double bbox_padding_y_;
+
   // Dynamic TF from gimbal feedback
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf2_broadcaster_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr micro_pose_sub_;

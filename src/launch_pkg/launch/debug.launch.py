@@ -270,21 +270,21 @@ def generate_launch_description():
         parameters=[
             {'target_frame': 'odom'},
             {'max_armor_distance': 10.0},
-            {'light_ratio': 0.85},
+            {'light_ratio': 1.0},
             {'tracker.max_match_distance': 0.60},
             {'tracker.tracking_thres': 2},
             {'tracker.lost_time_thres': 1.0},
             # EKF parameters
-            {'ekf.sigma2_q_xyz': 20.0},
-            {'ekf.sigma2_q_yaw': 100.0},
-            {'ekf.sigma2_q_r': 800.0},
+            {'ekf.sigma2_q_xyz': 2.0},
+            {'ekf.sigma2_q_yaw': 5.0},
+            {'ekf.sigma2_q_r': 0.5},
             {'ekf.xyz_damping_alpha': 0.95},
             {'ekf.yaw_damping_alpha': 0.95},
             {'ekf.coast_damping_factor': 0.85},
             {'ekf.damping_innov_threshold': 0.10},
             {'ekf.yaw_innov_threshold': 0.15},
             # Gimbal TF parameters
-            {'gimbal.height': 0.5},
+            {'gimbal.height': .325},
             {'gimbal.yaw_sign': 1.0},
             {'gimbal.pitch_sign': 1.0},
         ],
@@ -297,7 +297,7 @@ def generate_launch_description():
         plugin='rm_auto_aim::TrajectorySolverNode',
         name='trajectory_solver',
         parameters=[
-            {'bullet_speed': 25.0},
+            {'bullet_speed': 15.0},
             {'gravity': 9.8},
             {'k': 0.01},
             {'time_bias': 0.05},
@@ -311,7 +311,7 @@ def generate_launch_description():
             {'indirect_vyaw_threshold': 3.0},
             {'indirect_timing_tolerance': 0.02},
             {'indirect_max_candidates': 8},
-            {'gimbal_height': 0.5},
+            {'gimbal_height': 0.325},
         ],
         extra_arguments=[{'use_intra_process_comms': True}]
     )
@@ -320,7 +320,7 @@ def generate_launch_description():
         name='biggest_container',
         namespace='very_big',
         package='rclcpp_components',
-        executable='component_container',
+        executable='component_container_mt',
         composable_node_descriptions=[
             realsense_node,
             encoder_node,

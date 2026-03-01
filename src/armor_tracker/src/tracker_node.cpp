@@ -23,6 +23,11 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   // Ratio to scale YOLO bbox inward to approximate light-bar positions
   light_ratio_ = this->declare_parameter("light_ratio", 0.85);
 
+  // Letterbox padding: when DNN encoder pads image to square with keep_aspect_ratio,
+  // YOLO bbox Y coordinates are shifted by (network_h - image_h) / 2 pixels.
+  // Default 80 = (640 - 480) / 2 for 640x480 input padded to 640x640.
+  bbox_padding_y_ = this->declare_parameter("bbox_padding_y", 80.0);
+
   // Tracker
   double max_match_distance = this->declare_parameter("tracker.max_match_distance", 0.15);
   tracker_ = std::make_unique<Tracker>(max_match_distance);
@@ -140,9 +145,9 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
     return q;
   };
   // update_R - distance-dependent measurement noise covariance matrix
-  r_xyz_base_  = declare_parameter("ekf.r_xyz_base",  0.005);
+  r_xyz_base_  = declare_parameter("ekf.r_xyz_base",  0.04);
   r_xyz_slope_ = declare_parameter("ekf.r_xyz_slope", 0.03);
-  r_yaw_base_  = declare_parameter("ekf.r_yaw_base",  0.015);
+  r_yaw_base_  = declare_parameter("ekf.r_yaw_base",  0.05);
   r_yaw_slope_ = declare_parameter("ekf.r_yaw_slope", 0.002);
   auto u_r = [this](const Eigen::VectorXd & z) {
     Eigen::DiagonalMatrix<double, 4> r;
@@ -332,9 +337,9 @@ void ArmorTrackerNode::armorsCallback(
   size_t detection_idx = 0;
   for (const auto & detection : detection_msg->detections) {
     auto_aim_interfaces::msg::Armor armor_msg;
-    // Extract bbox (decoder outputs coordinates in real image space)
+    // Extract bbox (decoder outputs coordinates in padded network space)
     auto center_x = detection.bbox.center.position.x;
-    auto center_y = detection.bbox.center.position.y;
+    auto center_y = detection.bbox.center.position.y - bbox_padding_y_;
     auto width = detection.bbox.size_x;
     auto height = detection.bbox.size_y;
 

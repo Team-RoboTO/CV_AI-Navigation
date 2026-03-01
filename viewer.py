@@ -22,6 +22,7 @@ class VisualizerNode(Node):
         self.latest_marker = None
         self.camera_info = None
         self.tracking_info = None
+        self.gimbal_cmd = None
 
         self.create_subscription(Image, '/camera/camera/color/image_raw', self.img_cb, qos_profile_sensor_data)
         self.create_subscription(CameraInfo, '/camera/camera/color/camera_info', self.info_cb, qos_profile_sensor_data)
@@ -29,10 +30,11 @@ class VisualizerNode(Node):
         self.create_subscription(Detection2D, '/detections_output/optimal_target', self.optimal_cb, qos_profile_sensor_data)
         self.create_subscription(Marker, '/trajectory/marker', self.marker_cb, qos_profile_sensor_data)
 
-        # Try subscribing to tracker target for distance/tracking info
+        # Try subscribing to tracker target and gimbal commands
         try:
-            from auto_aim_interfaces.msg import Target
+            from auto_aim_interfaces.msg import Target, GimbalCmd
             self.create_subscription(Target, '/tracker/target', self.target_cb, qos_profile_sensor_data)
+            self.create_subscription(GimbalCmd, '/tracker/cmd_gimbal', self.gimbal_cmd_cb, qos_profile_sensor_data)
         except ImportError:
             self.get_logger().warn("auto_aim_interfaces not found — run: source install/setup.bash")
 
@@ -60,6 +62,9 @@ class VisualizerNode(Node):
     def target_cb(self, msg):
         self.tracking_info = msg
 
+    def gimbal_cmd_cb(self, msg):
+        self.gimbal_cmd = msg
+
     def bbox_cb(self, msg):
         self.latest_detections = msg
 
@@ -72,7 +77,7 @@ class VisualizerNode(Node):
         Scales from decoder output space (camera_info resolution) to actual image."""
         h_img, w_img, _ = cv_img.shape
         
-        pad_y = 80 
+        pad_y = 80  # letterbox padding: (640 - 480) / 2
         x_scale = w_img / 640.0 
         y_scale = h_img / 480.0
 
@@ -126,8 +131,6 @@ class VisualizerNode(Node):
         # 3. Impact point (red) — from trajectory solver marker
         if self.latest_marker is not None:
             # Transform from marker frame (odom) → camera optical frame
-            # Use latest TF (Time(0)) instead of marker stamp to avoid
-            # ExtrapolationException when TF and marker timestamps differ.
             pt_odom = PointStamped()
             pt_odom.header.frame_id = self.latest_marker.header.frame_id
             pt_odom.header.stamp = rclpy.time.Time().to_msg()  # latest TF
@@ -139,7 +142,6 @@ class VisualizerNode(Node):
                 x = pt_cam.point.x
                 y = pt_cam.point.y
                 z = pt_cam.point.z
-                # Project (x,y,z) in camera optical frame → pixel
                 if z > 0.05:
                     K = self.camera_info.k
                     fx, cx_cam = K[0], K[2]
@@ -155,6 +157,61 @@ class VisualizerNode(Node):
             except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
                     tf2_ros.ExtrapolationException) as e:
                 self.get_logger().warn(f"Impact TF failed: {e}", throttle_duration_sec=2.0)
+
+        # 4. Aim direction (cyan) — where the barrel is pointing
+        if self.gimbal_cmd is not None and self.gimbal_cmd.distance > 0.1:
+            import math
+            cmd = self.gimbal_cmd
+            pitch = cmd.pitch
+            yaw = cmd.yaw
+            dist = cmd.distance
+
+            # Compute aim point in odom: barrel at origin aims along (yaw, pitch)
+            aim_x = dist * math.cos(pitch) * math.cos(yaw)
+            aim_y = dist * math.cos(pitch) * math.sin(yaw)
+            aim_z = 0.325 + dist * math.sin(pitch)  # gimbal_height + vertical component
+
+            pt_aim = PointStamped()
+            pt_aim.header.frame_id = 'odom'
+            pt_aim.header.stamp = rclpy.time.Time().to_msg()
+            pt_aim.point.x = aim_x
+            pt_aim.point.y = aim_y
+            pt_aim.point.z = aim_z
+            try:
+                pt_cam = self.tf_buffer.transform(
+                    pt_aim, 'camera_color_optical_frame',
+                    timeout=rclpy.duration.Duration(seconds=0.05))
+                x = pt_cam.point.x
+                y = pt_cam.point.y
+                z = pt_cam.point.z
+                if z > 0.05:
+                    K = self.camera_info.k
+                    fx, cx_cam = K[0], K[2]
+                    fy, cy_cam = K[4], K[5]
+                    au = int((x / z) * fx + cx_cam)
+                    av = int((y / z) * fy + cy_cam)
+                    if 0 <= au < w_img and 0 <= av < h_img:
+                        # Cyan diamond crosshair for aim
+                        sz = 15
+                        pts = [(au, av-sz), (au+sz, av), (au, av+sz), (au-sz, av)]
+                        for i in range(4):
+                            cv2.line(cv_img, pts[i], pts[(i+1)%4], (255, 255, 0), 2)
+                        cv2.putText(cv_img, "AIM", (au + 10, av - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+            except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                    tf2_ros.ExtrapolationException):
+                pass
+
+            # Angle text overlay (top-left)
+            pitch_deg = math.degrees(pitch)
+            yaw_deg = math.degrees(yaw)
+            fire_str = "FIRE" if cmd.fire_cmd else "hold"
+            cv2.putText(cv_img, f"Pitch: {pitch_deg:+.1f} deg", (10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            cv2.putText(cv_img, f"Yaw:   {yaw_deg:+.1f} deg", (10, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            cv2.putText(cv_img, f"Dist:  {dist:.2f}m  [{fire_str}]", (10, 75),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
         out_msg = self.bridge.cv2_to_imgmsg(cv_img, encoding="bgr8")
         out_msg.header = self.latest_image.header
