@@ -46,8 +46,10 @@ class PredictionWithout():
         # Just for the visualization of the projectile in the camera frame
         # In the optimization process, the rotation is computed before
         if theta_0 is not None:
-            position[0] = position[0] * np.cos(theta_0) + position[2] * np.sin(theta_0)
-            position[2] = - position[0] * np.sin(theta_0) + position[2] * np.cos(theta_0)
+            orig_x = position[0]
+            orig_z = position[2]
+            position[0] = orig_x * np.cos(theta_0) + orig_z * np.sin(theta_0)
+            position[2] = -orig_x * np.sin(theta_0) + orig_z * np.cos(theta_0)
         
         return position
 
@@ -85,21 +87,21 @@ class PredictionWithout():
         vz = (z0 - self.z_prev) * 1e9 / dt #+ self.vaz
 
         d = np.sqrt(x0**2 + y0**2)
-        
-        yaw_pos = np.arctan2( - y0/d, x0/d)
-        
-        vy_final = vy - wz * d * np.cos(yaw_pos)
 
+        yaw_pos = np.arctan2(-y0, x0)
+        
         # update self variables
         self.x_prev, self.y_prev, self.z_prev, self.ts_prev = x0, y0, z0, ts
 
         # Velocity normalization
         v_abs = np.sqrt(vx**2 + vy**2 + vz**2)
-        if v_abs > 5: 
+        if v_abs > 5:
             div_factor = v_abs / 5
             vx /= div_factor
             vy /= div_factor
             vz /= div_factor
+
+        vy_final = vy - wz * d * np.cos(yaw_pos)
 
         # Update the average of the velocities and compute the mean
         self.weig_avg[0, self.weig_ind] = vx

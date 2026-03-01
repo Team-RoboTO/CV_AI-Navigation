@@ -250,7 +250,7 @@ def generate_launch_description():
             'nms_threshold': 0.45,
             'num_classes': 5,
             'in_width': 640.0,
-            'in_height': 640.0,
+            'in_height': 480.0,
             'out_width': 640.0,
             'out_height': 480.0,
             'tf_frame_id': 'camera_color_optical_frame'
@@ -270,8 +270,8 @@ def generate_launch_description():
         parameters=[
             {'target_frame': 'odom'},
             {'max_armor_distance': 10.0},
+            {'light_ratio': 0.85},
             {'tracker.max_match_distance': 0.60},
-            {'tracker.max_match_yaw_diff': 3},
             {'tracker.tracking_thres': 2},
             {'tracker.lost_time_thres': 1.0},
             # EKF parameters
@@ -308,10 +308,14 @@ def generate_launch_description():
             {'accel_ema_alpha': 0.3},
             {'max_accel': 6.0},
             {'latency_gate_sigma': 2.5},
+            {'indirect_vyaw_threshold': 3.0},
+            {'indirect_timing_tolerance': 0.02},
+            {'indirect_max_candidates': 8},
+            {'gimbal_height': 0.5},
         ],
         extra_arguments=[{'use_intra_process_comms': True}]
     )
-    
+
     container = ComposableNodeContainer(
         name='biggest_container',
         namespace='very_big',

@@ -15,13 +15,11 @@ enum class ArmorType { SMALL = 0, LARGE = 1 };
 
 const std::string ARMOR_TYPE_STR[] = {"small", "large"};
 
-struct Light : public cv::RotatedRect
+struct Light
 {
-  Light() = default;
-  explicit Light(const cv::RotatedRect & rect) : cv::RotatedRect(rect) {}
-
   cv::Point2f top;
   cv::Point2f bottom;
+  cv::Point2f center;
 };
 
 struct Armor

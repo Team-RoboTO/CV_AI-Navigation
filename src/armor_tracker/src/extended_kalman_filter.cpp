@@ -26,6 +26,17 @@ void ExtendedKalmanFilter::setState(const Eigen::VectorXd & x0) { x_post = x0; }
 
 void ExtendedKalmanFilter::resetCovariance() { P_post = P0_; }
 
+void ExtendedKalmanFilter::inflateCovariance(int idx, double factor)
+{
+  // Scale the row and column by sqrt(factor) to inflate the diagonal by factor
+  // while preserving the correlation structure of off-diagonal elements.
+  double s = std::sqrt(factor);
+  P_post.row(idx) *= s;
+  P_post.col(idx) *= s;
+  // Re-enforce symmetry after the two separate scalings
+  P_post = (P_post + P_post.transpose()) * 0.5;
+}
+
 Eigen::MatrixXd ExtendedKalmanFilter::predict()
 {
   F = jacobian_f(x_post), Q = update_Q();

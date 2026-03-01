@@ -129,7 +129,6 @@ def generate_launch_description():
             {'target_frame': 'odom'},
             {'max_armor_distance': 10.0},
             {'tracker.max_match_distance': 0.60},
-            {'tracker.max_match_yaw_diff': 2.0},
             {'tracker.tracking_thres': 2},
             {'tracker.lost_time_thres': 1.0},
             # EKF parameters
@@ -166,6 +165,10 @@ def generate_launch_description():
             {'accel_ema_alpha': 0.3},
             {'max_accel': 6.0},
             {'latency_gate_sigma': 2.5},
+            {'indirect_vyaw_threshold': 3.0},
+            {'indirect_timing_tolerance': 0.02},
+            {'indirect_max_candidates': 8},
+            {'gimbal_height': 0.5},
         ],
         extra_arguments=[{'use_intra_process_comms': True}]
     )

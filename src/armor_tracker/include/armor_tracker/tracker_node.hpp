@@ -49,9 +49,6 @@ private:
   // Maximum allowable armor distance in the XOY plane
   double max_armor_distance_;
 
-  // PnP light-bar corner correction factor
-  double light_ratio_;
-
   // The time when the last message was received
   rclcpp::Time last_time_;
   double dt_ = 1.0 / 30.0;
@@ -92,6 +89,9 @@ private:
   double coast_damping_factor_;       // TEMP_LOST multiplier (0.85)
   double damping_innov_threshold_;    // position_diff threshold (0.10m)
   double yaw_innov_threshold_;       // yaw innovation threshold for overshoot damping (rad)
+
+  // PnP light-bar ratio (bbox → light-bar scaling)
+  double light_ratio_;
 
   // Dynamic TF from gimbal feedback
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf2_broadcaster_;

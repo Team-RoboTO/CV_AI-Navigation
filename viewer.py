@@ -52,7 +52,10 @@ class VisualizerNode(Node):
 
     def marker_cb(self, msg):
         if msg.ns == 'impact_point':
-            self.latest_marker = msg
+            if msg.action == Marker.DELETE:
+                self.latest_marker = None
+            else:
+                self.latest_marker = msg
 
     def target_cb(self, msg):
         self.tracking_info = msg
@@ -65,17 +68,15 @@ class VisualizerNode(Node):
         self.draw_and_publish()
 
     def bbox_to_rect(self, det, cv_img):
-        """Convert a Detection2D bbox to pixel rectangle, accounting for
-        encoder letterboxing (640x480 → 640x640 with 80px top/bottom padding)."""
+        """Convert a Detection2D bbox to pixel rectangle.
+        The YOLO decoder un-letterboxes coordinates back to camera-native
+        pixel space (matching camera_info K matrix), so no pad correction needed."""
         h_img, w_img, _ = cv_img.shape
-        pad_y = 80.0
-        x_scale = w_img / 640.0
-        y_scale = h_img / 480.0
 
-        cx = int(det.bbox.center.position.x * x_scale)
-        w  = int(det.bbox.size_x * x_scale)
-        cy = int((det.bbox.center.position.y - pad_y) * y_scale)
-        h  = int(det.bbox.size_y * y_scale)
+        cx = int(det.bbox.center.position.x)
+        w  = int(det.bbox.size_x)
+        cy = int(det.bbox.center.position.y)
+        h  = int(det.bbox.size_y)
 
         pt1 = (cx - w//2, cy - h//2)
         pt2 = (cx + w//2, cy + h//2)
@@ -116,15 +117,18 @@ class VisualizerNode(Node):
             # Tracking info overlay
             if self.tracking_info is not None and self.tracking_info.tracking:
                 tgt = self.tracking_info
-                dist = tgt.position.z  # depth in camera frame
+                dist = (tgt.position.x**2 + tgt.position.y**2 + tgt.position.z**2) ** 0.5
                 label = f"d={dist:.2f}m yaw={tgt.yaw:.1f} v={tgt.v_yaw:.1f}r/s"
                 cv2.putText(cv_img, label, (pt1[0], pt1[1] - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
         # 3. Impact point (red) — from trajectory solver marker
         if self.latest_marker is not None:
             # Transform from marker frame (odom) → camera optical frame
+            # Use latest TF (Time(0)) instead of marker stamp to avoid
+            # ExtrapolationException when TF and marker timestamps differ.
             pt_odom = PointStamped()
-            pt_odom.header = self.latest_marker.header
+            pt_odom.header.frame_id = self.latest_marker.header.frame_id
+            pt_odom.header.stamp = rclpy.time.Time().to_msg()  # latest TF
             pt_odom.point = self.latest_marker.pose.position
             try:
                 pt_cam = self.tf_buffer.transform(
@@ -147,8 +151,8 @@ class VisualizerNode(Node):
                         cv2.putText(cv_img, "IMPACT", (u + 10, v - 10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
             except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
-                    tf2_ros.ExtrapolationException):
-                pass  # TF not yet available — skip this frame
+                    tf2_ros.ExtrapolationException) as e:
+                self.get_logger().warn(f"Impact TF failed: {e}", throttle_duration_sec=2.0)
 
         out_msg = self.bridge.cv2_to_imgmsg(cv_img, encoding="bgr8")
         out_msg.header = self.latest_image.header

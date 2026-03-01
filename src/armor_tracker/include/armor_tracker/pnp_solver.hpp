@@ -32,11 +32,12 @@ private:
   cv::Mat camera_matrix_;
   cv::Mat dist_coeffs_;
 
-  // Unit: mm
-  static constexpr float SMALL_ARMOR_WIDTH = 135;
-  static constexpr float SMALL_ARMOR_HEIGHT = 55;
-  static constexpr float LARGE_ARMOR_WIDTH = 225;
-  static constexpr float LARGE_ARMOR_HEIGHT = 55;
+  // Unit: mm — actual armor plate dimensions (AM02 small, AM12 large)
+  // TODO: MEASURE THESE VALUES.
+  static constexpr float SMALL_ARMOR_WIDTH = 140;
+  static constexpr float SMALL_ARMOR_HEIGHT = 125;
+  static constexpr float LARGE_ARMOR_WIDTH = 235;
+  static constexpr float LARGE_ARMOR_HEIGHT = 127;
 
   // Four vertices of armor in 3d
   std::vector<cv::Point3f> small_armor_points_;

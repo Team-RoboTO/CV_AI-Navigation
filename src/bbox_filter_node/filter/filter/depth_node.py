@@ -42,22 +42,24 @@ class BoundingBoxDepthNode(Node):
     
     def publish_callback(self):
 
-        detections = self.detections 
+        detections = self.detections
         camera_info = self.camera_info
         depth_image_cv = self.depth_image
         start = time.time()
-        self.get_logger().info(f'time from previous execution{self.prev_time - start}')
-        
-        if self.detections is None or self.camera_info is None or self.depth_image is None:
+        self.get_logger().info(f'time from previous execution: {start - self.prev_time}')
+
+        if detections is None or camera_info is None or depth_image_cv is None:
             return
-        
-        for detection in self.detections.detections:
+
+        for detection in detections.detections:
+            if not detection.results:
+                continue
             # Check if the detection frame ID matches the depth image frame ID
             bbox = detection.bbox
-            x = int(bbox.center.position.x - bbox.size_x / 2)
-            y = int(bbox.center.position.y - bbox.size_y / 2)
-            width = int(bbox.size_x*0.7)
-            height = int(bbox.size_y*0.7)
+            x = int(bbox.center.position.x - bbox.size_x * 0.7 / 2)
+            y = int(bbox.center.position.y - bbox.size_y * 0.7 / 2)
+            width = int(bbox.size_x * 0.7)
+            height = int(bbox.size_y * 0.7)
 
             # Ensure the bounding box is within the image bounds
             x = max(0, x)
@@ -82,10 +84,10 @@ class BoundingBoxDepthNode(Node):
             # Compute the 3D coordinates in the camera frame
             center_x = bbox.center.position.x
             center_y = bbox.center.position.y
-            fx = self.camera_info.k[0]
-            fy = self.camera_info.k[4]
-            cx = self.camera_info.k[2]
-            cy = self.camera_info.k[5]
+            fx = camera_info.k[0]
+            fy = camera_info.k[4]
+            cx = camera_info.k[2]
+            cy = camera_info.k[5]
 
             relative_x = (center_x - cx) * mean_distance / fx
             relative_y = (center_y - cy) * mean_distance / fy

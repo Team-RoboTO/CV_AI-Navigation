@@ -19,11 +19,6 @@ v_p = 17.0
 lag_time = 0.025  # Time delay before shooting (seconds)
 num_refs = 1 # number of references for the angles
 
-path = Path()
-path.poses = []
-path.header.frame_id = 'camera_color_optical_frame'
-
-
 class ShootPrediction(Node):
 
     def __init__(self):
@@ -33,6 +28,10 @@ class ShootPrediction(Node):
         self.theta_0 = None
         self.x0 = self.y0 = self.z0 = None
         self.ax = self.ay = self.az = 0.0
+
+        self.path = Path()
+        self.path.poses = []
+        self.path.header.frame_id = 'camera_color_optical_frame'
         
         self.wx = 0
         self.wy = 0
@@ -158,8 +157,7 @@ class ShootPrediction(Node):
         # self.get_logger().info(f"AX: {self.ax}, AY: {self.ay}, , AZ: {self.az}")        
 
 
-        # ts = detection.header.stamp_nsec
-        ts = detection.header.stamp.nanosec
+        ts = detection.header.stamp.sec * 1_000_000_000 + detection.header.stamp.nanosec
 
         wht_avg_t, wht_avg_p, t_hit, _ = self.predictionWithout.prediction_without(self.x0, (self.y0), (self.z0),self.wz, ts)
         # I guess theta_ref should be brought back to the camera frame (theta_0) for absolute angles
@@ -193,12 +191,11 @@ class ShootPrediction(Node):
         newpoint.pose.position.x = - position[1]
         newpoint.pose.position.y = - position[2]
     
-        path.poses.append(newpoint)
-        if len(path.poses) > 30: 
-            # self.get_logger().info("len path poses > 30")
-            path.poses.pop(0)
+        self.path.poses.append(newpoint)
+        if len(self.path.poses) > 30:
+            self.path.poses.pop(0)
 
-        self._predicted_shoot_publisher.publish(path)
+        self._predicted_shoot_publisher.publish(self.path)
         
 
         end_node = time.time()

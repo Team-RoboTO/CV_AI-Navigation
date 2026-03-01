@@ -81,6 +81,7 @@ class FilterPublisher(Node):
             color = names[class_id]
 
             if color == self.color_to_shoot:
+                score += _get_close(detection)
                 score += _get_centered(detection, self.image_width, self.image_height)
                 score += _get_wide(detection, self.image_width, self.image_height)
                 score += _get_fract_sizes(detection)
@@ -175,7 +176,7 @@ class FilterPublisher(Node):
         twist = Twist()
         twist.angular.z = -K_YAW * normalized_error_x
         twist.angular.y = -K_PITCH * normalized_error_y - PITCH_OFFSET
-        twist.angular.x = 1.0 if (abs(twist.angular.z) <= SHOOT_THRESHOLD and abs(twist.angular.y) <= SHOOT_THRESHOLD) else 0.0
+        twist.angular.x = 1.0 if (abs(normalized_error_x) <= SHOOT_THRESHOLD and abs(normalized_error_y) <= SHOOT_THRESHOLD) else 0.0
 
         return twist
 

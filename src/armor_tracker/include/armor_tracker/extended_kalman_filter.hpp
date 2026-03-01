@@ -26,6 +26,10 @@ public:
   // Reset P_post to initial covariance (call after hard state resets)
   void resetCovariance();
 
+  // Inflate covariance of one state element (and its cross-correlations) by factor.
+  // Use after yaw snaps to reflect that the new value bypassed the EKF update.
+  void inflateCovariance(int idx, double factor);
+
   // Compute a predicted state
   Eigen::MatrixXd predict();
 

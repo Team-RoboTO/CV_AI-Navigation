@@ -20,14 +20,12 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   // Maximum allowable armor distance in the XOY plane
   max_armor_distance_ = this->declare_parameter("max_armor_distance", 10.0);
 
-  // PnP light-bar corner correction: scale bbox half-width inward to match
-  // actual light-bar separation (tune empirically via /tracker/info yaw_diff)
+  // Ratio to scale YOLO bbox inward to approximate light-bar positions
   light_ratio_ = this->declare_parameter("light_ratio", 0.85);
 
   // Tracker
   double max_match_distance = this->declare_parameter("tracker.max_match_distance", 0.15);
-  double max_match_yaw_diff = this->declare_parameter("tracker.max_match_yaw_diff", 3);
-  tracker_ = std::make_unique<Tracker>(max_match_distance, max_match_yaw_diff);
+  tracker_ = std::make_unique<Tracker>(max_match_distance);
   tracker_->tracking_thres = this->declare_parameter("tracker.tracking_thres", 5);
   lost_time_thres_ = this->declare_parameter("tracker.lost_time_thres", 0.3);
 
@@ -139,7 +137,18 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
     double dist = std::sqrt(z[0]*z[0] + z[1]*z[1] + z[2]*z[2]);
     double ps = r_xyz_base_ + r_xyz_slope_ * dist;
     double ys = r_yaw_base_ + r_yaw_slope_ * dist;
-    r.diagonal() << ps*ps, ps*ps, ps*ps, ys*ys;
+
+    // Angle-aware noise: PnP accuracy degrades as ~1/cos²(oblique_angle)
+    // because projected width shrinks as cos(angle), amplifying pixel errors.
+    // z = [xa, ya, za, yaw]. Bearing from armor→camera is opposite of camera→armor.
+    double bearing_opp = std::atan2(-z[1], -z[0]);
+    double face_angle = std::abs(std::remainder(z[3] - bearing_opp, 2.0 * M_PI));
+    double cos_fa = std::cos(face_angle);
+    // Clamp at cos²=0.04 (≈78°) to cap inflation at 25x
+    double angle_factor = 1.0 / std::max(cos_fa * cos_fa, 0.04);
+
+    r.diagonal() << ps*ps*angle_factor, ps*ps*angle_factor,
+                     ps*ps*angle_factor, ys*ys*angle_factor;
     return r;
   };
   // P - initial error covariance
@@ -209,6 +218,7 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   // See http://wiki.ros.org/rviz/DisplayTypes/Marker
   position_marker_.ns = "position";
   position_marker_.type = visualization_msgs::msg::Marker::SPHERE;
+  position_marker_.pose.orientation.w = 1.0;
   position_marker_.scale.x = position_marker_.scale.y = position_marker_.scale.z = 0.1;
   position_marker_.color.a = 1.0;
   position_marker_.color.g = 1.0;
@@ -327,36 +337,29 @@ void ArmorTrackerNode::armorsCallback(
     Armor armor_obj;
     armor_obj.center = cv::Point2f(center_x, center_y);
 
-    // Heuristic for Armor Type
+    // Heuristic for Armor Type (plate aspect: small~1.12, large~1.85)
     float ratio = width / height;
-    armor_obj.type = (ratio > 3.0) ? ArmorType::LARGE : ArmorType::SMALL;
+    armor_obj.type = (ratio > 1.5) ? ArmorType::LARGE : ArmorType::SMALL;
     armor_obj.number = detection.results.empty() ? "unknown" : detection.results[0].hypothesis.class_id;
     armor_obj.confidence = detection.results.empty() ? 0.0 : detection.results[0].hypothesis.score;
     // Map class_id to type if possible, but ratio heuristic is good fallback
     // Set classification result for debug
     armor_obj.classfication_result = armor_obj.number;
 
-    // Construct lights (approximated from bbox).
-    // YOLO bbox edges overshoot the actual light-bar centers by ~15% due to
-    // padding and the non-light area between the bars. Scale inward to reduce
-    // the systematic PnP yaw/position bias (~8 cm at 5 m without correction).
-    const float light_ratio = static_cast<float>(light_ratio_);
-    const float lx = center_x - light_ratio * width / 2;
-    const float rx = center_x + light_ratio * width / 2;
+    // Scale bbox inward by light_ratio to approximate light-bar corners.
+    // YOLO bbox covers the full armor plate, which is wider than the light bars.
+    const float lr = static_cast<float>(light_ratio_);
+    const float lx = center_x - lr * width / 2;
+    const float rx = center_x + lr * width / 2;
+    const float ty = center_y - lr * height / 2;
+    const float by = center_y + lr * height / 2;
 
-    // Left light
     armor_obj.left_light.center = cv::Point2f(lx, center_y);
-    armor_obj.left_light.size = cv::Size2f(width / 10, height);
-    armor_obj.left_light.angle = 90;
-    armor_obj.left_light.top    = cv::Point2f(lx, center_y - height / 2);
-    armor_obj.left_light.bottom = cv::Point2f(lx, center_y + height / 2);
-
-    // Right light
+    armor_obj.left_light.top    = cv::Point2f(lx, ty);
+    armor_obj.left_light.bottom = cv::Point2f(lx, by);
     armor_obj.right_light.center = cv::Point2f(rx, center_y);
-    armor_obj.right_light.size = cv::Size2f(width / 10, height);
-    armor_obj.right_light.angle = 90;
-    armor_obj.right_light.top    = cv::Point2f(rx, center_y - height / 2);
-    armor_obj.right_light.bottom = cv::Point2f(rx, center_y + height / 2);
+    armor_obj.right_light.top   = cv::Point2f(rx, ty);
+    armor_obj.right_light.bottom = cv::Point2f(rx, by);
 
     cv::Mat rvec, tvec;
     bool success = pnp_solver_->solvePnP(armor_obj, rvec, tvec);
@@ -392,16 +395,24 @@ void ArmorTrackerNode::armorsCallback(
   // Pointer to the converted message
   auto armors_ptr = std::make_shared<auto_aim_interfaces::msg::Armors>(armors_msg);
 
-  // Transform armor position from image frame to world coordinate
-  for (auto & armor : armors_ptr->armors) {
-    geometry_msgs::msg::PoseStamped ps;
-    ps.header = armors_ptr->header;
-    ps.pose = armor.pose;
+  // Transform armor positions from image frame to world coordinate
+  // Look up the transform once and apply it to all armors (avoids N redundant buffer lookups)
+  if (!armors_ptr->armors.empty()) {
+    geometry_msgs::msg::TransformStamped tf_stamped;
     try {
-      armor.pose = tf2_buffer_->transform(ps, target_frame_).pose;
+      tf_stamped = tf2_buffer_->lookupTransform(
+        target_frame_, armors_ptr->header.frame_id,
+        armors_ptr->header.stamp, rclcpp::Duration::from_seconds(0.01));
     } catch (const tf2::TransformException & ex) {
       RCLCPP_ERROR(get_logger(), "TF2 error: %s", ex.what());
       return;
+    }
+    for (auto & armor : armors_ptr->armors) {
+      geometry_msgs::msg::PoseStamped ps_in, ps_out;
+      ps_in.header = armors_ptr->header;
+      ps_in.pose = armor.pose;
+      tf2::doTransform(ps_in, ps_out, tf_stamped);
+      armor.pose = ps_out.pose;
     }
   }
 
@@ -601,7 +612,9 @@ void ArmorTrackerNode::publishMarkers(const auto_aim_interfaces::msg::Target & t
     angular_v_marker_.points.emplace_back(arrow_end);
 
     armor_marker_.action = visualization_msgs::msg::Marker::ADD;
-    armor_marker_.scale.y = tracker_->tracked_armor.type == "small" ? 0.135 : 0.23;
+    bool is_small = (tracker_->tracked_armor.type == "small");
+    armor_marker_.scale.y = is_small ? 0.140 : 0.235;
+    armor_marker_.scale.z = is_small ? 0.125 : 0.127;
     bool is_current_pair = true;
     size_t a_n = target_msg.armors_num;
     geometry_msgs::msg::Point p_a;
