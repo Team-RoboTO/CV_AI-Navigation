@@ -69,18 +69,15 @@ class VisualizerNode(Node):
 
     def bbox_to_rect(self, det, cv_img):
         """Convert a Detection2D bbox to pixel rectangle.
-        The YOLO decoder un-letterboxes coordinates back to camera-native
-        pixel space (matching camera_info K matrix), so no pad correction needed."""
+        Scales from decoder output space (camera_info resolution) to actual image."""
         h_img, w_img, _ = cv_img.shape
-        pad_y = 80.0
-        x_scale = w_img / 640.0
-        y_scale = h_img / 480.0
+        x_scale = w_img / self.camera_info.width
+        y_scale = h_img / self.camera_info.height
 
         cx = int(det.bbox.center.position.x * x_scale)
         w  = int(det.bbox.size_x * x_scale)
-        cy = int((det.bbox.center.position.y - pad_y) * y_scale)
+        cy = int(det.bbox.center.position.y * y_scale)
         h  = int(det.bbox.size_y * y_scale)
-
         pt1 = (cx - w//2, cy - h//2)
         pt2 = (cx + w//2, cy + h//2)
         return pt1, pt2, (cx, cy)
