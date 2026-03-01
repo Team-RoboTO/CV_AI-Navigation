@@ -23,16 +23,16 @@ class VisualizerNode(Node):
         self.camera_info = None
         self.tracking_info = None
 
-        self.create_subscription(Image, '/camera/camera/color/image_raw', self.img_cb, 10)
-        self.create_subscription(CameraInfo, '/camera/camera/color/camera_info', self.info_cb, 10)
+        self.create_subscription(Image, '/camera/camera/color/image_raw', self.img_cb, qos_profile_sensor_data)
+        self.create_subscription(CameraInfo, '/camera/camera/color/camera_info', self.info_cb, qos_profile_sensor_data)
         self.create_subscription(Detection2DArray, '/detections_output', self.bbox_cb, qos_profile_sensor_data)
         self.create_subscription(Detection2D, '/detections_output/optimal_target', self.optimal_cb, qos_profile_sensor_data)
-        self.create_subscription(Marker, '/trajectory/marker', self.marker_cb, 10)
+        self.create_subscription(Marker, '/trajectory/marker', self.marker_cb, qos_profile_sensor_data)
 
         # Try subscribing to tracker target for distance/tracking info
         try:
             from auto_aim_interfaces.msg import Target
-            self.create_subscription(Target, '/tracker/target', self.target_cb, 10)
+            self.create_subscription(Target, '/tracker/target', self.target_cb, qos_profile_sensor_data)
         except ImportError:
             self.get_logger().warn("auto_aim_interfaces not found — run: source install/setup.bash")
 
@@ -72,11 +72,14 @@ class VisualizerNode(Node):
         The YOLO decoder un-letterboxes coordinates back to camera-native
         pixel space (matching camera_info K matrix), so no pad correction needed."""
         h_img, w_img, _ = cv_img.shape
+        pad_y = 80.0
+        x_scale = w_img / 640.0
+        y_scale = h_img / 480.0
 
-        cx = int(det.bbox.center.position.x)
-        w  = int(det.bbox.size_x)
-        cy = int(det.bbox.center.position.y)
-        h  = int(det.bbox.size_y)
+        cx = int(det.bbox.center.position.x * x_scale)
+        w  = int(det.bbox.size_x * x_scale)
+        cy = int((det.bbox.center.position.y - pad_y) * y_scale)
+        h  = int(det.bbox.size_y * y_scale)
 
         pt1 = (cx - w//2, cy - h//2)
         pt2 = (cx + w//2, cy + h//2)
