@@ -57,11 +57,15 @@ void Tracker::init(const Armors::SharedPtr & armors_msg)
 void Tracker::update(const Armors::SharedPtr & armors_msg)
 {
   // KF predict
+  // ekf_prediction is a 9D state vector: [xc, v_xc, yc, v_yc, za, v_za, yaw, v_yaw, r]
+  // representing the robot center position/velocity, armor height velocity,
+  // yaw angle/rate, and orbit radius — all propagated forward one timestep
+  // by the process model (no measurement update yet).
   Eigen::VectorXd ekf_prediction = ekf.predict();
   RCLCPP_DEBUG(rclcpp::get_logger("armor_tracker"), "EKF predict");
 
   bool matched = false;
-  // Use KF prediction as default target state if no matched armor is found
+  // Use EKF prediction as default target state if no matched armor is found
   target_state = ekf_prediction;
 
   if (!armors_msg->armors.empty()) {
@@ -107,13 +111,35 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
         angles::shortest_angular_distance(ekf_prediction(6), measured_yaw);
       double yaw_diff = std::abs(yaw_innov_signed);
 
-      // Store tracker info
+      // Store diagnostics for external inspection (e.g. TrackerInfo publisher):
+      //   info_position_diff   — Euclidean distance [m] between the EKF-predicted
+      //                          armor position and the measured armor position;
+      //                          used as the primary matching gate threshold.
+      //   info_yaw_diff        — Unsigned angular error [rad] between the EKF-predicted
+      //                          yaw (state index 6) and the measured yaw; used to
+      //                          detect armor-jump events when it exceeds max_match_yaw_diff_.
+      //   info_yaw_innov_signed — Signed version of the same yaw innovation
+      //                          (positive = measured leads predicted, negative = lags);
+      //                          preserved so callers can tell which direction the
+      //                          robot is rotating relative to our prediction.
+      //   info_position_innov  — 3D position innovation vector (measured − predicted) [m];
+      //                          useful for tuning EKF noise covariances.
       info_position_diff = position_diff;
       info_yaw_diff = yaw_diff;
       info_yaw_innov_signed = yaw_innov_signed;
       info_position_innov = Eigen::Vector3d(p.x, p.y, p.z) - predicted_position;
       tracked_armor = selected_armor;
 
+      // Three-way decision based on how well the detected armor matches the EKF prediction:
+      //   MATCH   — both position and yaw are within gate thresholds → feed the
+      //             measurement into the EKF (update step) and mark as matched.
+      //   JUMP    — yaw error exceeds max_match_yaw_diff_ even though the armor was
+      //             the closest candidate → the robot has rotated far enough that a
+      //             different face is now visible; call handleArmorJump() to re-initialise
+      //             the EKF yaw and radius state for the new face.
+      //   MISS    — position is too far off but yaw is within bounds → transient
+      //             detection noise; log a warning and leave target_state as the
+      //             raw EKF prediction (no update, matched stays false).
       if (position_diff < max_match_distance_ && yaw_diff < max_match_yaw_diff_) {
         // Matched armor found
         matched = true;
@@ -131,7 +157,26 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
     }
   }
 
-  // Prevent radius from spreading
+  // Clamp the orbit radius (state index 8) to the physical bounds [0.12, 0.40] m.
+  //
+  // WHY THIS IS NECESSARY:
+  // The EKF treats radius as a free state variable and updates it whenever a new
+  // armor measurement arrives.  Without bounds, two failure modes corrupt it:
+  //
+  //   1. Divergence toward zero — if a noisy or mismatched detection places the
+  //      armor very close to the center, the EKF can drive the radius to near-zero.
+  //      A near-zero radius collapses the armor position onto the center point,
+  //      making face-position prediction meaningless and causing the trajectory
+  //      solver to aim at the wrong point.
+  //
+  //   2. Divergence toward large values — a spurious detection far from the robot
+  //      center pushes the radius up.  The EKF then predicts all armor faces far
+  //      from the true center, the matching gate fails every frame, and the tracker
+  //      goes LOST even though the robot is still visible.
+  //
+  // The bounds [0.12, 0.40] m cover the full range of RoboMaster robot chassis
+  // geometries (infantry ≈ 0.14–0.18 m, hero/sentry up to ~0.35 m).  Any value
+  // outside this range is physically impossible and must be an EKF artefact.
   if (target_state(8) < 0.12) {
     target_state(8) = 0.12;
     ekf.setState(target_state);
@@ -140,6 +185,7 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
     ekf.setState(target_state);
   }
 
+  // TODO: abscertain this v_yaw_max value is correct 
   // Clamp v_yaw to physically plausible range.
   // RoboMaster robots cannot spin faster than ~15 rad/s (~143 rpm);
   // values beyond this indicate EKF divergence from a bad detection.
@@ -150,31 +196,50 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
     RCLCPP_WARN(rclcpp::get_logger("armor_tracker"), "v_yaw clamped — covariance reset");
   }
 
-  // Tracking state machine
+  // Tracking state machine:
+  //   LOST ──► DETECTING ──(tracking_thres consecutive matches)──► TRACKING
+  //                │                                                  │
+  //            any miss                                            any miss
+  //                ▼                                                  ▼
+  //              LOST                                            TEMP_LOST
+  //                                                           │          │
+  //                                              match again  │          │ lost_thres misses
+  //                                                           ▼          ▼
+  //                                                        TRACKING     LOST
   if (tracker_state == DETECTING) {
     if (matched) {
+      // Accumulate consecutive matches; promote only after tracking_thres frames
+      // to avoid locking onto a single false-positive detection.
       detect_count_++;
       if (detect_count_ > tracking_thres) {
         detect_count_ = 0;
         tracker_state = TRACKING;
       }
     } else {
+      // Any miss in DETECTING resets the counter — the candidate was unreliable.
       detect_count_ = 0;
       tracker_state = LOST;
     }
   } else if (tracker_state == TRACKING) {
     if (!matched) {
+      // First missed frame: don't drop immediately, give the EKF a chance to
+      // coast through a brief occlusion or detection dropout.
       tracker_state = TEMP_LOST;
       lost_count_++;
     }
+    // If matched: stay in TRACKING, nothing to do.
   } else if (tracker_state == TEMP_LOST) {
     if (!matched) {
+      // Still no detection — increment miss counter and wait up to lost_thres
+      // frames before giving up and resetting to LOST.
       lost_count_++;
       if (lost_count_ > lost_thres) {
         lost_count_ = 0;
         tracker_state = LOST;
       }
     } else {
+      // Detection recovered — snap back to TRACKING immediately without
+      // requiring re-confirmation (detect_count_ threshold).
       tracker_state = TRACKING;
       lost_count_ = 0;
     }

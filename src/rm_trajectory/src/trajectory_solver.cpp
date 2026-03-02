@@ -585,19 +585,50 @@ void TrajectorySolverNode::targetCallback(
   double pt = t0 + time_bias_;
 
   // findBestFace: given a prediction time, return the index of the armor face
-  // whose normal is closest to the camera-to-robot bearing at that time.
-  // The face normal points outward; we want the face pointing back at us.
+  // that is the best shooting target, considering both distance and oblique angle.
+  //
+  // Score = distance / cos(oblique_angle)  ("effective distance")
+  //   - A close, square-on face scores low (good).
+  //   - A far, oblique face scores high (bad).
+  //   - cos(oblique) < 0.1 means the face is >84° away — skip entirely.
+  //
+  // This replaces the old pure-angle selection which ignored that a closer face
+  // at a slightly worse angle can be a better target (shorter flight time,
+  // less prediction error, more surface area).
   auto findBestFace = [&](double predict_time) -> int {
     double pred_yaw = msg->yaw + msg->v_yaw * predict_time;
     double pred_cx = xc + vx * predict_time + 0.5 * ax * predict_time * predict_time;
     double pred_cy = yc + vy * predict_time + 0.5 * ay * predict_time * predict_time;
-    double bear = std::atan2(pred_cy, pred_cx);  // camera-to-center bearing
-    double best_d = M_PI;
+    double pred_cz = za + vz * predict_time + 0.5 * az * predict_time * predict_time;
+
+    double best_score = 1e9;
     int best_f = 0;
     for (int i = 0; i < n_faces; i++) {
-      double fy = pred_yaw + i * face_spacing;
-      double d = std::abs(angles::shortest_angular_distance(bear, fy));
-      if (d < best_d) { best_d = d; best_f = i; }
+      double face_yaw = pred_yaw + i * face_spacing;
+
+      // Compute actual face position (same geometry as the aiming code below)
+      bool is_current_pair = (i % 2 == 0);
+      double r = is_current_pair ? msg->radius_1 : msg->radius_2;
+      double dz_off = (n_faces == 4 && !is_current_pair) ? msg->dz : 0.0;
+
+      double fx = pred_cx - r * std::cos(face_yaw);
+      double fy = pred_cy - r * std::sin(face_yaw);
+      double fz = pred_cz + dz_off;
+
+      // Distance from camera (origin) to this face
+      double dist = std::sqrt(fx * fx + fy * fy + fz * fz);
+
+      // Oblique angle: angle between face outward normal and face-to-camera direction
+      double face_normal = face_yaw + M_PI;  // outward from center
+      double face_to_cam = std::atan2(-fy, -fx);
+      double oblique = std::abs(angles::shortest_angular_distance(face_normal, face_to_cam));
+
+      // Effective distance: penalises oblique faces (less visible area)
+      double cos_obl = std::cos(oblique);
+      if (cos_obl < 0.1) continue;  // face pointing away (>84°)
+      double score = dist / cos_obl;
+
+      if (score < best_score) { best_score = score; best_f = i; }
     }
     return best_f;
   };
