@@ -211,26 +211,16 @@ void Tracker::initEKF(const Armor & a)
   ekf.setState(target_state);
 }
 
-// Defaults to NORMAL_4, it was made to handle turrets and different types of armor.
-// It was added to consider edge cases, it is built to support different types of armors, but IT CAN BE EASILY DISCARDED IN REFACTORING. 
-// FOR NOW WE CONSIDER IT.
+// Color-based YOLO class IDs (0=blue,1=grey,2=purple,3=red) cannot distinguish
+// robot types (hero, sentry, balance, outpost). Always assume NORMAL_4 so
+// yaw-jump thresholds and trajectory face-spacing are correct for standard robots.
+// BALANCE_2 / OUTPOST_3 enums are kept for future use when robot-type detection
+// is available (e.g. via a separate classifier or communication from the lower computer).
 void Tracker::updateArmorsNum(const Armor & armor)
 {
-  if (armor.type == "large" && (tracked_id == "3" || tracked_id == "4" || tracked_id == "5")) {
-    tracked_armors_num = ArmorsNum::BALANCE_2;
-  } else if (tracked_id == "outpost") {
-    tracked_armors_num = ArmorsNum::OUTPOST_3;
-  } else {
-    tracked_armors_num = ArmorsNum::NORMAL_4;
-  }
-
-  // Adjust yaw jump threshold to match the geometric spacing of this robot's armors.
-  // Using (inter-armor angle) minus a 0.3 rad margin to avoid false positives mid-spin.
-  switch (tracked_armors_num) {
-    case ArmorsNum::BALANCE_2:  max_match_yaw_diff_ = M_PI - 0.3;         break;  // ~150°
-    case ArmorsNum::OUTPOST_3:  max_match_yaw_diff_ = 2.0 * M_PI / 3.0 - 0.3;  break;  // ~90°
-    default:  /* NORMAL_4 */    max_match_yaw_diff_ = M_PI / 3.0;          break;  // ~60°
-  }
+  (void)armor;  // unused until robot-type detection is available
+  tracked_armors_num = ArmorsNum::NORMAL_4;
+  max_match_yaw_diff_ = M_PI / 3.0;  // ~60°
 }
 
 void Tracker::handleArmorJump(const Armor & current_armor)

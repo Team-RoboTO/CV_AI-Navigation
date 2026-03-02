@@ -269,6 +269,7 @@ def generate_launch_description():
         ],
         parameters=[
             {'target_frame': 'odom'},              # TF frame for 3D pose output
+            {'target_classes': ['3']},              # YOLO class IDs to track (0=blue,1=grey,2=purple,3=red); grey always excluded
             {'max_armor_distance': 10.0},           # [m] discard PnP detections farther than this
             {'light_ratio': 1.0},                   # min light-bar aspect ratio to accept as armor
             # Tracker

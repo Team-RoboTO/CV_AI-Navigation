@@ -20,6 +20,7 @@
 
 // STD
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -48,6 +49,9 @@ private:
 
   // Maximum allowable armor distance in the XOY plane
   double max_armor_distance_;
+
+  // YOLO class IDs to track (e.g. "3" = red_armor); grey/dead ("1") always excluded
+  std::set<std::string> target_classes_;
 
   // The time when the last message was received
   rclcpp::Time last_time_;

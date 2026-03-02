@@ -20,6 +20,20 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   // Maximum allowable armor distance in the XOY plane
   max_armor_distance_ = this->declare_parameter("max_armor_distance", 10.0);
 
+  // YOLO class IDs to track (0=blue, 1=grey/dead, 2=purple, 3=red)
+  // Default: {"3"} = red only. Grey ("1") is always removed regardless of config.
+  auto target_classes_vec = this->declare_parameter<std::vector<std::string>>(
+    "target_classes", std::vector<std::string>{"3"});
+  target_classes_ = std::set<std::string>(target_classes_vec.begin(), target_classes_vec.end());
+  target_classes_.erase("1");  // grey/dead — never track
+  std::string classes_str;
+  for (const auto & c : target_classes_) {
+    if (!classes_str.empty()) classes_str += ", ";
+    classes_str += c;
+  }
+  RCLCPP_INFO(this->get_logger(),
+    "Tracking %zu class(es): %s", target_classes_.size(), classes_str.c_str());
+
   // Ratio to scale YOLO bbox inward to approximate light-bar positions
   light_ratio_ = this->declare_parameter("light_ratio", 0.85);
 
@@ -348,6 +362,15 @@ void ArmorTrackerNode::armorsCallback(
     if (height < 1.0 || width < 1.0) {
       detection_idx++;
       continue;
+    }
+
+    // Filter by YOLO class ID — skip teammates, dead robots, etc.
+    if (!detection.results.empty()) {
+      const auto & class_id = detection.results[0].hypothesis.class_id;
+      if (target_classes_.find(class_id) == target_classes_.end()) {
+        detection_idx++;
+        continue;
+      }
     }
 
     // Create a fake Armor object for PnP
