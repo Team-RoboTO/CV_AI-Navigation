@@ -17,8 +17,7 @@
     rgb_camera.enable_auto_exposure: true
     rgb_camera.exposure: 100
     rgb_camera.gain: 16
-    rgb_camera.enable_auto_white_balance: false
-    rgb_camera.white_balance: 4600.0
+    rgb_camera.enable_auto_white_balance: true
 
     publish_tf: true
     tf_publish_rate: 20.0
