@@ -388,7 +388,7 @@ void TrajectorySolverNode::targetCallback(
         // For 4-armor robots, faces alternate between two radii (r1, r2) and
         // two heights (za, za+dz) — even-indexed faces use radius_1/height za.
         bool is_current_pair = (i % 2 == 0);
-        double r = is_current_pair ? msg->radius_1 : msg->radius_2;
+        double r = (n_faces == 4 && !is_current_pair) ? msg->radius_2 : msg->radius_1;
         double dz_offset = (n_faces == 4 && !is_current_pair) ? msg->dz : 0.0;
 
         // Kinematic prediction of robot center at alignment time t_a
@@ -484,7 +484,7 @@ void TrajectorySolverNode::targetCallback(
 
       // Recompute impact position and trajectory at the refined alignment time
       bool is_current_pair = (best->face % 2 == 0);
-      double r = is_current_pair ? msg->radius_1 : msg->radius_2;
+      double r = (n_faces == 4 && !is_current_pair) ? msg->radius_2 : msg->radius_1;
       double dz_offset = (n_faces == 4 && !is_current_pair) ? msg->dz : 0.0;
 
       double pcx = xc + vx * best_ta + 0.5 * ax * best_ta * best_ta;
@@ -608,7 +608,7 @@ void TrajectorySolverNode::targetCallback(
 
       // Compute actual face position (same geometry as the aiming code below)
       bool is_current_pair = (i % 2 == 0);
-      double r = is_current_pair ? msg->radius_1 : msg->radius_2;
+      double r = (n_faces == 4 && !is_current_pair) ? msg->radius_2 : msg->radius_1;
       double dz_off = (n_faces == 4 && !is_current_pair) ? msg->dz : 0.0;
 
       double fx = pred_cx - r * std::cos(face_yaw);
@@ -652,7 +652,7 @@ void TrajectorySolverNode::targetCallback(
     // Even-indexed faces: radius_1 / height za
     // Odd-indexed faces:  radius_2 / height za+dz  (for 4-armor robots)
     bool is_current_pair = (best_face % 2 == 0);
-    double r = is_current_pair ? msg->radius_1 : msg->radius_2;
+    double r = (n_faces == 4 && !is_current_pair) ? msg->radius_2 : msg->radius_1;
     double dz_offset = (n_faces == 4 && !is_current_pair) ? msg->dz : 0.0;
 
     // Predict robot center at total_t then offset by armor radius to get plate position

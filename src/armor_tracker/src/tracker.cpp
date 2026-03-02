@@ -344,6 +344,13 @@ void Tracker::handleArmorJump(const Armor & current_armor)
     ekf.inflateCovariance(4, 4.0);  // za:   variance x4 (snapped, uncertain)
     ekf.inflateCovariance(5, 4.0);  // v_za: variance x4 (zeroed above)
   }
+
+  // Feed the measurement through the EKF update step so the center position
+  // (xc, yc) is properly corrected via the Kalman gain. Without this, the
+  // jump only snaps yaw/radius/za but leaves xc, yc at the raw predict()
+  // values — the actual armor observation is never fused.
+  measurement = Eigen::Vector4d(p.x, p.y, p.z, yaw);
+  target_state = ekf.update(measurement);
 }
 
 double Tracker::orientationToYaw(const geometry_msgs::msg::Quaternion & q)
