@@ -1,6 +1,3 @@
-// Copyright 2022 Chen Jun
-// Licensed under the MIT License.
-
 #ifndef ARMOR_TRACKER__PNP_SOLVER_HPP_
 #define ARMOR_TRACKER__PNP_SOLVER_HPP_
 

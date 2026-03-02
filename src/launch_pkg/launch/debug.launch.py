@@ -268,25 +268,28 @@ def generate_launch_description():
             ('/camera_info', '/camera/camera/color/camera_info')
         ],
         parameters=[
-            {'target_frame': 'odom'},
-            {'max_armor_distance': 10.0},
-            {'light_ratio': 1.0},
-            {'tracker.max_match_distance': 0.60},
-            {'tracker.tracking_thres': 2},
-            {'tracker.lost_time_thres': 1.0},
-            # EKF parameters
-            {'ekf.sigma2_q_xyz': 2.0},
-            {'ekf.sigma2_q_yaw': 5.0},
-            {'ekf.sigma2_q_r': 0.5},
-            {'ekf.xyz_damping_alpha': 0.95},
-            {'ekf.yaw_damping_alpha': 0.95},
-            {'ekf.coast_damping_factor': 0.85},
-            {'ekf.damping_innov_threshold': 0.10},
-            {'ekf.yaw_innov_threshold': 0.15},
-            # Gimbal TF parameters
-            {'gimbal.height': .325},
-            {'gimbal.yaw_sign': 1.0},
-            {'gimbal.pitch_sign': 1.0},
+            {'target_frame': 'odom'},              # TF frame for 3D pose output
+            {'max_armor_distance': 10.0},           # [m] discard PnP detections farther than this
+            {'light_ratio': 1.0},                   # min light-bar aspect ratio to accept as armor
+            # Tracker
+            {'tracker.max_match_distance': 0.60},   # [m] max 3D distance between EKF prediction and detection to match
+            {'tracker.max_track_range': 6.0},        # [m] drop target if farther than this from camera
+            {'tracker.tracking_thres': 2},           # consecutive matches needed to transition DETECTING → TRACKING
+            {'tracker.lost_time_thres': 1.0},        # [s] time without match before TEMP_LOST → LOST
+            # EKF process noise
+            {'ekf.sigma2_q_xyz': 2.0},              # position process noise variance (higher → trusts measurements more)
+            {'ekf.sigma2_q_yaw': 5.0},              # yaw process noise variance
+            {'ekf.sigma2_q_r': 0.5},                # radius process noise variance
+            # EKF velocity damping (alpha^(dt/T) decay per step; 1.0 = no decay)
+            {'ekf.xyz_damping_alpha': 0.95},         # position velocity damping (lower → stronger braking)
+            {'ekf.yaw_damping_alpha': 0.95},         # yaw velocity damping
+            {'ekf.coast_damping_factor': 0.85},      # extra damping multiplier during TEMP_LOST coasting
+            {'ekf.damping_innov_threshold': 0.10},   # [m] position innovation above which overshoot damping activates
+            {'ekf.yaw_innov_threshold': 0.15},       # [rad] yaw innovation above which yaw damping activates
+            # Gimbal TF
+            {'gimbal.height': .325},                 # [m] gimbal pivot height above ground
+            {'gimbal.yaw_sign': 1.0},                # sign flip for yaw axis (+1 or -1)
+            {'gimbal.pitch_sign': 1.0},              # sign flip for pitch axis (+1 or -1)
         ],
         extra_arguments=[{'use_intra_process_comms': True}]
     )
@@ -297,21 +300,27 @@ def generate_launch_description():
         plugin='rm_auto_aim::TrajectorySolverNode',
         name='trajectory_solver',
         parameters=[
-            {'bullet_speed': 15.0},
-            {'gravity': 9.8},
-            {'k': 0.01},
-            {'time_bias': 0.05},
-            {'time_bias_alpha': 0.35},
-            {'min_fire_dist': 0.5},
-            {'max_fire_dist': 10.0},
-            {'angular_window': 0.09},
-            {'accel_ema_alpha': 0.3},
-            {'max_accel': 6.0},
-            {'latency_gate_sigma': 2.5},
-            {'indirect_vyaw_threshold': 3.0},
-            {'indirect_timing_tolerance': 0.02},
-            {'indirect_max_candidates': 8},
-            {'gimbal_height': 0.325},
+            # Ballistics
+            {'bullet_speed': 15.0},                 # [m/s] muzzle velocity of the projectile
+            {'gravity': 9.8},                        # [m/s²] gravitational acceleration
+            {'k': 0.01},                             # air drag coefficient (higher → more drop compensation)
+            # Latency compensation
+            {'time_bias': 0.05},                     # [s] fixed pipeline latency added to flight time
+            {'time_bias_alpha': 0.35},               # EMA smoothing factor for adaptive time bias (0–1)
+            # Fire gate
+            {'min_fire_dist': 0.5},                  # [m] minimum range to allow firing
+            {'max_fire_dist': 10.0},                 # [m] maximum range to allow firing
+            {'angular_window': 0.09},                # [rad] half-width of face-aligned fire gate (~5°)
+            # Acceleration estimator
+            {'accel_ema_alpha': 0.3},                # EMA smoothing for target acceleration estimate (0–1)
+            {'max_accel': 6.0},                      # [m/s²] clamp on estimated acceleration
+            {'latency_gate_sigma': 2.5},             # sigma multiplier for timing tolerance in indirect mode
+            # Indirect mode (fast-spinning targets)
+            {'indirect_vyaw_threshold': 3.0},        # [rad/s] spin rate above which indirect aiming activates
+            {'indirect_timing_tolerance': 0.02},     # [s] base timing tolerance for alignment windows
+            {'indirect_max_candidates': 8},          # max alignment candidates to evaluate per frame
+            # Gimbal
+            {'gimbal_height': 0.325},                # [m] gimbal pivot height (must match tracker's gimbal.height)
         ],
         extra_arguments=[{'use_intra_process_comms': True}]
     )

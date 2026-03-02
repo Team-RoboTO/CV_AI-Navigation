@@ -16,7 +16,7 @@
 
 namespace rm_auto_aim
 {
-Tracker::Tracker(double max_match_distance)
+Tracker::Tracker(double max_match_distance, double max_track_range)
 : tracker_state(LOST),
   tracked_id(std::string("")),
   info_position_diff(0.0),
@@ -24,7 +24,8 @@ Tracker::Tracker(double max_match_distance)
   measurement(Eigen::VectorXd::Zero(4)),
   target_state(Eigen::VectorXd::Zero(9)),
   max_match_distance_(max_match_distance),
-  max_match_yaw_diff_(M_PI / 2.0 - 0.3)
+  max_match_yaw_diff_(M_PI / 3.0),
+  max_track_range_(max_track_range)
 {
 }
 
@@ -178,6 +179,17 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
       lost_count_ = 0;
     }
   }
+
+  // Drop target if it is beyond max tracking range
+  if (tracker_state != LOST) {
+    double xc = target_state(0), yc = target_state(2), za = target_state(4);
+    double range = std::sqrt(xc * xc + yc * yc + za * za);
+    if (range > max_track_range_) {
+      tracker_state = LOST;
+      RCLCPP_WARN(rclcpp::get_logger("armor_tracker"),
+        "Target beyond max range (%.1fm > %.1fm) — LOST", range, max_track_range_);
+    }
+  }
 }
 
 void Tracker::initEKF(const Armor & a)
@@ -217,7 +229,7 @@ void Tracker::updateArmorsNum(const Armor & armor)
   switch (tracked_armors_num) {
     case ArmorsNum::BALANCE_2:  max_match_yaw_diff_ = M_PI - 0.3;         break;  // ~150°
     case ArmorsNum::OUTPOST_3:  max_match_yaw_diff_ = 2.0 * M_PI / 3.0 - 0.3;  break;  // ~90°
-    default:  /* NORMAL_4 */    max_match_yaw_diff_ = M_PI / 2.0 - 0.3;   break;  // ~60°
+    default:  /* NORMAL_4 */    max_match_yaw_diff_ = M_PI / 3.0;          break;  // ~60°
   }
 }
 

@@ -30,7 +30,8 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
 
   // Tracker
   double max_match_distance = this->declare_parameter("tracker.max_match_distance", 0.15);
-  tracker_ = std::make_unique<Tracker>(max_match_distance);
+  double max_track_range = this->declare_parameter("tracker.max_track_range", 6.0);
+  tracker_ = std::make_unique<Tracker>(max_match_distance, max_track_range);
   tracker_->tracking_thres = this->declare_parameter("tracker.tracking_thres", 5);
   lost_time_thres_ = this->declare_parameter("tracker.lost_time_thres", 0.3);
 

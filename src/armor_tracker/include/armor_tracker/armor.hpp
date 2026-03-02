@@ -1,6 +1,3 @@
-// Copyright 2022 Chen Jun
-// Licensed under the MIT License.
-
 #ifndef ARMOR_TRACKER__ARMOR_HPP_
 #define ARMOR_TRACKER__ARMOR_HPP_
 
