@@ -12,6 +12,7 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <vision_msgs/msg/detection2_d.hpp>
@@ -105,6 +106,28 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr micro_pose_sub_;
   double gimbal_yaw_, gimbal_pitch_;
   double gimbal_height_, yaw_sign_, pitch_sign_;
+
+  // IMU-based chassis rotation estimation
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
+  void imuCallback(const sensor_msgs::msg::Imu::ConstSharedPtr msg);
+
+  double chassis_yaw_ = 0.0;
+  double chassis_pitch_ = 0.0;
+  double imu_wz_filtered_ = 0.0;
+  double imu_wy_filtered_ = 0.0;
+  double prev_gimbal_yaw_ = 0.0;
+  double prev_gimbal_pitch_ = 0.0;
+  rclcpp::Time prev_imu_time_;
+  bool imu_initialized_ = false;
+  bool imu_active_ = false;
+  rclcpp::Time last_imu_time_;
+
+  // IMU parameters
+  bool enable_imu_compensation_ = true;
+  double imu_gyro_alpha_ = 0.3;
+  double imu_timeout_ = 0.1;
+  double imu_yaw_axis_sign_ = -1.0;
+  double imu_pitch_axis_sign_ = -1.0;
 
   // Visualization marker publisher
   visualization_msgs::msg::Marker position_marker_;

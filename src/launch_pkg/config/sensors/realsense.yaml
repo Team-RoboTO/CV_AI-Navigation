@@ -5,7 +5,7 @@
     enable_infra2: false
     enable_color: true
     enable_depth: false
-    enable_gyro: false
+    enable_gyro: true
     enable_accel: false
 
     rgb_camera.color_profile: "640x480x30"

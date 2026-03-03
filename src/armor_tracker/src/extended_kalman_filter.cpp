@@ -76,6 +76,19 @@ Eigen::MatrixXd ExtendedKalmanFilter::predict()
   return x_pri;
 }
 
+double ExtendedKalmanFilter::mahalanobis(const Eigen::VectorXd & z)
+{
+  Eigen::MatrixXd H_tmp = jacobian_h(x_pri);
+  Eigen::MatrixXd R_tmp = update_R(z);
+  Eigen::MatrixXd S = H_tmp * P_pri * H_tmp.transpose() + R_tmp;
+  Eigen::VectorXd y = z - h(x_pri);
+  Eigen::LDLT<Eigen::MatrixXd> S_ldlt(S);
+  if (S_ldlt.info() != Eigen::Success || !S_ldlt.isPositive()) {
+    return 1e9;  // treat degenerate S as outlier
+  }
+  return y.transpose() * S_ldlt.solve(y);
+}
+
 Eigen::MatrixXd ExtendedKalmanFilter::update(const Eigen::VectorXd & z)
 {
   H = jacobian_h(x_pri), R = update_R(z);

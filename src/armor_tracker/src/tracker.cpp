@@ -173,11 +173,18 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
       //             detection noise; log a warning and leave target_state as the
       //             raw EKF prediction (no update, matched stays false).
       if (position_diff < max_match_distance_ && yaw_diff < max_match_yaw_diff_) {
-        // Matched armor found
-        matched = true;
+        // Matched armor found — check Mahalanobis distance before fusing
         measurement = Eigen::Vector4d(p.x, p.y, p.z, measured_yaw);
-        target_state = ekf.update(measurement);
-        RCLCPP_DEBUG(rclcpp::get_logger("armor_tracker"), "EKF update");
+        double maha = ekf.mahalanobis(measurement);
+        // chi-squared threshold for 4 DOF at 99% confidence ≈ 13.3
+        if (maha < 13.3) {
+          matched = true;
+          target_state = ekf.update(measurement);
+          RCLCPP_DEBUG(rclcpp::get_logger("armor_tracker"), "EKF update (maha=%.1f)", maha);
+        } else {
+          RCLCPP_WARN(rclcpp::get_logger("armor_tracker"),
+            "Measurement rejected: Mahalanobis=%.1f > 13.3", maha);
+        }
       } else if (yaw_diff > max_match_yaw_diff_) {
         // Yaw jumped: spinning (single face) or proactive face switch (multi-face)
         handleArmorJump(selected_armor);

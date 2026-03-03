@@ -39,6 +39,10 @@ public:
   // Update the estimated state based on measurement
   Eigen::MatrixXd update(const Eigen::VectorXd & z);
 
+  // Compute squared Mahalanobis distance of measurement z from predicted state.
+  // Returns (z - h(x_pri))^T S^{-1} (z - h(x_pri)) where S = H P_pri H^T + R.
+  double mahalanobis(const Eigen::VectorXd & z);
+
   // Get posterior variance of a single state element
   double getVariance(int idx) const { return P_post(idx, idx); }
 

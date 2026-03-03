@@ -186,7 +186,7 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   // P - initial error covariance
   Eigen::DiagonalMatrix<double, 9> p0;
   //       xc    v_xc  yc    v_yc  za    v_za  yaw   v_yaw  r
-  p0.diagonal() << 0.1, 1.0, 0.1, 1.0, 0.1, 0.2, 0.1, 3.0, 0.003;
+  p0.diagonal() << 0.1, 1.0, 0.1, 1.0, 0.1, 0.2, 0.1, 3.0, 0.015;
   tracker_->ekf = ExtendedKalmanFilter{f, h, j_f, j_h, u_q, u_r, p0};
 
   // Covariance upper bounds — safety net against P explosion during TEMP_LOST
@@ -286,6 +286,17 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   micro_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
     "/micro_pose", rclcpp::SensorDataQoS(),
     std::bind(&ArmorTrackerNode::microPoseCallback, this, std::placeholders::_1));
+
+  // IMU-based chassis rotation compensation
+  enable_imu_compensation_ = declare_parameter("imu.enable", true);
+  imu_gyro_alpha_ = declare_parameter("imu.gyro_alpha", 0.3);
+  imu_timeout_ = declare_parameter("imu.timeout", 0.1);
+  imu_yaw_axis_sign_ = declare_parameter("imu.yaw_axis_sign", -1.0);
+  imu_pitch_axis_sign_ = declare_parameter("imu.pitch_axis_sign", -1.0);
+
+  imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
+    "/imu", rclcpp::SensorDataQoS(),
+    std::bind(&ArmorTrackerNode::imuCallback, this, std::placeholders::_1));
 }
 
 void ArmorTrackerNode::microPoseCallback(
@@ -298,16 +309,93 @@ void ArmorTrackerNode::microPoseCallback(
   broadcastGimbalTF(msg->header.stamp);
 }
 
+void ArmorTrackerNode::imuCallback(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
+{
+  if (!enable_imu_compensation_) {
+    return;
+  }
+
+  rclcpp::Time now = msg->header.stamp;
+  last_imu_time_ = now;
+
+  if (!imu_initialized_) {
+    prev_imu_time_ = now;
+    prev_gimbal_yaw_ = gimbal_yaw_;
+    prev_gimbal_pitch_ = gimbal_pitch_;
+    imu_initialized_ = true;
+    imu_active_ = true;
+    return;
+  }
+
+  double dt = (now - prev_imu_time_).seconds();
+  if (dt <= 0.0 || dt > 0.5) {
+    prev_imu_time_ = now;
+    prev_gimbal_yaw_ = gimbal_yaw_;
+    prev_gimbal_pitch_ = gimbal_pitch_;
+    return;
+  }
+
+  // D455 IMU axis mapping (camera optical frame: X-right, Y-down, Z-forward)
+  // World yaw (rotation around vertical) maps to gyro Y axis
+  // World pitch (rotation around lateral) maps to gyro X axis
+  double raw_wz = imu_yaw_axis_sign_ * msg->angular_velocity.y;
+  double raw_wy = imu_pitch_axis_sign_ * msg->angular_velocity.x;
+
+  // EMA filter on raw gyro
+  imu_wz_filtered_ = imu_gyro_alpha_ * raw_wz + (1.0 - imu_gyro_alpha_) * imu_wz_filtered_;
+  imu_wy_filtered_ = imu_gyro_alpha_ * raw_wy + (1.0 - imu_gyro_alpha_) * imu_wy_filtered_;
+
+  // Gimbal angular velocity from derivative of gimbal angles
+  double gimbal_wz = (gimbal_yaw_ - prev_gimbal_yaw_) / dt;
+  double gimbal_wy = (gimbal_pitch_ - prev_gimbal_pitch_) / dt;
+
+  // Chassis angular velocity = total IMU rotation - gimbal rotation
+  double chassis_wz = imu_wz_filtered_ - gimbal_wz;
+  double chassis_wy = imu_wy_filtered_ - gimbal_wy;
+
+  // Integrate chassis rotation (Euler integration)
+  chassis_yaw_ += chassis_wz * dt;
+  chassis_pitch_ += chassis_wy * dt;
+
+  imu_active_ = true;
+  prev_imu_time_ = now;
+  prev_gimbal_yaw_ = gimbal_yaw_;
+  prev_gimbal_pitch_ = gimbal_pitch_;
+}
+
 void ArmorTrackerNode::broadcastGimbalTF(const rclcpp::Time & stamp)
 {
-  // T(odom → camera) = Translate(0,0,height) × R_z(yaw) × R_y(pitch) × R_convention
-  // R_convention = RPY(-π/2, 0, -π/2) matches the old static TF when yaw=pitch=0
+  // T(odom → camera) = Translate(0,0,height)
+  //   × R_z(chassis_yaw) × R_y(chassis_pitch)   ← NEW: ego-motion from IMU
+  //   × R_z(gimbal_yaw) × R_y(gimbal_pitch)
+  //   × R_convention
+
+  // Chassis rotation from IMU (identity if IMU inactive/stale)
+  tf2::Quaternion q_chassis_yaw, q_chassis_pitch;
+  q_chassis_yaw.setRPY(0, 0, 0);
+  q_chassis_pitch.setRPY(0, 0, 0);
+
+  if (enable_imu_compensation_ && imu_active_) {
+    double staleness = (stamp - last_imu_time_).seconds();
+    if (staleness < imu_timeout_) {
+      q_chassis_yaw.setRPY(0, 0, chassis_yaw_);
+      q_chassis_pitch.setRPY(0, chassis_pitch_, 0);
+    } else {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "IMU data stale (%.3fs > %.3fs), falling back to gimbal-only TF",
+        staleness, imu_timeout_);
+    }
+  }
+
+  // Gimbal rotation from lower computer feedback
   tf2::Quaternion q_yaw, q_pitch, q_convention;
   q_yaw.setRPY(0, 0, gimbal_yaw_);
   q_pitch.setRPY(0, gimbal_pitch_, 0);
+  // R_convention = RPY(-π/2, 0, -π/2) matches the old static TF when yaw=pitch=0
   q_convention.setRPY(-M_PI / 2.0, 0, -M_PI / 2.0);
 
-  tf2::Quaternion q_final = q_yaw * q_pitch * q_convention;
+  tf2::Quaternion q_final = q_chassis_yaw * q_chassis_pitch * q_yaw * q_pitch * q_convention;
   q_final.normalize();
 
   geometry_msgs::msg::TransformStamped t;

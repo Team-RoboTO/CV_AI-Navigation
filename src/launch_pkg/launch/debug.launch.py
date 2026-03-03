@@ -265,7 +265,8 @@ def generate_launch_description():
         name='armor_tracker',
         remappings=[
             ('/detector/armors', '/detections_output'),
-            ('/camera_info', '/camera/camera/color/camera_info')
+            ('/camera_info', '/camera/camera/color/camera_info'),
+            ('/imu', '/camera/camera/gyro/imu_info'),
         ],
         parameters=[
             {'target_frame': 'odom'},              # TF frame for 3D pose output
@@ -278,9 +279,9 @@ def generate_launch_description():
             {'tracker.tracking_thres': 2},           # consecutive matches needed to transition DETECTING → TRACKING
             {'tracker.lost_time_thres': 1.0},        # [s] time without match before TEMP_LOST → LOST
             # EKF process noise
-            {'ekf.sigma2_q_xyz': 2.0},              # position process noise variance (higher → trusts measurements more)
-            {'ekf.sigma2_q_yaw': 5.0},              # yaw process noise variance
-            {'ekf.sigma2_q_r': 0.5},                # radius process noise variance
+            {'ekf.sigma2_q_xyz': 6.0},              # position process noise variance (higher → trusts measurements more)
+            {'ekf.sigma2_q_yaw': 20.0},             # yaw process noise variance
+            {'ekf.sigma2_q_r': 3.0},                # radius process noise variance (keep high so r adapts as target rotates)
             # EKF velocity damping (alpha^(dt/T) decay per step; 1.0 = no decay)
             {'ekf.xyz_damping_alpha': 0.95},         # position velocity damping (lower → stronger braking)
             {'ekf.yaw_damping_alpha': 0.95},         # yaw velocity damping
@@ -291,6 +292,12 @@ def generate_launch_description():
             {'gimbal.height': .325},                 # [m] gimbal pivot height above ground
             {'gimbal.yaw_sign': 1.0},                # sign flip for yaw axis (+1 or -1)
             {'gimbal.pitch_sign': 1.0},              # sign flip for pitch axis (+1 or -1)
+            # IMU chassis compensation
+            {'imu.enable': True},                    # enable/disable IMU ego-motion compensation
+            {'imu.gyro_alpha': 0.3},                 # EMA filter weight for gyro smoothing (0–1)
+            {'imu.timeout': 0.1},                    # [s] IMU staleness threshold before fallback
+            {'imu.yaw_axis_sign': -1.0},             # sign correction for D455 gyro Y → world yaw
+            {'imu.pitch_axis_sign': -1.0},           # sign correction for D455 gyro X → world pitch
         ],
         extra_arguments=[{'use_intra_process_comms': True}]
     )

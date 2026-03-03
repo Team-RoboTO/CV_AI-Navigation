@@ -123,11 +123,13 @@ def generate_launch_description():
         name='armor_tracker',
         remappings=[
             ('/detector/armors', '/detections_output'),
-            ('/camera_info', '/camera/camera/color/camera_info')
+            ('/camera_info', '/camera/camera/color/camera_info'),
+            ('/imu', '/camera/camera/gyro/imu_info'),
         ],
         parameters=[
             {'target_frame': 'odom'},
             {'max_armor_distance': 10.0},
+            {'detection_pad_y': 140.0},  # (640-360)/2 for 1280x720→640x640 letterbox; verify with actual decoder output
             {'tracker.max_match_distance': 0.60},
             {'tracker.tracking_thres': 2},
             {'tracker.lost_time_thres': 1.0},
@@ -144,6 +146,12 @@ def generate_launch_description():
             {'gimbal.height': 0.5},
             {'gimbal.yaw_sign': 1.0},
             {'gimbal.pitch_sign': 1.0},
+            # IMU chassis compensation
+            {'imu.enable': True},
+            {'imu.gyro_alpha': 0.3},
+            {'imu.timeout': 0.1},
+            {'imu.yaw_axis_sign': -1.0},
+            {'imu.pitch_axis_sign': -1.0},
         ],
         extra_arguments=[{'use_intra_process_comms': True}]
     )
