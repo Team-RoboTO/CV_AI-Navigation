@@ -279,12 +279,12 @@ def generate_launch_description():
             {'tracker.tracking_thres': 2},           # consecutive matches needed to transition DETECTING → TRACKING
             {'tracker.lost_time_thres': 1.0},        # [s] time without match before TEMP_LOST → LOST
             # EKF process noise
-            {'ekf.sigma2_q_xyz':20.0},              # position process noise variance (higher → trusts measurements more)
-            {'ekf.sigma2_q_yaw': 10.0},             # yaw process noise variance
-            {'ekf.sigma2_q_r': 5.0},                # radius process noise variance (keep high so r adapts as target rotates)
+            {'ekf.sigma2_q_xyz': 8.0},              # position process noise variance (higher → trusts measurements more)
+            {'ekf.sigma2_q_yaw':10.0},             # yaw process noise variance
+            {'ekf.sigma2_q_r': 4.0},                # radius process noise variance (keep high so r adapts as target rotates)
             # EKF velocity damping (alpha^(dt/T) decay per step; 1.0 = no decay)
             {'ekf.xyz_damping_alpha': 0.95},         # position velocity damping (lower → stronger braking)
-            {'ekf.yaw_damping_alpha': 0.95},         # yaw velocity damping
+            {'ekf.yaw_damping_alpha': 1},         # yaw velocity damping
             {'ekf.coast_damping_factor': 0.85},      # extra damping multiplier during TEMP_LOST coasting
             {'ekf.damping_innov_threshold': 0.10},   # [m] position innovation above which overshoot damping activates
             {'ekf.yaw_innov_threshold': 0.15},       # [rad] yaw innovation above which yaw damping activates
@@ -293,7 +293,7 @@ def generate_launch_description():
             {'gimbal.yaw_sign': 1.0},                # sign flip for yaw axis (+1 or -1)
             {'gimbal.pitch_sign': 1.0},              # sign flip for pitch axis (+1 or -1)
             # IMU chassis compensation
-            {'imu.enable': True},                    # enable/disable IMU ego-motion compensation
+            {'imu.enable': False},                    # enable/disable IMU ego-motion compensation
             {'imu.gyro_alpha': 0.3},                 # EMA filter weight for gyro smoothing (0–1)
             {'imu.timeout': 0.1},                    # [s] IMU staleness threshold before fallback
             {'imu.yaw_axis_sign': -1.0},             # sign correction for D455 gyro Y → world yaw
@@ -318,7 +318,7 @@ def generate_launch_description():
             # Fire gate
             {'min_fire_dist': 0.5},                  # [m] minimum range to allow firing
             {'max_fire_dist': 10.0},                 # [m] maximum range to allow firing
-            {'angular_window': 0.09},                # [rad] half-width of face-aligned fire gate (~5°)
+            {'angular_window': .7},                # [rad] half-width of face-aligned fire gate (~5°)
             # Acceleration estimator
             {'accel_ema_alpha': 0.3},                # EMA smoothing for target acceleration estimate (0–1)
             {'max_accel': 6.0},                      # [m/s²] clamp on estimated acceleration

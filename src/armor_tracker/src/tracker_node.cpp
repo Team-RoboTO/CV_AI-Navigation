@@ -283,9 +283,9 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   gimbal_height_ = declare_parameter("gimbal.height", 0.5);
   yaw_sign_      = declare_parameter("gimbal.yaw_sign", 1.0);
   pitch_sign_    = declare_parameter("gimbal.pitch_sign", 1.0);
-  // micro_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
-  //   "/micro_pose", rclcpp::SensorDataQoS(),
-  //   std::bind(&ArmorTrackerNode::microPoseCallback, this, std::placeholders::_1));
+  micro_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
+    "/micro_pose", rclcpp::SensorDataQoS(),
+    std::bind(&ArmorTrackerNode::microPoseCallback, this, std::placeholders::_1));
 
   // IMU-based chassis rotation compensation
   enable_imu_compensation_ = declare_parameter("imu.enable", true);
@@ -297,15 +297,22 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
     std::bind(&ArmorTrackerNode::imuCallback, this, std::placeholders::_1));
 }
 
-// void ArmorTrackerNode::microPoseCallback(
-//   const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg)
-// {
-//   // Extract gimbal angles from the lower computer.
-//   // cmd_vel_subscriber stores: position.x = -pitch, position.y = -yaw (radians)
-//   gimbal_yaw_   = yaw_sign_ * msg->pose.position.y;
-//   gimbal_pitch_ = pitch_sign_ * msg->pose.position.x;
-//   broadcastGimbalTF(msg->header.stamp);
-// }
+
+
+void ArmorTrackerNode::microPoseCallback(
+  const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg)
+{
+  // Extract gimbal angles from the lower computer.
+  // cmd_vel_subscriber stores: position.x = -pitch, position.y = -yaw (radians)
+  double p = pitch_sign_ * msg->pose.position.x;
+  double y = yaw_sign_ * msg->pose.position.y;
+  // Reject garbage serial data — gimbal angles physically can't exceed ~90°
+  if (std::abs(p) < 1.6 && std::abs(y) < 1.6) {
+    gimbal_yaw_   = y;
+    gimbal_pitch_ = p;
+  }
+  broadcastGimbalTF(msg->header.stamp);
+}
 
 void ArmorTrackerNode::imuCallback(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
 {
@@ -373,6 +380,10 @@ void ArmorTrackerNode::imuCallback(const sensor_msgs::msg::Imu::ConstSharedPtr m
   // Yaw is pure Z rotation. Pitch is pure Y rotation. (Roll / X is ignored for trajectory)
   chassis_yaw_ += chassis_wz * dt;
   chassis_pitch_ += chassis_wy * dt;
+
+  RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
+      "IMU chassis_yaw=%.4f chassis_pitch=%.4f gimbal_yaw=%.4f gimbal_pitch=%.4f wz=%.4f wy=%.4f",
+      chassis_yaw_, chassis_pitch_, gimbal_yaw_, gimbal_pitch_, chassis_wz, chassis_wy);
 
   imu_active_ = true;
   prev_imu_time_ = now;
@@ -572,7 +583,7 @@ void ArmorTrackerNode::armorsCallback(
     tf2::fromMsg(a.pose.orientation, q);
     double roll, pitch, yaw;
     tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
-    RCLCPP_INFO(get_logger(),
+    RCLCPP_DEBUG(get_logger(),
       "Det[%zu] id=%s yaw=%.3f pos=(%.2f, %.2f, %.2f)",
       i, a.number.c_str(), yaw,
       a.pose.position.x, a.pose.position.y, a.pose.position.z);
@@ -709,9 +720,8 @@ void ArmorTrackerNode::armorsCallback(
       target_msg.yaw        = state(6);
       target_msg.v_yaw      = state(7);
       target_msg.radius_1   = state(8);
-      // to print
-      RCLCPP_INFO(this->get_logger(), "target_msg.position: %f %f %f %f %f %f %f %f %f", 
-      target_msg.position.x, target_msg.position.y, target_msg.position.z, 
+      RCLCPP_DEBUG(this->get_logger(), "target_msg.position: %f %f %f %f %f %f %f %f %f",
+      target_msg.position.x, target_msg.position.y, target_msg.position.z,
       target_msg.velocity.x, target_msg.velocity.y, target_msg.velocity.z,
       target_msg.yaw, target_msg.v_yaw, target_msg.radius_1);
       target_msg.radius_2   = tracker_->another_r;

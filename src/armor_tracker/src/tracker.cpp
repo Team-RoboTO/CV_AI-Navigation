@@ -83,53 +83,79 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
       Armor selected_armor;
 
       if (same_id_armors.size() > 1) {
-        // Two-pass selection to avoid ping-ponging between faces at transition
-        // angles (which spams handleArmorJump and corrupts EKF state).
-        //
-        // Pass 1: Among visible faces, find those whose raw yaw is within
-        //         max_match_yaw_diff_ of the EKF predicted yaw. Pick the
-        //         position-closest of those (yaw-consistent candidates).
-        // Pass 2: Only if NO face is yaw-consistent, fall back to pure
-        //         position-closest (will likely trigger handleArmorJump).
-        //
-        // IMPORTANT: Use raw RPY yaw via tf2::Matrix3x3::getRPY, NOT
-        // orientationToYaw(), which mutates last_yaw_.
         double predicted_yaw = ekf_prediction(6);
-        double min_yaw_consistent_dist = DBL_MAX;
-        double min_fallback_dist = DBL_MAX;
-        Armor yaw_consistent_armor;
-        Armor fallback_armor;
-        bool found_yaw_consistent = false;
+        double abs_vyaw = std::abs(target_state(7));
 
-        for (const auto & armor : same_id_armors) {
-          // Extract raw yaw without mutating last_yaw_
-          tf2::Quaternion tf_q;
-          tf2::fromMsg(armor.pose.orientation, tf_q);
-          double roll, pitch, raw_yaw;
-          tf2::Matrix3x3(tf_q).getRPY(roll, pitch, raw_yaw);
+        if (abs_vyaw < 1.0) {
+          // === SLOW MODE: pick the most face-on armor ===
+          // For stationary/slowly rotating targets, the best shooting target
+          // is the armor that's most face-on to the camera.
+          // No yaw filter — multiple same-id armors = same robot, no ambiguity.
+          // Hysteresis: currently tracked face gets 15° advantage.
+          double best_oblique = M_PI;
+          Armor best_faceon_armor;
+          bool found = false;
 
-          double yaw_diff = std::abs(
-            angles::shortest_angular_distance(predicted_yaw, raw_yaw));
+          for (const auto & armor : same_id_armors) {
+            tf2::Quaternion tf_q;
+            tf2::fromMsg(armor.pose.orientation, tf_q);
+            double roll, pitch, raw_yaw;
+            tf2::Matrix3x3(tf_q).getRPY(roll, pitch, raw_yaw);
 
-          auto p = armor.pose.position;
-          Eigen::Vector3d pos(p.x, p.y, p.z);
-          double dist = (predicted_position - pos).norm();
+            double yaw_diff = std::abs(
+              angles::shortest_angular_distance(predicted_yaw, raw_yaw));
 
-          // Track position-closest fallback regardless of yaw
-          if (dist < min_fallback_dist) {
-            min_fallback_dist = dist;
-            fallback_armor = armor;
+            auto p = armor.pose.position;
+            double face_normal = raw_yaw + M_PI;
+            double face_to_cam = std::atan2(-p.y, -p.x);
+            double oblique = std::abs(
+              angles::shortest_angular_distance(face_normal, face_to_cam));
+
+            // Hysteresis: currently tracked face gets 15° advantage
+            if (yaw_diff < 0.15) oblique -= 0.26;
+
+            if (oblique < best_oblique) {
+              best_oblique = oblique;
+              best_faceon_armor = armor;
+              found = true;
+            }
           }
+          selected_armor = found ? best_faceon_armor : same_id_armors[0];
 
-          // Track yaw-consistent candidates
-          if (yaw_diff < max_match_yaw_diff_ && dist < min_yaw_consistent_dist) {
-            min_yaw_consistent_dist = dist;
-            yaw_consistent_armor = armor;
-            found_yaw_consistent = true;
+        } else {
+          // === FAST MODE: pick position-closest with yaw consistency ===
+          // For fast spinners, maintaining stable v_yaw tracking is critical.
+          // Switching faces would zero v_yaw and break indirect mode.
+          double min_yaw_dist = DBL_MAX;
+          double min_fallback_dist = DBL_MAX;
+          Armor yaw_armor, fallback_armor;
+          bool found_yaw = false;
+
+          for (const auto & armor : same_id_armors) {
+            tf2::Quaternion tf_q;
+            tf2::fromMsg(armor.pose.orientation, tf_q);
+            double roll, pitch, raw_yaw;
+            tf2::Matrix3x3(tf_q).getRPY(roll, pitch, raw_yaw);
+
+            double yaw_diff = std::abs(
+              angles::shortest_angular_distance(predicted_yaw, raw_yaw));
+
+            auto p = armor.pose.position;
+            Eigen::Vector3d pos(p.x, p.y, p.z);
+            double dist = (predicted_position - pos).norm();
+
+            if (dist < min_fallback_dist) {
+              min_fallback_dist = dist;
+              fallback_armor = armor;
+            }
+            if (yaw_diff < max_match_yaw_diff_ && dist < min_yaw_dist) {
+              min_yaw_dist = dist;
+              yaw_armor = armor;
+              found_yaw = true;
+            }
           }
+          selected_armor = found_yaw ? yaw_armor : fallback_armor;
         }
-
-        selected_armor = found_yaw_consistent ? yaw_consistent_armor : fallback_armor;
       } else {
         selected_armor = same_id_armors[0];
       }
@@ -186,9 +212,16 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
             "Measurement rejected: Mahalanobis=%.1f > 13.3", maha);
         }
       } else if (yaw_diff > max_match_yaw_diff_) {
-        // Yaw jumped: spinning (single face) or proactive face switch (multi-face)
-        handleArmorJump(selected_armor);
-        matched = true;
+        // Yaw jumped — gate with relaxed Mahalanobis before accepting
+        measurement = Eigen::Vector4d(p.x, p.y, p.z, measured_yaw);
+        double maha = ekf.mahalanobis(measurement);
+        if (maha < 20.0) {  // relaxed gate for jumps (vs 13.3 for matches)
+          handleArmorJump(selected_armor);
+          matched = true;
+        } else {
+          RCLCPP_WARN(rclcpp::get_logger("armor_tracker"),
+            "Armor jump rejected: Mahalanobis=%.1f > 20.0", maha);
+        }
       } else {
         // No matched armor found
         RCLCPP_WARN(rclcpp::get_logger("armor_tracker"), "No matched armor found!");
@@ -233,6 +266,20 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
     ekf.setState(target_state);
     ekf.resetCovariance();
     RCLCPP_WARN(rclcpp::get_logger("armor_tracker"), "v_yaw clamped — covariance reset");
+  }
+
+  // Normalize yaw to [-π, π] to prevent unbounded accumulation.
+  // orientationToYaw() unwraps yaw continuously (for v_yaw estimation), but the
+  // absolute value can drift to -37 rad+ over time.  Large yaw values don't affect
+  // cos/sin (periodic), but they cause precision issues and make all face-position
+  // calculations in the trajectory solver subtly wrong when the accumulated error
+  // isn't an exact multiple of face_spacing.
+  // v_yaw estimation is unaffected: it depends on yaw *changes*, not absolute value.
+  double wrapped_yaw = angles::normalize_angle(target_state(6));
+  if (wrapped_yaw != target_state(6)) {
+    target_state(6) = wrapped_yaw;
+    last_yaw_ = wrapped_yaw;  // keep orientationToYaw in sync
+    ekf.setState(target_state);
   }
 
   // Tracking state machine:
@@ -333,6 +380,7 @@ void Tracker::handleArmorJump(const Armor & current_armor)
   // Check if jump direction agrees with current v_yaw.
   // If the robot reversed spin, v_yaw sign will disagree with the jump direction.
   double jump_direction = angles::shortest_angular_distance(target_state(6), yaw);
+  double jump_angle = std::abs(jump_direction);
   if (jump_direction * target_state(7) < 0) {
     // Spin reversal detected — zero v_yaw to prevent EKF from extrapolating in wrong direction
     target_state(7) = 0.0;
@@ -342,11 +390,17 @@ void Tracker::handleArmorJump(const Armor & current_armor)
   updateArmorsNum(current_armor);
   // Only 4 armors has 2 radius and height
   if (tracked_armors_num == ArmorsNum::NORMAL_4) {
-    dz = target_state(4) - current_armor.pose.position.z;
-    target_state(4) = current_armor.pose.position.z;
-    target_state(5) = 0.0;  // v_za corrupted by za snap — zero it
-    std::swap(target_state(8), another_r);
-    another_r = std::max(0.12, std::min(another_r, 0.4));
+    // Distinguish ~90° jump (pair switch: even↔odd face) from ~180° jump (same pair).
+    // 90° jump: faces 0,2 use (r1, za) and faces 1,3 use (r2, za+dz) — must swap.
+    // 180° jump: stays on same pair (0→2 or 1→3) — no swap needed.
+    bool is_pair_switch = (jump_angle > M_PI / 4.0) && (jump_angle < 3.0 * M_PI / 4.0);
+    if (is_pair_switch) {
+      dz = target_state(4) - current_armor.pose.position.z;
+      target_state(4) = current_armor.pose.position.z;
+      target_state(5) = 0.0;  // v_za corrupted by za snap — zero it
+      std::swap(target_state(8), another_r);
+      another_r = std::max(0.12, std::min(another_r, 0.4));
+    }
   }
   info_yaw_innov_signed = 0.0;
   RCLCPP_WARN(rclcpp::get_logger("armor_tracker"), "Armor jump!");

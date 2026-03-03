@@ -78,8 +78,13 @@ TrajectorySolverNode::TrajectorySolverNode(const rclcpp::NodeOptions &options)
   micro_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
       "/micro_pose", rclcpp::SensorDataQoS(),
       [this](const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg) {
-        current_pitch_ = pitch_sign_ * msg->pose.position.x;
-        current_yaw_   = yaw_sign_ * msg->pose.position.y;
+        double p = pitch_sign_ * msg->pose.position.x;
+        double y = yaw_sign_  * msg->pose.position.y;
+        // Reject garbage serial data — gimbal angles physically can't exceed ~90°
+        if (std::abs(p) < 1.6 && std::abs(y) < 1.6) {
+          current_pitch_ = p;
+          current_yaw_   = y;
+        }
       });
 }
 
@@ -653,15 +658,20 @@ void TrajectorySolverNode::targetCallback(
       // cos^n penalty ensures face-on armor wins even at close range where
       // the radius offset makes the oblique face significantly closer.
       double cos_obl = std::cos(oblique);
+      RCLCPP_DEBUG(this->get_logger(),
+          "  Face[%d] pos=(%.3f,%.3f,%.3f) dist=%.3f oblique=%.1f° cos=%.3f %s",
+          i, fx, fy, fz, dist, oblique * 180.0 / M_PI, cos_obl,
+          (cos_obl < 0.26) ? "SKIP" : "");
       if (cos_obl < 0.26) continue;  // face pointing away (>75°)
       double score = dist / std::pow(cos_obl, oblique_exponent_);
 
+      RCLCPP_DEBUG(this->get_logger(), "    -> score=%.3f (best=%.3f)", score, best_score);
       if (score < best_score) { best_score = score; best_f = i; }
     }
     return best_f;
   };
 
-  // Pass 1 — choose face using the coarse flight-time estimate
+  // Pick the face that gives the best shot: close + face-on at predicted impact time
   int best_face = findBestFace(pt);
   double pitch = 0.0, t_flight = 0.0;
   double tx = 0.0, ty = 0.0, tz = 0.0;
@@ -700,10 +710,10 @@ void TrajectorySolverNode::targetCallback(
     t_flight = result.second;
 
     if (pass == 0) {
-      // Check whether the solved flight time changes the face selection
-      int recheck_face = findBestFace(t_flight + time_bias_);
-      if (recheck_face == best_face) break;  // Face consistent — no second pass needed
-      best_face = recheck_face;              // Face changed — redo with corrected face
+      // Recheck: with refined flight time, is a different face better?
+      int new_face = findBestFace(t_flight + time_bias_);
+      if (new_face == best_face) break;  // converged — same face
+      best_face = new_face;  // face changed — re-solve in pass 1
     }
   }
 
@@ -776,6 +786,12 @@ void TrajectorySolverNode::targetCallback(
   cmd.distance = range;
   cmd.fire_cmd = in_range;
   cmd_pub_->publish(cmd);
+
+  RCLCPP_DEBUG(this->get_logger(),
+      "DIRECT body_yaw=%.3f face=%d pos=(%.3f,%.3f,%.3f) abs_yaw=%.1f° abs_pitch=%.1f° rel_yaw=%.1f° rel_pitch=%.1f° fire=%d",
+      msg->yaw, best_face, tx, ty, tz,
+      yaw * 180.0 / M_PI, pitch * 180.0 / M_PI,
+      rel_yaw * 180.0 / M_PI, rel_pitch * 180.0 / M_PI, in_range);
 
   geometry_msgs::msg::Twist twist;
   twist.angular.x = in_range ? 1.0 : 0.0;
