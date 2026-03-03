@@ -53,6 +53,9 @@ private:
   double time_bias_var_ = 0.01;
   double latency_gate_sigma_;
 
+  // Oblique face scoring exponent (higher = more penalty for oblique faces)
+  double oblique_exponent_;
+
   // Indirect aiming for fast spinners
   double indirect_vyaw_threshold_;
   double indirect_timing_tolerance_;

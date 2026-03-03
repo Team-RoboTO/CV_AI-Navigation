@@ -83,21 +83,53 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
       Armor selected_armor;
 
       if (same_id_armors.size() > 1) {
-        // Multiple faces visible: pick the one closest to the EKF prediction.
-        // This keeps tracking the same face through the overlap window instead
-        // of proactively switching to the face-on armor (which triggers
-        // handleArmorJump and disrupts the EKF state for 7-21 frames).
-        // Matches upstream rm_auto_aim behavior.
-        double min_dist = DBL_MAX;
+        // Two-pass selection to avoid ping-ponging between faces at transition
+        // angles (which spams handleArmorJump and corrupts EKF state).
+        //
+        // Pass 1: Among visible faces, find those whose raw yaw is within
+        //         max_match_yaw_diff_ of the EKF predicted yaw. Pick the
+        //         position-closest of those (yaw-consistent candidates).
+        // Pass 2: Only if NO face is yaw-consistent, fall back to pure
+        //         position-closest (will likely trigger handleArmorJump).
+        //
+        // IMPORTANT: Use raw RPY yaw via tf2::Matrix3x3::getRPY, NOT
+        // orientationToYaw(), which mutates last_yaw_.
+        double predicted_yaw = ekf_prediction(6);
+        double min_yaw_consistent_dist = DBL_MAX;
+        double min_fallback_dist = DBL_MAX;
+        Armor yaw_consistent_armor;
+        Armor fallback_armor;
+        bool found_yaw_consistent = false;
+
         for (const auto & armor : same_id_armors) {
+          // Extract raw yaw without mutating last_yaw_
+          tf2::Quaternion tf_q;
+          tf2::fromMsg(armor.pose.orientation, tf_q);
+          double roll, pitch, raw_yaw;
+          tf2::Matrix3x3(tf_q).getRPY(roll, pitch, raw_yaw);
+
+          double yaw_diff = std::abs(
+            angles::shortest_angular_distance(predicted_yaw, raw_yaw));
+
           auto p = armor.pose.position;
           Eigen::Vector3d pos(p.x, p.y, p.z);
           double dist = (predicted_position - pos).norm();
-          if (dist < min_dist) {
-            min_dist = dist;
-            selected_armor = armor;
+
+          // Track position-closest fallback regardless of yaw
+          if (dist < min_fallback_dist) {
+            min_fallback_dist = dist;
+            fallback_armor = armor;
+          }
+
+          // Track yaw-consistent candidates
+          if (yaw_diff < max_match_yaw_diff_ && dist < min_yaw_consistent_dist) {
+            min_yaw_consistent_dist = dist;
+            yaw_consistent_armor = armor;
+            found_yaw_consistent = true;
           }
         }
+
+        selected_armor = found_yaw_consistent ? yaw_consistent_armor : fallback_armor;
       } else {
         selected_armor = same_id_armors[0];
       }
@@ -344,6 +376,10 @@ void Tracker::handleArmorJump(const Armor & current_armor)
     ekf.inflateCovariance(4, 4.0);  // za:   variance x4 (snapped, uncertain)
     ekf.inflateCovariance(5, 4.0);  // v_za: variance x4 (zeroed above)
   }
+
+  // Sync prior so update() uses the post-jump state/covariance, not the
+  // stale x_pri/P_pri from the earlier predict() call.
+  ekf.syncPrior();
 
   // Feed the measurement through the EKF update step so the center position
   // (xc, yc) is properly corrected via the Kalman gain. Without this, the

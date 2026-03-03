@@ -22,9 +22,23 @@ ExtendedKalmanFilter::ExtendedKalmanFilter(
 {
 }
 
-void ExtendedKalmanFilter::setState(const Eigen::VectorXd & x0) { x_post = x0; }
+void ExtendedKalmanFilter::setState(const Eigen::VectorXd & x0)
+{
+  x_post = x0;
+  x_pri = x0;
+}
 
-void ExtendedKalmanFilter::resetCovariance() { P_post = P0_; }
+void ExtendedKalmanFilter::resetCovariance()
+{
+  P_post = P0_;
+  P_pri = P0_;
+}
+
+void ExtendedKalmanFilter::syncPrior()
+{
+  x_pri = x_post;
+  P_pri = P_post;
+}
 
 void ExtendedKalmanFilter::inflateCovariance(int idx, double factor)
 {

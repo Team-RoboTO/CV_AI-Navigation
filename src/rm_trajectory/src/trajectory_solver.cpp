@@ -47,6 +47,7 @@ TrajectorySolverNode::TrajectorySolverNode(const rclcpp::NodeOptions &options)
   indirect_vyaw_threshold_    = this->declare_parameter("indirect_vyaw_threshold",    3.0);
   indirect_timing_tolerance_  = this->declare_parameter("indirect_timing_tolerance",  0.02);
   indirect_max_candidates_    = this->declare_parameter("indirect_max_candidates",    8);
+  oblique_exponent_           = this->declare_parameter("oblique_exponent",            2.0);
 
   // Match RELIABLE QoS used by armor_tracker's target publisher
   auto target_qos = rclcpp::SensorDataQoS()
@@ -261,10 +262,12 @@ void TrajectorySolverNode::targetCallback(
     if (std::abs(residual) < latency_gate_sigma_ * sigma) {
       time_bias_ = time_bias_alpha_ * measured_latency
                    + (1.0 - time_bias_alpha_) * time_bias_;
+      // Update variance only for accepted samples to prevent outlier spikes
+      // from inflating sigma and widening the gate permanently
+      double new_residual = measured_latency - time_bias_;
+      time_bias_var_ = time_bias_alpha_ * (new_residual * new_residual)
+                       + (1.0 - time_bias_alpha_) * time_bias_var_;
     }
-    // Always update variance (tracks spread even during rejection)
-    time_bias_var_ = time_bias_alpha_ * (residual * residual)
-                     + (1.0 - time_bias_alpha_) * time_bias_var_;
   }
 
   // EKF state: robot *center* position and velocity (not the visible armor plate)
@@ -573,6 +576,15 @@ void TrajectorySolverNode::targetCallback(
   double dist_center = std::sqrt(xc * xc + yc * yc + za * za);
   if (bullet_speed_ < 1e-3) {
     RCLCPP_WARN(this->get_logger(), "bullet_speed is near zero, skipping");
+    auto_aim_interfaces::msg::GimbalCmd cmd;
+    cmd.header = msg->header;
+    cmd.fire_cmd = false;
+    cmd_pub_->publish(cmd);
+
+    geometry_msgs::msg::Twist twist;
+    twist.angular.x = 0.0;
+    twist_pub_->publish(twist);
+
     visualization_msgs::msg::Marker del;
     del.header = msg->header;
     del.ns = "impact_point";
@@ -587,14 +599,14 @@ void TrajectorySolverNode::targetCallback(
   // findBestFace: given a prediction time, return the index of the armor face
   // that is the best shooting target, considering both distance and oblique angle.
   //
-  // Score = distance / cos(oblique_angle)  ("effective distance")
+  // Score = distance / cos²(oblique_angle)
   //   - A close, square-on face scores low (good).
   //   - A far, oblique face scores high (bad).
   //   - cos(oblique) < 0.1 means the face is >84° away — skip entirely.
   //
-  // This replaces the old pure-angle selection which ignored that a closer face
-  // at a slightly worse angle can be a better target (shorter flight time,
-  // less prediction error, more surface area).
+  // The cos² penalty ensures face-on armor is preferred even at close range,
+  // where the radius offset makes the oblique face significantly closer.
+  // With single cos, the distance advantage can dominate at ranges < 1m.
   auto findBestFace = [&](double predict_time) -> int {
     double pred_yaw = msg->yaw + msg->v_yaw * predict_time;
     double pred_cx = xc + vx * predict_time + 0.5 * ax * predict_time * predict_time;
@@ -623,10 +635,12 @@ void TrajectorySolverNode::targetCallback(
       double face_to_cam = std::atan2(-fy, -fx);
       double oblique = std::abs(angles::shortest_angular_distance(face_normal, face_to_cam));
 
-      // Effective distance: penalises oblique faces (less visible area)
+      // Effective distance: penalises oblique faces (less visible area).
+      // cos^n penalty ensures face-on armor wins even at close range where
+      // the radius offset makes the oblique face significantly closer.
       double cos_obl = std::cos(oblique);
-      if (cos_obl < 0.1) continue;  // face pointing away (>84°)
-      double score = dist / cos_obl;
+      if (cos_obl < 0.26) continue;  // face pointing away (>75°)
+      double score = dist / std::pow(cos_obl, oblique_exponent_);
 
       if (score < best_score) { best_score = score; best_f = i; }
     }
@@ -688,6 +702,10 @@ void TrajectorySolverNode::targetCallback(
     cmd.distance = 0.0;
     cmd.fire_cmd = false;
     cmd_pub_->publish(cmd);
+
+    geometry_msgs::msg::Twist twist;
+    twist.angular.x = 0.0;
+    twist_pub_->publish(twist);
 
     visualization_msgs::msg::Marker del;
     del.header = msg->header;

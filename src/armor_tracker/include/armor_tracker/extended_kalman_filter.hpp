@@ -30,6 +30,9 @@ public:
   // Use after yaw snaps to reflect that the new value bypassed the EKF update.
   void inflateCovariance(int idx, double factor);
 
+  // Copy x_post/P_post into x_pri/P_pri so the next update() sees post-jump state.
+  void syncPrior();
+
   // Compute a predicted state
   Eigen::MatrixXd predict();
 
