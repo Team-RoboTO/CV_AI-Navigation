@@ -162,49 +162,40 @@ class VisualizerNode(Node):
         if self.gimbal_cmd is not None and self.gimbal_cmd.distance > 0.1:
             import math
             cmd = self.gimbal_cmd
-            pitch = cmd.pitch
-            yaw = cmd.yaw
+            pitch_deg = cmd.pitch
+            yaw_deg = cmd.yaw
             dist = cmd.distance
+            
+            pitch = math.radians(pitch_deg)
+            yaw = math.radians(yaw_deg)
 
-            # Compute aim point in odom: barrel at origin aims along (yaw, pitch)
-            aim_x = dist * math.cos(pitch) * math.cos(yaw)
-            aim_y = dist * math.cos(pitch) * math.sin(yaw)
-            aim_z = 0.325 + dist * math.sin(pitch)  # gimbal_height + vertical component
+            # Option 2: Direct Projection in Camera Optical Frame
+            # Z is forward, X is right, Y is down
+            # Relative yaw moves barrel left -> negative X
+            # Relative pitch moves barrel up -> negative Y
+            z = dist * math.cos(pitch) * math.cos(yaw)
+            x = -dist * math.cos(pitch) * math.sin(yaw)
+            y = -dist * math.sin(pitch)
+            
+            if z > 0.05:
+                K = self.camera_info.k
+                fx, cx_cam = K[0], K[2]
+                fy, cy_cam = K[4], K[5]
+                # Project onto image plane
+                au = int((x / z) * fx + cx_cam)
+                av = int((y / z) * fy + cy_cam)
+                
+                if 0 <= au < w_img and 0 <= av < h_img:
+                    # Cyan diamond crosshair for aim
+                    sz = 15
+                    pts = [(au, av-sz), (au+sz, av), (au, av+sz), (au-sz, av)]
+                    for i in range(4):
+                        cv2.line(cv_img, pts[i], pts[(i+1)%4], (255, 255, 0), 2)
+                    cv2.putText(cv_img, "AIM", (au + 10, av - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
 
-            pt_aim = PointStamped()
-            pt_aim.header.frame_id = 'odom'
-            pt_aim.header.stamp = rclpy.time.Time().to_msg()
-            pt_aim.point.x = aim_x
-            pt_aim.point.y = aim_y
-            pt_aim.point.z = aim_z
-            try:
-                pt_cam = self.tf_buffer.transform(
-                    pt_aim, 'camera_color_optical_frame',
-                    timeout=rclpy.duration.Duration(seconds=0.05))
-                x = pt_cam.point.x
-                y = pt_cam.point.y
-                z = pt_cam.point.z
-                if z > 0.05:
-                    K = self.camera_info.k
-                    fx, cx_cam = K[0], K[2]
-                    fy, cy_cam = K[4], K[5]
-                    au = int((x / z) * fx + cx_cam)
-                    av = int((y / z) * fy + cy_cam)
-                    if 0 <= au < w_img and 0 <= av < h_img:
-                        # Cyan diamond crosshair for aim
-                        sz = 15
-                        pts = [(au, av-sz), (au+sz, av), (au, av+sz), (au-sz, av)]
-                        for i in range(4):
-                            cv2.line(cv_img, pts[i], pts[(i+1)%4], (255, 255, 0), 2)
-                        cv2.putText(cv_img, "AIM", (au + 10, av - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
-            except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
-                    tf2_ros.ExtrapolationException):
-                pass
 
             # Angle text overlay (top-left)
-            pitch_deg = math.degrees(pitch)
-            yaw_deg = math.degrees(yaw)
             fire_str = "FIRE" if cmd.fire_cmd else "hold"
             cv2.putText(cv_img, f"Pitch: {pitch_deg:+.1f} deg", (10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)

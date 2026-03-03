@@ -1,7 +1,7 @@
 #ifndef RM_TRAJECTORY__TRAJECTORY_SOLVER_HPP_
 #define RM_TRAJECTORY__TRAJECTORY_SOLVER_HPP_
 
-#include <geometry_msgs/msg/point.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <visualization_msgs/msg/marker.hpp>
@@ -61,6 +61,13 @@ private:
   double indirect_timing_tolerance_;
   int indirect_max_candidates_;
   bool indirect_mode_active_ = false;
+
+  // Gimbal relative angle subscription
+  rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr micro_pose_sub_;
+  double current_pitch_ = 0.0;
+  double current_yaw_ = 0.0;
+  double yaw_sign_ = 1.0;
+  double pitch_sign_ = 1.0;
 
   double nextAlignmentTime(double yaw, double v_yaw, double face_idx,
                            double face_spacing, double bearing) const;

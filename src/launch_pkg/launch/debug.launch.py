@@ -279,9 +279,9 @@ def generate_launch_description():
             {'tracker.tracking_thres': 2},           # consecutive matches needed to transition DETECTING → TRACKING
             {'tracker.lost_time_thres': 1.0},        # [s] time without match before TEMP_LOST → LOST
             # EKF process noise
-            {'ekf.sigma2_q_xyz': 6.0},              # position process noise variance (higher → trusts measurements more)
-            {'ekf.sigma2_q_yaw': 20.0},             # yaw process noise variance
-            {'ekf.sigma2_q_r': 3.0},                # radius process noise variance (keep high so r adapts as target rotates)
+            {'ekf.sigma2_q_xyz':20.0},              # position process noise variance (higher → trusts measurements more)
+            {'ekf.sigma2_q_yaw': 10.0},             # yaw process noise variance
+            {'ekf.sigma2_q_r': 5.0},                # radius process noise variance (keep high so r adapts as target rotates)
             # EKF velocity damping (alpha^(dt/T) decay per step; 1.0 = no decay)
             {'ekf.xyz_damping_alpha': 0.95},         # position velocity damping (lower → stronger braking)
             {'ekf.yaw_damping_alpha': 0.95},         # yaw velocity damping
@@ -309,7 +309,7 @@ def generate_launch_description():
         name='trajectory_solver',
         parameters=[
             # Ballistics
-            {'bullet_speed': 15.0},                 # [m/s] muzzle velocity of the projectile
+            {'bullet_speed': 25.0},                 # [m/s] muzzle velocity of the projectile
             {'gravity': 9.8},                        # [m/s²] gravitational acceleration
             {'k': 0.01},                             # air drag coefficient (higher → more drop compensation)
             # Latency compensation

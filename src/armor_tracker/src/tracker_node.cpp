@@ -283,31 +283,29 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   gimbal_height_ = declare_parameter("gimbal.height", 0.5);
   yaw_sign_      = declare_parameter("gimbal.yaw_sign", 1.0);
   pitch_sign_    = declare_parameter("gimbal.pitch_sign", 1.0);
-  micro_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
-    "/micro_pose", rclcpp::SensorDataQoS(),
-    std::bind(&ArmorTrackerNode::microPoseCallback, this, std::placeholders::_1));
+  // micro_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
+  //   "/micro_pose", rclcpp::SensorDataQoS(),
+  //   std::bind(&ArmorTrackerNode::microPoseCallback, this, std::placeholders::_1));
 
   // IMU-based chassis rotation compensation
   enable_imu_compensation_ = declare_parameter("imu.enable", true);
   imu_gyro_alpha_ = declare_parameter("imu.gyro_alpha", 0.3);
   imu_timeout_ = declare_parameter("imu.timeout", 0.1);
-  imu_yaw_axis_sign_ = declare_parameter("imu.yaw_axis_sign", -1.0);
-  imu_pitch_axis_sign_ = declare_parameter("imu.pitch_axis_sign", -1.0);
 
   imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
     "/imu", rclcpp::SensorDataQoS(),
     std::bind(&ArmorTrackerNode::imuCallback, this, std::placeholders::_1));
 }
 
-void ArmorTrackerNode::microPoseCallback(
-  const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg)
-{
-  // Extract gimbal angles from the lower computer.
-  // cmd_vel_subscriber stores: position.x = -pitch, position.y = -yaw (radians)
-  gimbal_yaw_   = yaw_sign_ * msg->pose.position.y;
-  gimbal_pitch_ = pitch_sign_ * msg->pose.position.x;
-  broadcastGimbalTF(msg->header.stamp);
-}
+// void ArmorTrackerNode::microPoseCallback(
+//   const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg)
+// {
+//   // Extract gimbal angles from the lower computer.
+//   // cmd_vel_subscriber stores: position.x = -pitch, position.y = -yaw (radians)
+//   gimbal_yaw_   = yaw_sign_ * msg->pose.position.y;
+//   gimbal_pitch_ = pitch_sign_ * msg->pose.position.x;
+//   broadcastGimbalTF(msg->header.stamp);
+// }
 
 void ArmorTrackerNode::imuCallback(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
 {
@@ -335,25 +333,44 @@ void ArmorTrackerNode::imuCallback(const sensor_msgs::msg::Imu::ConstSharedPtr m
     return;
   }
 
-  // D455 IMU axis mapping (camera optical frame: X-right, Y-down, Z-forward)
-  // World yaw (rotation around vertical) maps to gyro Y axis
-  // World pitch (rotation around lateral) maps to gyro X axis
-  double raw_wz = imu_yaw_axis_sign_ * msg->angular_velocity.y;
-  double raw_wy = imu_pitch_axis_sign_ * msg->angular_velocity.x;
+  // D455 IMU in camera_color_optical_frame (X-right, Y-down, Z-forward).
+  // First, apply EMA filter to raw gyro (rad/s)
+  imu_wx_filtered_ = imu_gyro_alpha_ * msg->angular_velocity.x + (1.0 - imu_gyro_alpha_) * imu_wx_filtered_;
+  imu_wy_filtered_ = imu_gyro_alpha_ * msg->angular_velocity.y + (1.0 - imu_gyro_alpha_) * imu_wy_filtered_;
+  imu_wz_filtered_ = imu_gyro_alpha_ * msg->angular_velocity.z + (1.0 - imu_gyro_alpha_) * imu_wz_filtered_;
 
-  // EMA filter on raw gyro
-  imu_wz_filtered_ = imu_gyro_alpha_ * raw_wz + (1.0 - imu_gyro_alpha_) * imu_wz_filtered_;
-  imu_wy_filtered_ = imu_gyro_alpha_ * raw_wy + (1.0 - imu_gyro_alpha_) * imu_wy_filtered_;
+  // Construct rotation from Camera Optical Frame -> Chassis Frame.
+  //   q_camera_to_chassis = q_gimbal_yaw * q_gimbal_pitch * q_convention
+  tf2::Quaternion q_yaw, q_pitch, q_convention;
+  q_yaw.setRPY(0, 0, gimbal_yaw_);         // Rotation around world Z
+  q_pitch.setRPY(0, gimbal_pitch_, 0);     // Rotation around gimbal Y
+  q_convention.setRPY(-M_PI / 2.0, 0, -M_PI / 2.0); // Optical frame convention
 
-  // Gimbal angular velocity from derivative of gimbal angles
+  tf2::Quaternion q_c2chassis = q_yaw * q_pitch * q_convention;
+  q_c2chassis.normalize();
+
+  // Total angular velocity vector measured by camera IMU (in camera frame)
+  tf2::Vector3 omega_c_in_c(imu_wx_filtered_, imu_wy_filtered_, imu_wz_filtered_);
+
+  // Rotate angular velocity vector to chassis frame
+  tf2::Vector3 omega_c_in_chassis = tf2::quatRotate(q_c2chassis, omega_c_in_c);
+
+  // Reconstruct gimbal's angular velocity relative to chassis
+  // Gimbal pitches around its Y axis, yaws around Chassis Z axis.
   double gimbal_wz = (gimbal_yaw_ - prev_gimbal_yaw_) / dt;
   double gimbal_wy = (gimbal_pitch_ - prev_gimbal_pitch_) / dt;
-
-  // Chassis angular velocity = total IMU rotation - gimbal rotation
-  double chassis_wz = imu_wz_filtered_ - gimbal_wz;
-  double chassis_wy = imu_wy_filtered_ - gimbal_wy;
+  
+  // Total angular velocity = chassis velocity + gimbal velocity. 
+  //   omega_c_in_chassis = omega_chassis + omega_gimbal.
+  // We want to isolate omega_chassis.
+  // Note: gimbal pitch is a rotation around the yawed Y axis, so we must separate them carefully.
+  // A simpler and sufficiently accurate assumption: 
+  //   chassis pitch/yaw velocity is total velocity minus the change in gimbal angles.
+  double chassis_wy = omega_c_in_chassis.y() - gimbal_wy;
+  double chassis_wz = omega_c_in_chassis.z() - gimbal_wz;
 
   // Integrate chassis rotation (Euler integration)
+  // Yaw is pure Z rotation. Pitch is pure Y rotation. (Roll / X is ignored for trajectory)
   chassis_yaw_ += chassis_wz * dt;
   chassis_pitch_ += chassis_wy * dt;
 
@@ -692,6 +709,11 @@ void ArmorTrackerNode::armorsCallback(
       target_msg.yaw        = state(6);
       target_msg.v_yaw      = state(7);
       target_msg.radius_1   = state(8);
+      // to print
+      RCLCPP_INFO(this->get_logger(), "target_msg.position: %f %f %f %f %f %f %f %f %f", 
+      target_msg.position.x, target_msg.position.y, target_msg.position.z, 
+      target_msg.velocity.x, target_msg.velocity.y, target_msg.velocity.z,
+      target_msg.yaw, target_msg.v_yaw, target_msg.radius_1);
       target_msg.radius_2   = tracker_->another_r;
       target_msg.dz         = tracker_->dz;
       target_msg.v_yaw_variance = tracker_->ekf.getVariance(7);

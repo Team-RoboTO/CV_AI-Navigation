@@ -70,6 +70,17 @@ TrajectorySolverNode::TrajectorySolverNode(const rclcpp::NodeOptions &options)
   // Debug sphere showing predicted bullet impact point in RViz
   marker_pub_ = this->create_publisher<visualization_msgs::msg::Marker>(
       "/trajectory/marker", rclcpp::QoS(10).durability(rclcpp::DurabilityPolicy::Volatile));
+
+  // Subscribe to current gimbal pose to calculate relative commands
+  yaw_sign_      = this->declare_parameter("gimbal_yaw_sign", 1.0);
+  pitch_sign_    = this->declare_parameter("gimbal_pitch_sign", 1.0);
+  
+  micro_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
+      "/micro_pose", rclcpp::SensorDataQoS(),
+      [this](const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg) {
+        current_pitch_ = pitch_sign_ * msg->pose.position.x;
+        current_yaw_   = yaw_sign_ * msg->pose.position.y;
+      });
 }
 
 // ---------------------------------------------------------------------------
@@ -531,11 +542,14 @@ void TrajectorySolverNode::targetCallback(
       fire = (best->residual < timing_tol);
     }
 
-    // Publish GimbalCmd
+    // Publish GimbalCmd (relative angles!)
     auto_aim_interfaces::msg::GimbalCmd cmd;
     cmd.header = msg->header;
-    cmd.pitch    = best->pitch;
-    cmd.yaw      = best->yaw;
+    double rel_pitch = best->pitch - current_pitch_;
+    double rel_yaw = angles::shortest_angular_distance(current_yaw_, best->yaw);
+    
+    cmd.pitch    = rel_pitch * 180.0 / M_PI;
+    cmd.yaw      = rel_yaw * 180.0 / M_PI;
     cmd.distance = best->range;
     cmd.fire_cmd = fire;
     cmd_pub_->publish(cmd);
@@ -543,8 +557,8 @@ void TrajectorySolverNode::targetCallback(
     // Publish Twist
     geometry_msgs::msg::Twist twist;
     twist.angular.x = fire ? 1.0 : 0.0;
-    twist.angular.y = best->pitch * 180.0 / M_PI;
-    twist.angular.z = best->yaw   * 180.0 / M_PI;
+    twist.angular.y = rel_pitch * 180.0 / M_PI;
+    twist.angular.z = rel_yaw   * 180.0 / M_PI;
     twist_pub_->publish(twist);
 
     // Orange marker for indirect impact point
@@ -751,18 +765,22 @@ void TrajectorySolverNode::targetCallback(
     in_range = (min_face_diff < effective_window);
   }
 
+  // Publish GimbalCmd (relative angles!)
   auto_aim_interfaces::msg::GimbalCmd cmd;
   cmd.header = msg->header;
-  cmd.pitch    = pitch;
-  cmd.yaw      = yaw;
+  double rel_pitch = pitch - current_pitch_;
+  double rel_yaw = angles::shortest_angular_distance(current_yaw_, yaw);
+
+  cmd.pitch    = rel_pitch * 180.0 / M_PI;
+  cmd.yaw      = rel_yaw * 180.0 / M_PI;
   cmd.distance = range;
   cmd.fire_cmd = in_range;
   cmd_pub_->publish(cmd);
 
   geometry_msgs::msg::Twist twist;
   twist.angular.x = in_range ? 1.0 : 0.0;
-  twist.angular.y = pitch * 180.0 / M_PI;
-  twist.angular.z = yaw   * 180.0 / M_PI;
+  twist.angular.y = rel_pitch * 180.0 / M_PI;
+  twist.angular.z = rel_yaw   * 180.0 / M_PI;
   twist_pub_->publish(twist);
 
   // Visualise predicted impact point

@@ -113,8 +113,9 @@ private:
 
   double chassis_yaw_ = 0.0;
   double chassis_pitch_ = 0.0;
-  double imu_wz_filtered_ = 0.0;
+  double imu_wx_filtered_ = 0.0;
   double imu_wy_filtered_ = 0.0;
+  double imu_wz_filtered_ = 0.0;
   double prev_gimbal_yaw_ = 0.0;
   double prev_gimbal_pitch_ = 0.0;
   rclcpp::Time prev_imu_time_;
@@ -126,8 +127,6 @@ private:
   bool enable_imu_compensation_ = true;
   double imu_gyro_alpha_ = 0.3;
   double imu_timeout_ = 0.1;
-  double imu_yaw_axis_sign_ = -1.0;
-  double imu_pitch_axis_sign_ = -1.0;
 
   // Visualization marker publisher
   visualization_msgs::msg::Marker position_marker_;
