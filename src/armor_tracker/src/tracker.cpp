@@ -25,17 +25,26 @@ Tracker::Tracker(double max_match_distance, double max_track_range)
   target_state(Eigen::VectorXd::Zero(9)),
   max_match_distance_(max_match_distance),
   max_match_yaw_diff_(M_PI / 3.0),
-  max_track_range_(max_track_range)
+  max_track_range_(max_track_range),
+  max_yaw_oblique_angle_(65.0 * M_PI / 180.0)
 {
 }
 
+// ---------------------------------------------------------------------------
+// init — pick a target and bootstrap the EKF from scratch.
+//
+// Called when the tracker is in LOST state (no active target).  We need to
+// pick ONE armor to start tracking.  Why closest-to-image-center?  Because
+// edge-of-frame detections have worse PnP accuracy (more lens distortion,
+// less resolution), and center detections are more likely to be the robot
+// the operator is pointing at.
+// ---------------------------------------------------------------------------
 void Tracker::init(const Armors::SharedPtr & armors_msg)
 {
   if (armors_msg->armors.empty()) {
     return;
   }
 
-  // Simply choose the armor that is closest to image center
   double min_distance = DBL_MAX;
   tracked_armor = armors_msg->armors[0];
   for (const auto & armor : armors_msg->armors) {
@@ -54,22 +63,78 @@ void Tracker::init(const Armors::SharedPtr & armors_msg)
   updateArmorsNum(tracked_armor);
 }
 
+// ---------------------------------------------------------------------------
+// update — the core per-frame tracking loop.
+//
+// This is the most complex function in the tracker.  Here's the big picture:
+//
+// PROBLEM: The camera sees one or more armor detections each frame.  We need
+// to figure out which detection (if any) corresponds to the robot we're
+// already tracking, then update our belief about where that robot is.
+//
+// APPROACH (in order):
+//   1. PREDICT  — Advance the EKF forward in time using the motion model.
+//                 This gives us a "best guess" of where the armor should be
+//                 NOW, before looking at any new detections.
+//
+//   2. ASSOCIATE — Among all detected armors, find the one that best matches
+//                  our prediction.  We only consider armors with the same
+//                  YOLO class ID ("same_id_armors") because color = team.
+//                  If multiple same-ID armors exist (robot showing 2 faces),
+//                  we pick the one closest to our prediction in the statistical
+//                  sense (Mahalanobis distance, not raw Euclidean).
+//
+//   3. CLASSIFY — Does the match look like:
+//      MATCH: position close + yaw close     → normal EKF update
+//      JUMP:  position close + yaw far off   → robot rotated, new face visible
+//      MISS:  position too far               → probably noise, skip update
+//
+//   4. UPDATE   — Feed the matched measurement into the EKF to correct our
+//                 state estimate.  Also update the radius scalar KFs.
+//
+//   5. STATE MACHINE — Transition between DETECTING/TRACKING/TEMP_LOST/LOST
+//                      based on whether we found a match this frame.
+// ---------------------------------------------------------------------------
 void Tracker::update(const Armors::SharedPtr & armors_msg)
 {
-  // KF predict
-  // ekf_prediction is a 9D state vector: [xc, v_xc, yc, v_yc, za, v_za, yaw, v_yaw, r]
-  // representing the robot center position/velocity, armor height velocity,
-  // yaw angle/rate, and orbit radius — all propagated forward one timestep
-  // by the process model (no measurement update yet).
+  // === STEP 1: PREDICT ===
+  // Propagate state forward one timestep.  After this, ekf_prediction holds
+  // "where we think the robot is right now" based on the motion model alone.
   Eigen::VectorXd ekf_prediction = ekf.predict();
   RCLCPP_DEBUG(rclcpp::get_logger("armor_tracker"), "EKF predict");
 
+  // The radius is managed by separate scalar KFs (not the main EKF), because
+  // radius changes rarely (only on armor jumps) and mixing it into the 9D EKF
+  // creates unwanted cross-correlations that bias position/yaw estimates.
+  // We "predict" the scalar KFs too (just grows their covariance by Q each frame).
+  r_active_kf_.predict();
+  r_other_kf_.predict();
+
+  // Overwrite the EKF's radius state with the scalar KF's estimate and zero
+  // all cross-covariance terms.  This way, every downstream operation
+  // (Mahalanobis gating, Kalman gain computation) uses the scalar KF's
+  // radius and uncertainty instead of the EKF's stale/uncorrelated values.
+  ekf_prediction(8) = r_active_kf_.x;
+  ekf.setState(ekf_prediction);
+  ekf.decoupleState(8, r_active_kf_.P);
+
   bool matched = false;
-  // Use EKF prediction as default target state if no matched armor is found
+  measurement_valid = false;
+  // Default: if we don't find a match, the EKF just coasts on its prediction.
   target_state = ekf_prediction;
 
+  // When two faces of the same robot are visible simultaneously, we can measure
+  // the OTHER pair's radius/height without waiting for a jump.  We defer this
+  // measurement until after the EKF update so we use the corrected (posterior)
+  // center position, which is more accurate than the raw prediction.
+  bool has_other_pair_armor = false;
+  double other_pair_x = 0.0, other_pair_y = 0.0, other_pair_z = 0.0;
+  double other_pair_yaw = 0.0;
+
   if (!armors_msg->armors.empty()) {
-    // Collect all same-ID armors
+    // === STEP 2: ASSOCIATE ===
+    // Only consider detections with the same YOLO class ID as our target.
+    // Class ID encodes color (red/blue), so this filters out teammates.
     std::vector<Armor> same_id_armors;
     auto predicted_position = getArmorPositionFromState(ekf_prediction);
 
@@ -83,78 +148,78 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
       Armor selected_armor;
 
       if (same_id_armors.size() > 1) {
+        // Multiple same-ID armors visible (robot showing 2+ faces).
+        // Use Mahalanobis distance (not Euclidean) to pick the best match.
+        // WHY: Mahalanobis accounts for the EKF's uncertainty shape — if the
+        // filter is very confident in X but uncertain in Y, a candidate that
+        // is close in X but far in Y is penalised correctly.  Euclidean
+        // distance treats all axes equally and can pick the wrong face.
+        double min_maha = DBL_MAX;
         double predicted_yaw = ekf_prediction(6);
-        double abs_vyaw = std::abs(target_state(7));
+        int selected_idx = 0;
+        for (size_t i = 0; i < same_id_armors.size(); i++) {
+          auto p = same_id_armors[i].pose.position;
+          // Extract raw yaw without updating last_yaw_ (non-destructive)
+          tf2::Quaternion tf_q;
+          tf2::fromMsg(same_id_armors[i].pose.orientation, tf_q);
+          double roll, pitch, raw_yaw;
+          tf2::Matrix3x3(tf_q).getRPY(roll, pitch, raw_yaw);
+          // Unwrap relative to EKF prediction so the innovation is correct
+          double unwrapped_yaw = predicted_yaw +
+            angles::shortest_angular_distance(predicted_yaw, raw_yaw);
 
-        if (abs_vyaw < 1.0) {
-          // === SLOW MODE: pick the most face-on armor ===
-          // For stationary/slowly rotating targets, the best shooting target
-          // is the armor that's most face-on to the camera.
-          // No yaw filter — multiple same-id armors = same robot, no ambiguity.
-          // Hysteresis: currently tracked face gets 15° advantage.
-          double best_oblique = M_PI;
-          Armor best_faceon_armor;
-          bool found = false;
+          Eigen::Vector4d z(p.x, p.y, p.z, unwrapped_yaw);
+          double maha = ekf.mahalanobis(z);
+          if (maha < min_maha) {
+            min_maha = maha;
+            selected_armor = same_id_armors[i];
+            selected_idx = static_cast<int>(i);
+          }
+        }
 
-          for (const auto & armor : same_id_armors) {
-            tf2::Quaternion tf_q;
-            tf2::fromMsg(armor.pose.orientation, tf_q);
-            double roll, pitch, raw_yaw;
-            tf2::Matrix3x3(tf_q).getRPY(roll, pitch, raw_yaw);
+        // If we see TWO faces of the same robot simultaneously, we can measure
+        // the OTHER pair's geometry (r2, dz) right now instead of waiting for
+        // a jump event.  This is more accurate because both measurements come
+        // from the same frame (no temporal drift between them).
+        //
+        // WHY DEFERRED: We store the data now but process it AFTER the EKF
+        // update (below), so we use the corrected center position.  Processing
+        // it here with the raw prediction would introduce velocity-dependent
+        // bias into the radius measurement.
+        //
+        // WHY RAW RPY: We extract yaw via getRPY() instead of orientationToYaw()
+        // because the latter updates last_yaw_ (the unwrapping state), and we
+        // haven't decided which armor is the "primary" one yet.  Calling
+        // orientationToYaw on the wrong one would corrupt future yaw unwrapping.
+        if (tracked_armors_num == ArmorsNum::NORMAL_4) {
+          tf2::Quaternion sel_q;
+          tf2::fromMsg(selected_armor.pose.orientation, sel_q);
+          double sel_roll, sel_pitch, sel_yaw;
+          tf2::Matrix3x3(sel_q).getRPY(sel_roll, sel_pitch, sel_yaw);
 
-            double yaw_diff = std::abs(
-              angles::shortest_angular_distance(predicted_yaw, raw_yaw));
+          for (size_t i = 0; i < same_id_armors.size(); i++) {
+            if (static_cast<int>(i) == selected_idx) continue;
+            // Reject duplicates: if within 10cm, it's the same physical plate
+            double ddx = same_id_armors[i].pose.position.x - selected_armor.pose.position.x;
+            double ddy = same_id_armors[i].pose.position.y - selected_armor.pose.position.y;
+            double ddz = same_id_armors[i].pose.position.z - selected_armor.pose.position.z;
+            if (std::sqrt(ddx * ddx + ddy * ddy + ddz * ddz) < 0.10) continue;
 
-            auto p = armor.pose.position;
-            double face_normal = raw_yaw + M_PI;
-            double face_to_cam = std::atan2(-p.y, -p.x);
-            double oblique = std::abs(
-              angles::shortest_angular_distance(face_normal, face_to_cam));
-
-            // Hysteresis: currently tracked face gets 15° advantage
-            if (yaw_diff < 0.15) oblique -= 0.26;
-
-            if (oblique < best_oblique) {
-              best_oblique = oblique;
-              best_faceon_armor = armor;
-              found = true;
+            tf2::Quaternion other_q;
+            tf2::fromMsg(same_id_armors[i].pose.orientation, other_q);
+            double other_roll, other_pitch, other_yaw;
+            tf2::Matrix3x3(other_q).getRPY(other_roll, other_pitch, other_yaw);
+            double yaw_sep = std::abs(angles::shortest_angular_distance(sel_yaw, other_yaw));
+            // ~90° separation means different pair
+            if (yaw_sep > M_PI / 4.0 && yaw_sep < 3.0 * M_PI / 4.0) {
+              has_other_pair_armor = true;
+              other_pair_x = same_id_armors[i].pose.position.x;
+              other_pair_y = same_id_armors[i].pose.position.y;
+              other_pair_z = same_id_armors[i].pose.position.z;
+              other_pair_yaw = other_yaw;  // raw RPY yaw for radial projection
+              break;  // only one other-pair armor expected
             }
           }
-          selected_armor = found ? best_faceon_armor : same_id_armors[0];
-
-        } else {
-          // === FAST MODE: pick position-closest with yaw consistency ===
-          // For fast spinners, maintaining stable v_yaw tracking is critical.
-          // Switching faces would zero v_yaw and break indirect mode.
-          double min_yaw_dist = DBL_MAX;
-          double min_fallback_dist = DBL_MAX;
-          Armor yaw_armor, fallback_armor;
-          bool found_yaw = false;
-
-          for (const auto & armor : same_id_armors) {
-            tf2::Quaternion tf_q;
-            tf2::fromMsg(armor.pose.orientation, tf_q);
-            double roll, pitch, raw_yaw;
-            tf2::Matrix3x3(tf_q).getRPY(roll, pitch, raw_yaw);
-
-            double yaw_diff = std::abs(
-              angles::shortest_angular_distance(predicted_yaw, raw_yaw));
-
-            auto p = armor.pose.position;
-            Eigen::Vector3d pos(p.x, p.y, p.z);
-            double dist = (predicted_position - pos).norm();
-
-            if (dist < min_fallback_dist) {
-              min_fallback_dist = dist;
-              fallback_armor = armor;
-            }
-            if (yaw_diff < max_match_yaw_diff_ && dist < min_yaw_dist) {
-              min_yaw_dist = dist;
-              yaw_armor = armor;
-              found_yaw = true;
-            }
-          }
-          selected_armor = found_yaw ? yaw_armor : fallback_armor;
         }
       } else {
         selected_armor = same_id_armors[0];
@@ -169,55 +234,148 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
         angles::shortest_angular_distance(ekf_prediction(6), measured_yaw);
       double yaw_diff = std::abs(yaw_innov_signed);
 
-      // Store diagnostics for external inspection (e.g. TrackerInfo publisher):
-      //   info_position_diff   — Euclidean distance [m] between the EKF-predicted
-      //                          armor position and the measured armor position;
-      //                          used as the primary matching gate threshold.
-      //   info_yaw_diff        — Unsigned angular error [rad] between the EKF-predicted
-      //                          yaw (state index 6) and the measured yaw; used to
-      //                          detect armor-jump events when it exceeds max_match_yaw_diff_.
-      //   info_yaw_innov_signed — Signed version of the same yaw innovation
-      //                          (positive = measured leads predicted, negative = lags);
-      //                          preserved so callers can tell which direction the
-      //                          robot is rotating relative to our prediction.
-      //   info_position_innov  — 3D position innovation vector (measured − predicted) [m];
-      //                          useful for tuning EKF noise covariances.
+      // === OBLIQUENESS CHECK ===
+      // WHY THIS EXISTS: When a robot is turning, one face might be nearly
+      // edge-on to the camera (>65°).  At such extreme angles, PnP cannot
+      // resolve the yaw reliably — the armor plate is just a thin line of
+      // pixels, so the orientation becomes essentially random noise.
+      //
+      // Without this check, the large yaw error would look like an "armor jump"
+      // and trigger handleArmorJump(), which snaps yaw and swaps radii —
+      // completely wrong when the robot hasn't actually switched faces.
+      //
+      // Solution: compute how oblique the view is.  If it's beyond the
+      // threshold, we IGNORE the yaw gate entirely (treat as "match" regardless
+      // of yaw_diff).  The R matrix already inflates yaw noise at high obliquity,
+      // so the Kalman gain for yaw → 0 and the bad yaw measurement is harmlessly
+      // ignored.  The XYZ position is still fused normally.
+      double face_angle = 0.0;
+      if (p.x * p.x + p.y * p.y > 1e-12) {
+        double bearing_opp = std::atan2(-p.y, -p.x);
+        face_angle = std::abs(std::remainder(measured_yaw - bearing_opp, 2.0 * M_PI));
+      }
+      bool yaw_oblique = face_angle > max_yaw_oblique_angle_;
+
       info_position_diff = position_diff;
       info_yaw_diff = yaw_diff;
       info_yaw_innov_signed = yaw_innov_signed;
       info_position_innov = Eigen::Vector3d(p.x, p.y, p.z) - predicted_position;
+      info_face_angle = face_angle;
       tracked_armor = selected_armor;
 
-      // Three-way decision based on how well the detected armor matches the EKF prediction:
-      //   MATCH   — both position and yaw are within gate thresholds → feed the
-      //             measurement into the EKF (update step) and mark as matched.
-      //   JUMP    — yaw error exceeds max_match_yaw_diff_ even though the armor was
-      //             the closest candidate → the robot has rotated far enough that a
-      //             different face is now visible; call handleArmorJump() to re-initialise
-      //             the EKF yaw and radius state for the new face.
-      //   MISS    — position is too far off but yaw is within bounds → transient
-      //             detection noise; log a warning and leave target_state as the
-      //             raw EKF prediction (no update, matched stays false).
-      if (position_diff < max_match_distance_ && yaw_diff < max_match_yaw_diff_) {
+      // === STEP 3: CLASSIFY — is this a normal match, an armor jump, or noise? ===
+      //
+      // MATCH (position close, yaw close or oblique):
+      //   The most common case.  The detected armor is the same face we've been
+      //   tracking.  Feed it into the EKF to correct our state estimate.
+      //
+      // JUMP (position close, yaw far off, NOT oblique):
+      //   The robot rotated far enough (~90° or ~180°) that a DIFFERENT face is
+      //   now the one closest to us.  This is normal for spinning robots — every
+      //   fraction of a second, a new face comes into view.  We need special
+      //   handling: swap radii, snap yaw, recalculate center position.
+      //
+      // MISS (position too far):
+      //   The detection is far from where we expect.  This usually means either
+      //   (a) a false positive from YOLO, or (b) the EKF has diverged.  We
+      //   ignore it to prevent corrupting the filter with bad data.
+      //
+      // WHY A YAW GATE AT ALL?  Without it, a slowly rotating robot would always
+      // look like a "match" (position is close), and we'd feed a yaw measurement
+      // that's 90° off into the EKF.  The yaw gate catches the moment the visible
+      // face switches, so we can handle it correctly (handleArmorJump).
+      if (position_diff < max_match_distance_ &&
+          (yaw_diff < max_match_yaw_diff_ || yaw_oblique)) {
         // Matched armor found — check Mahalanobis distance before fusing
+        if (yaw_oblique && yaw_diff >= max_match_yaw_diff_) {
+          RCLCPP_DEBUG(rclcpp::get_logger("armor_tracker"),
+            "Oblique view (%.0f°) — bypassing yaw gate (yaw_diff=%.1f°), R_yaw inflated",
+            face_angle * 180.0 / M_PI, yaw_diff * 180.0 / M_PI);
+        }
         measurement = Eigen::Vector4d(p.x, p.y, p.z, measured_yaw);
         double maha = ekf.mahalanobis(measurement);
         // chi-squared threshold for 4 DOF at 99% confidence ≈ 13.3
         if (maha < 13.3) {
           matched = true;
+          measurement_valid = true;
           target_state = ekf.update(measurement);
+
+          // === RADIUS ADAPTATION ===
+          // WHY: The initial radius guess (0.22m) is just an approximation.
+          // Real robots have slightly different armor arrangements.  We
+          // measure the actual radius each frame and feed it into a scalar KF
+          // so the trajectory solver aims at the right spot.
+          //
+          // WHY YAW-PROJECTED (not raw Euclidean distance)?
+          // The vector from center to armor has two components:
+          //   radial:     along the yaw direction  (this IS the radius)
+          //   tangential: perpendicular to yaw     (this is PnP noise)
+          // By projecting onto the yaw direction with dot(delta, [cos,sin]),
+          // we extract only the radial component, rejecting tangential noise.
+          // This makes the radius estimate ~3x less noisy than raw distance.
+          {
+            double yaw = target_state(6);
+            double dx = target_state(0) - measurement(0);  // xc - xa
+            double dy = target_state(2) - measurement(1);  // yc - ya
+            double r_measured = dx * std::cos(yaw) + dy * std::sin(yaw);
+            double range = std::sqrt(
+              target_state(0) * target_state(0) +
+              target_state(2) * target_state(2) +
+              target_state(4) * target_state(4));
+            if (range < r_adapt_max_dist_ &&
+                r_measured > 0.10 && r_measured < 0.45) {
+              r_active_kf_.update(r_measured);
+            }
+            target_state(8) = r_active_kf_.x;
+          }
+
+          // Other pair: deferred multi-armor measurement using posterior center.
+          // Only fires on MATCH (not JUMP), preventing double-adaptation.
+          // Uses yaw-projected radius (same as active pair) to reject tangential error.
+          if (has_other_pair_armor) {
+            double odx = target_state(0) - other_pair_x;
+            double ody = target_state(2) - other_pair_y;
+            double r_other_measured =
+              odx * std::cos(other_pair_yaw) + ody * std::sin(other_pair_yaw);
+            if (r_other_measured > 0.10 && r_other_measured < 0.45) {
+              r_other_kf_.update(r_other_measured);
+            }
+            another_r = r_other_kf_.x;
+
+            // dz from same-frame observation (more accurate than jump-based:
+            // both measurements are simultaneous, no temporal drift).
+            double dz_measured = other_pair_z - target_state(4);
+            dz_measured = std::max(-0.25, std::min(dz_measured, 0.25));
+            if (!dz_initialized_) {
+              dz = dz_measured;
+              dz_initialized_ = true;
+            } else {
+              dz = dz_adapt_alpha_ * dz_measured + (1.0 - dz_adapt_alpha_) * dz;
+            }
+          }
+
+          ekf.setState(target_state);
+          // Sync EKF covariance for radius with the scalar KF: zero cross-terms
+          // so the externally-managed r doesn't pollute Kalman gains or Mahalanobis.
+          ekf.decoupleState(8, r_active_kf_.P);
           RCLCPP_DEBUG(rclcpp::get_logger("armor_tracker"), "EKF update (maha=%.1f)", maha);
         } else {
-          RCLCPP_WARN(rclcpp::get_logger("armor_tracker"),
-            "Measurement rejected: Mahalanobis=%.1f > 13.3", maha);
+          if (maha >= 1e8) {
+            RCLCPP_WARN(rclcpp::get_logger("armor_tracker"),
+              "EKF: singular innovation covariance (maha=%.0f) — possible divergence", maha);
+          } else {
+            RCLCPP_WARN(rclcpp::get_logger("armor_tracker"),
+              "Measurement rejected: Mahalanobis=%.1f > 13.3", maha);
+          }
         }
-      } else if (yaw_diff > max_match_yaw_diff_) {
-        // Yaw jumped — gate with relaxed Mahalanobis before accepting
+      } else if (yaw_diff > max_match_yaw_diff_ && !yaw_oblique) {
+        // Yaw jumped (and not oblique) — gate with relaxed Mahalanobis before accepting
         measurement = Eigen::Vector4d(p.x, p.y, p.z, measured_yaw);
         double maha = ekf.mahalanobis(measurement);
         if (maha < 20.0) {  // relaxed gate for jumps (vs 13.3 for matches)
           handleArmorJump(selected_armor);
           matched = true;
+          measurement_valid = true;
         } else {
           RCLCPP_WARN(rclcpp::get_logger("armor_tracker"),
             "Armor jump rejected: Mahalanobis=%.1f > 20.0", maha);
@@ -229,32 +387,14 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
     }
   }
 
-  // Clamp the orbit radius (state index 8) to the physical bounds [0.12, 0.40] m.
-  //
-  // WHY THIS IS NECESSARY:
-  // The EKF treats radius as a free state variable and updates it whenever a new
-  // armor measurement arrives.  Without bounds, two failure modes corrupt it:
-  //
-  //   1. Divergence toward zero — if a noisy or mismatched detection places the
-  //      armor very close to the center, the EKF can drive the radius to near-zero.
-  //      A near-zero radius collapses the armor position onto the center point,
-  //      making face-position prediction meaningless and causing the trajectory
-  //      solver to aim at the wrong point.
-  //
-  //   2. Divergence toward large values — a spurious detection far from the robot
-  //      center pushes the radius up.  The EKF then predicts all armor faces far
-  //      from the true center, the matching gate fails every frame, and the tracker
-  //      goes LOST even though the robot is still visible.
-  //
-  // The bounds [0.12, 0.40] m cover the full range of RoboMaster robot chassis
-  // geometries (infantry ≈ 0.14–0.18 m, hero/sentry up to ~0.35 m).  Any value
-  // outside this range is physically impossible and must be an EKF artefact.
-  if (target_state(8) < 0.12) {
-    target_state(8) = 0.12;
+  // Safety-net clamp on radius [0.12, 0.40] m.
+  // Last-resort guard against edge cases (e.g. covariance reset or divergence).
+  if (target_state(8) < 0.12 || target_state(8) > 0.4) {
+    target_state(8) = std::max(0.12, std::min(target_state(8), 0.4));
+    r_active_kf_.x = target_state(8);
+    r_active_kf_.P = r_kf_P_init_;  // reset KF uncertainty after clamp
     ekf.setState(target_state);
-  } else if (target_state(8) > 0.4) {
-    target_state(8) = 0.4;
-    ekf.setState(target_state);
+    ekf.decoupleState(8, r_active_kf_.P);
   }
 
   // TODO: abscertain this v_yaw_max value is correct 
@@ -265,6 +405,9 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
     target_state(7) = std::copysign(15.0, target_state(7));
     ekf.setState(target_state);
     ekf.resetCovariance();
+    // resetCovariance restores P0 which has cross-terms = 0 for r,
+    // but re-decouple to ensure P(8,8) matches the scalar KF.
+    ekf.decoupleState(8, r_active_kf_.P);
     RCLCPP_WARN(rclcpp::get_logger("armor_tracker"), "v_yaw clamped — covariance reset");
   }
 
@@ -343,21 +486,53 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
   }
 }
 
+// ---------------------------------------------------------------------------
+// initEKF — bootstrap the EKF state from a single armor detection.
+//
+// Given the armor plate position (xa, ya, za) and its yaw orientation,
+// we back-calculate the robot center position:
+//
+//   center = armor + r · [cos(yaw), sin(yaw)]
+//
+// This is the inverse of getArmorPositionFromState().  All velocities are
+// initialised to zero (we have no motion information from a single frame).
+//
+// Both scalar radius KFs are reset with initial guesses (r1, r2) and high
+// covariance so they converge quickly once measurements start flowing.
+// ---------------------------------------------------------------------------
 void Tracker::initEKF(const Armor & a)
 {
   double xa = a.pose.position.x;
   double ya = a.pose.position.y;
   double za = a.pose.position.z;
+  // Reset yaw unwrapping history so orientationToYaw starts fresh
   last_yaw_ = 0;
   double yaw = orientationToYaw(a.pose.orientation);
 
-  // Set initial position at 0.2m behind the target
+  // Back-calculate robot center from armor position:
+  //   armor = center − r·[cos,sin]  ⟹  center = armor + r·[cos,sin]
   target_state = Eigen::VectorXd::Zero(9);
-  double r = 0.26;
+  double r = initial_r1_;
   double xc = xa + r * cos(yaw);
   double yc = ya + r * sin(yaw);
-  dz = 0, another_r = r;
-  target_state << xc, 0, yc, 0, za, 0, yaw, 0, r;
+
+  // Reset other-pair geometry estimates
+  dz = 0;
+  another_r = initial_r2_;
+  dz_initialized_ = false;
+
+  // Reset scalar KFs with initial radii and configured noise parameters.
+  // High P_init (σ ≈ 8cm) ensures the gain is large for the first few frames,
+  // allowing the radius to converge quickly from the initial guess.
+  r_active_kf_.reset(initial_r1_, r_kf_P_init_);
+  r_active_kf_.Q = r_kf_Q_;
+  r_active_kf_.R = r_kf_R_;
+  r_other_kf_.reset(initial_r2_, r_kf_P_init_);
+  r_other_kf_.Q = r_kf_Q_;
+  r_other_kf_.R = r_kf_R_;
+
+  //                xc  v_xc  yc  v_yc  za  v_za  yaw  v_yaw  r
+  target_state << xc, 0,    yc, 0,    za, 0,    yaw, 0,     r;
 
   ekf.setState(target_state);
 }
@@ -374,11 +549,39 @@ void Tracker::updateArmorsNum(const Armor & armor)
   max_match_yaw_diff_ = M_PI / 3.0;  // ~60°
 }
 
+// ---------------------------------------------------------------------------
+// handleArmorJump — process the event when a different face becomes visible.
+//
+// WHY THIS HAPPENS:
+//   RoboMaster robots spin continuously.  With 4 armor plates spaced 90° apart,
+//   every ~0.1-0.5s (depending on spin speed), the face pointing at us changes.
+//   From the EKF's perspective, the measured yaw suddenly jumps by ~90° or ~180°.
+//
+// WHAT THIS FUNCTION DOES:
+//   1. Detects spin reversals (v_yaw sign disagrees with jump direction)
+//   2. Snaps the EKF's yaw to the new measurement
+//   3. For 90° jumps (pair switch): swaps the radius KFs and updates dz
+//      because even/odd faces have different radii and heights
+//   4. Checks if the EKF has diverged (position too far off) and hard-resets if so
+//   5. Inflates covariance to reflect the uncertainty introduced by snapping
+//   6. Feeds the measurement through the EKF update step so center position
+//      (xc, yc) gets properly corrected — without this, only yaw/radius/za
+//      would be updated and the center would drift
+//
+// WHY NOT JUST LET THE EKF HANDLE IT?
+//   A 90° yaw jump is far beyond the EKF's linear approximation range.  The
+//   Jacobian H is linearized around the current yaw, and at 90° off, the
+//   linearization is completely wrong — the EKF would either reject the
+//   measurement (Mahalanobis too high) or corrupt the state.  Snapping
+//   yaw first and then running the update gives the EKF a good linearization
+//   point for correcting the position.
+// ---------------------------------------------------------------------------
 void Tracker::handleArmorJump(const Armor & current_armor)
 {
   double yaw = orientationToYaw(current_armor.pose.orientation);
-  // Check if jump direction agrees with current v_yaw.
-  // If the robot reversed spin, v_yaw sign will disagree with the jump direction.
+  // Is the robot spinning the same direction as before, or did it reverse?
+  // jump_direction > 0 means the new face is CCW from the old face.
+  // If that disagrees with v_yaw's sign, the robot changed spin direction.
   double jump_direction = angles::shortest_angular_distance(target_state(6), yaw);
   double jump_angle = std::abs(jump_direction);
   if (jump_direction * target_state(7) < 0) {
@@ -395,10 +598,22 @@ void Tracker::handleArmorJump(const Armor & current_armor)
     // 180° jump: stays on same pair (0→2 or 1→3) — no swap needed.
     bool is_pair_switch = (jump_angle > M_PI / 4.0) && (jump_angle < 3.0 * M_PI / 4.0);
     if (is_pair_switch) {
-      dz = target_state(4) - current_armor.pose.position.z;
+      // EMA-smooth dz across jumps instead of single-shot noisy PnP measurement
+      double new_dz = target_state(4) - current_armor.pose.position.z;
+      new_dz = std::max(-0.25, std::min(new_dz, 0.25));
+      if (!dz_initialized_) {
+        dz = new_dz;
+        dz_initialized_ = true;
+      } else {
+        dz = dz_adapt_alpha_ * new_dz + (1.0 - dz_adapt_alpha_) * dz;
+      }
       target_state(4) = current_armor.pose.position.z;
       target_state(5) = 0.0;  // v_za corrupted by za snap — zero it
-      std::swap(target_state(8), another_r);
+      // Swap radius KFs — each KF retains its own covariance, so the
+      // swapped-in KF's gain automatically reflects how stale it is.
+      std::swap(r_active_kf_, r_other_kf_);
+      target_state(8) = r_active_kf_.x;
+      another_r = r_other_kf_.x;
       another_r = std::max(0.12, std::min(another_r, 0.4));
     }
   }
@@ -442,34 +657,84 @@ void Tracker::handleArmorJump(const Armor & current_armor)
   // stale x_pri/P_pri from the earlier predict() call.
   ekf.syncPrior();
 
+  // Decouple radius before the EKF update so the Kalman gain for r ≈ 0
+  // and the update doesn't introduce spurious cross-covariance.
+  ekf.decoupleState(8, r_active_kf_.P);
+
   // Feed the measurement through the EKF update step so the center position
   // (xc, yc) is properly corrected via the Kalman gain. Without this, the
   // jump only snaps yaw/radius/za but leaves xc, yc at the raw predict()
   // values — the actual armor observation is never fused.
   measurement = Eigen::Vector4d(p.x, p.y, p.z, yaw);
   target_state = ekf.update(measurement);
+  // Yaw-projected radius measurement for the newly visible pair.
+  // The scalar KF's gain is automatically high after the swap (P grew
+  // while this pair wasn't observed), giving fast initial correction.
+  {
+    double yaw_post = target_state(6);
+    double dx = target_state(0) - p.x;  // xc - xa
+    double dy = target_state(2) - p.y;  // yc - ya
+    double r_measured = dx * std::cos(yaw_post) + dy * std::sin(yaw_post);
+    if (r_measured > 0.10 && r_measured < 0.45) {
+      r_active_kf_.update(r_measured);
+    }
+    target_state(8) = r_active_kf_.x;
+    ekf.setState(target_state);
+    ekf.decoupleState(8, r_active_kf_.P);
+  }
 }
 
+// ---------------------------------------------------------------------------
+// orientationToYaw — convert quaternion to a *continuous* yaw angle.
+//
+// PnP returns yaw in [-π, π], which wraps discontinuously (e.g. π → -π).
+// The EKF's v_yaw estimation relies on smooth yaw differences between frames.
+// If yaw jumps from +3.1 to -3.1, the filter computes Δyaw ≈ -6.2 instead
+// of the true +0.08 — corrupting v_yaw for many frames.
+//
+// Solution: unwrap each new yaw measurement relative to the previous one.
+//   raw_yaw ∈ [-π, π]       (from RPY decomposition)
+//   delta = shortest_angular_distance(last_yaw_, raw_yaw)   ∈ [-π, π]
+//   unwrapped = last_yaw_ + delta    → continuous, can grow beyond ±π
+//
+// The absolute value of unwrapped yaw can drift (e.g. -37 rad after minutes
+// of spinning).  This is normalised back to [-π, π] periodically in update()
+// to avoid floating-point precision issues.
+// ---------------------------------------------------------------------------
 double Tracker::orientationToYaw(const geometry_msgs::msg::Quaternion & q)
 {
-  // Get armor yaw
   tf2::Quaternion tf_q;
   tf2::fromMsg(q, tf_q);
   double roll, pitch, yaw;
   tf2::Matrix3x3(tf_q).getRPY(roll, pitch, yaw);
-  // Make yaw change continuous (-pi~pi to -inf~inf)
+  // Unwrap: add the shortest angular delta to last_yaw_ for continuity
   yaw = last_yaw_ + angles::shortest_angular_distance(last_yaw_, yaw);
   last_yaw_ = yaw;
   return yaw;
 }
 
+// ---------------------------------------------------------------------------
+// getArmorPositionFromState — convert center-based EKF state to armor position.
+//
+// The EKF tracks the robot *center*, but measurements come from the *armor plate*.
+// The plate is offset from center by radius r in the direction of yaw:
+//
+//   center = (xc, yc)
+//   armor  = center − r · [cos(yaw), sin(yaw)]
+//
+// The minus sign is a convention: yaw points along the face outward normal,
+// so the armor is behind the center when viewed from the front.
+//
+//     Camera ─────────→  [Armor plate]  ←─r─→  (Robot center)
+//                         xa, ya                 xc, yc
+//                         ← face normal (yaw) ───┘
+// ---------------------------------------------------------------------------
 Eigen::Vector3d Tracker::getArmorPositionFromState(const Eigen::VectorXd & x)
 {
-  // Calculate predicted position of the current armor
   double xc = x(0), yc = x(2), za = x(4);
   double yaw = x(6), r = x(8);
-  double xa = xc - r * cos(yaw);
-  double ya = yc - r * sin(yaw);
+  double xa = xc - r * cos(yaw);  // Armor X = center X − r·cos(yaw)
+  double ya = yc - r * sin(yaw);  // Armor Y = center Y − r·sin(yaw)
   return Eigen::Vector3d(xa, ya, za);
 }
 

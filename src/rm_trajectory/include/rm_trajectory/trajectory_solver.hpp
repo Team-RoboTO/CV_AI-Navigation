@@ -4,12 +4,42 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <tuple>
 #include <visualization_msgs/msg/marker.hpp>
 
 #include "auto_aim_interfaces/msg/gimbal_cmd.hpp"
 #include "auto_aim_interfaces/msg/target.hpp"
 
 namespace rm_auto_aim {
+
+// ---------------------------------------------------------------------------
+// TrajectorySolverNode — ballistic trajectory solver and fire-gate controller.
+//
+// Subscribes to /tracker/target (EKF output: robot center position, velocity,
+// yaw, yaw-rate, radii, dz) and publishes gimbal pitch/yaw commands + fire
+// trigger on /tracker/cmd_gimbal and /cmd_vel.
+//
+// Two aiming modes:
+//
+//   DIRECT (default, |v_yaw| < threshold):
+//     Predicts which armor face will be closest + most face-on at bullet
+//     impact time, solves the ballistic trajectory (iterative, with air drag),
+//     and fires when the angular gap between barrel bearing and face normal
+//     is within a configurable window.
+//
+//   INDIRECT (|v_yaw| > indirect_vyaw_threshold_):
+//     For fast spinners.  Enumerates upcoming alignment windows (moments when
+//     any face will be squarely facing the camera), solves trajectory to each
+//     candidate impact point, and fires when timing residual < tolerance.
+//
+// Ballistic model (linear air drag):
+//   Horizontal: x(t) = v·cos(θ) · (1 − e^(−kt)) / k
+//   Vertical:   z(t) = v·sin(θ)·t − ½·g·t²
+//   Solver iterates pitch ↔ flight-time until convergence (~3–5 passes).
+//
+// Pipeline latency is compensated via an adaptive EMA with outlier rejection.
+// Acceleration is estimated from consecutive EKF velocity outputs.
+// ---------------------------------------------------------------------------
 class TrajectorySolverNode : public rclcpp::Node {
 public:
   explicit TrajectorySolverNode(const rclcpp::NodeOptions &options);
@@ -18,9 +48,11 @@ private:
   void targetCallback(auto_aim_interfaces::msg::Target::UniquePtr msg);
 
   // Solves for the pitch angle given position and velocity
-  // Returns pair<pitch, flight_time>
-  std::pair<double, double> solveTrajectory(const double dist, const double z,
-                                            const double v);
+  // Returns tuple<pitch, flight_time, reachable>
+  // reachable is false when the unclamped pitch exceeds gimbal limits
+  std::tuple<double, double, bool> solveTrajectory(const double dist,
+                                                   const double z,
+                                                   const double v);
 
   rclcpp::Subscription<auto_aim_interfaces::msg::Target>::SharedPtr target_sub_;
   rclcpp::Publisher<auto_aim_interfaces::msg::GimbalCmd>::SharedPtr cmd_pub_;
@@ -38,23 +70,34 @@ private:
   double min_fire_dist_;   // Minimum engagement range (metres)
   double max_fire_dist_;   // Maximum engagement range (metres)
   double angular_window_;             // Half-width of armor face window (rad)
+  double max_measurement_age_;        // Maximum allowed measurement staleness (seconds)
 
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr twist_pub_;
 
-  // Acceleration estimation from consecutive target messages
-  bool has_prev_target_ = false;
-  rclcpp::Time prev_target_time_;
-  double prev_vx_ = 0.0, prev_vy_ = 0.0, prev_vz_ = 0.0;
-  double ax_ema_ = 0.0, ay_ema_ = 0.0, az_ema_ = 0.0;
-  double accel_ema_alpha_;
-  double max_accel_;
+  // --- Acceleration estimation (2nd-order motion model) ---
+  // The EKF only provides position + velocity.  We differentiate consecutive
+  // velocity readings and smooth with a time-adjusted EMA to get acceleration,
+  // which improves target prediction for accelerating/decelerating robots.
+  bool has_prev_target_ = false;          // First frame flag
+  rclcpp::Time prev_target_time_;         // Timestamp of previous target message
+  double prev_vx_ = 0.0, prev_vy_ = 0.0, prev_vz_ = 0.0;  // Previous velocities
+  double ax_ema_ = 0.0, ay_ema_ = 0.0, az_ema_ = 0.0;      // EMA-smoothed acceleration
+  double accel_ema_alpha_;                // EMA weight (higher = more responsive, noisier)
+  double max_accel_;                      // Clamp on raw accel (rejects EKF jumps)
 
-  // Latency outlier rejection
-  double time_bias_var_ = 0.01;
-  double latency_gate_sigma_;
+  // --- Latency EMA with outlier rejection ---
+  // Tracks pipeline delay (camera → YOLO → EKF → here) as an EMA of
+  // measured_latency = now() − msg->header.stamp.  Outlier gate prevents
+  // GPU throttle spikes from corrupting the estimate.
+  double time_bias_var_ = 0.0009;  // Running variance of latency (σ² ≈ 30ms²)
+  double latency_gate_sigma_;      // Reject samples > N·σ from mean
+  int latency_warmup_count_ = 0;   // Accept first N samples unconditionally
+  static constexpr int kLatencyWarmupSamples = 5;
 
   // Oblique face scoring exponent (higher = more penalty for oblique faces)
   double oblique_exponent_;
+  double gimbal_pitch_max_;  // Physical gimbal pitch upper limit (rad)
+  double gimbal_pitch_min_;  // Physical gimbal pitch lower limit (rad)
 
   // Indirect aiming for fast spinners
   double indirect_vyaw_threshold_;
@@ -68,6 +111,8 @@ private:
   double current_yaw_ = 0.0;
   double yaw_sign_ = 1.0;
   double pitch_sign_ = 1.0;
+  rclcpp::Time last_micro_pose_time_{0, 0, RCL_ROS_TIME};
+  double micro_pose_timeout_;          // Suppress fire when /micro_pose is stale (seconds)
 
   double nextAlignmentTime(double yaw, double v_yaw, double face_idx,
                            double face_spacing, double bearing) const;

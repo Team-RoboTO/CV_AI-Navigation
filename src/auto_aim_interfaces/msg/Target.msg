@@ -19,3 +19,4 @@ float64 v_yaw
 float64 radius_1
 float64 radius_2
 float64 dz
+builtin_interfaces/Time last_measurement_stamp

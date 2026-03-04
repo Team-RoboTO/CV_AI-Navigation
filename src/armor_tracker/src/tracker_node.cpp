@@ -47,7 +47,17 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   double max_track_range = this->declare_parameter("tracker.max_track_range", 6.0);
   tracker_ = std::make_unique<Tracker>(max_match_distance, max_track_range);
   tracker_->tracking_thres = this->declare_parameter("tracker.tracking_thres", 5);
+  // max_yaw_oblique_angle_ is set later after max_yaw_oblique_deg_ is declared (in EKF section)
   lost_time_thres_ = this->declare_parameter("tracker.lost_time_thres", 0.3);
+  // Geometry adaptation — r1 ≠ r2 (elliptical armor arrangement)
+  // Scalar KFs for radius: adaptive gain (fast initial convergence, low steady-state noise)
+  tracker_->initial_r1_         = this->declare_parameter("tracker.initial_r1", 0.22);
+  tracker_->initial_r2_         = this->declare_parameter("tracker.initial_r2", 0.30);
+  tracker_->r_kf_Q_             = this->declare_parameter("tracker.r_kf_Q", 3.3e-8);
+  tracker_->r_kf_R_             = this->declare_parameter("tracker.r_kf_R", 0.0004);
+  tracker_->r_kf_P_init_        = this->declare_parameter("tracker.r_kf_P_init", 0.0064);
+  tracker_->r_adapt_max_dist_   = this->declare_parameter("tracker.r_adapt_max_dist", 4.0);
+  tracker_->dz_adapt_alpha_     = this->declare_parameter("tracker.dz_adapt_alpha", 0.2);
 
   // EKF
   // xa = x_armor, xc = x_robot_center
@@ -63,11 +73,24 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   yaw_innov_threshold_    = declare_parameter("ekf.yaw_innov_threshold", 0.15);
   xyz_damping_alpha_ = xyz_damping_alpha_base_;
   yaw_damping_alpha_ = yaw_damping_alpha_base_;
-  // --- f: EKF Process Function ---
-  // Predicts the next state from the current state using a damped constant-velocity model.
-  // Each axis follows: pos += v*dt,  v_new = v * alpha^(dt/T_ref)
-  // where T_ref=1/30s normalizes the decay so alpha is "per-frame at 30Hz" regardless of dt.
-  // r (radius) is constant — it only changes on armor-jump events handled in Tracker::update().
+  // --- f: EKF Process Function (what the robot does between frames) ---
+  //
+  // WHY DAMPED CONSTANT-VELOCITY?
+  //   We don't model acceleration as a state (that would add 3+ dimensions and
+  //   require much more data to converge).  Instead we assume the robot moves
+  //   at roughly constant velocity, with a per-frame velocity decay that acts
+  //   like friction.  This is good enough for ~30ms prediction horizons.
+  //
+  //   The damping (alpha < 1) serves two purposes:
+  //   1. Physical: real robots decelerate when motors stop.  Pure constant-
+  //      velocity would overshoot forever.
+  //   2. Practical: it makes the EKF self-correcting.  If v_yaw gets corrupted
+  //      by a bad measurement, damping naturally shrinks it toward zero over
+  //      a few frames, instead of letting the error persist indefinitely.
+  //
+  //   Alpha is normalised to a 30Hz reference so the same parameter value
+  //   gives the same physical behaviour regardless of actual frame rate.
+  //   alpha=0.95 at 30Hz → half-life of ~0.45 seconds.
   auto f = [this](const Eigen::VectorXd & x) {
     Eigen::VectorXd x_new = x;
     // Per-step decay factors, scaled to the actual dt so alpha is frame-rate independent.
@@ -112,17 +135,44 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
     // clang-format on
     return f;
   };
-  // h - Observation function
+  // --- h: Observation Function ---
+  // Maps the 9D state to the 4D measurement that we actually observe:
+  //   z = [xa, ya, za, yaw]
+  //
+  // The armor plate is offset from the robot center by radius r:
+  //   xa = xc − r·cos(yaw)    (armor X position)
+  //   ya = yc − r·sin(yaw)    (armor Y position)
+  //   za = za                  (armor Z = tracked directly)
+  //   yaw = yaw                (observed = internal yaw)
+  //
+  // This is the "spinning top" observation: the camera sees a plate on the
+  // rim of a spinning disk, and we infer the disk center from it.
   auto h = [](const Eigen::VectorXd & x) {
     Eigen::VectorXd z(4);
     double xc = x(0), yc = x(2), yaw = x(6), r = x(8);
-    z(0) = xc - r * cos(yaw);  // xa
-    z(1) = yc - r * sin(yaw);  // ya
-    z(2) = x(4);               // za
-    z(3) = x(6);               // yaw
+    z(0) = xc - r * cos(yaw);  // xa: armor plate X
+    z(1) = yc - r * sin(yaw);  // ya: armor plate Y
+    z(2) = x(4);               // za: armor plate Z (= state directly)
+    z(3) = x(6);               // yaw: robot heading (= state directly)
     return z;
   };
-  // J_h - Jacobian of observation function
+  // --- J_h: Jacobian of the Observation Function ---
+  // H = ∂h/∂x, a 4×9 matrix.  Most entries are 0 because each measurement
+  // depends on only a few state variables.  Non-trivial partial derivatives:
+  //
+  //   ∂xa/∂xc  = 1               (armor X depends linearly on center X)
+  //   ∂xa/∂yaw = r·sin(yaw)      (rotating the disk moves the plate tangentially)
+  //   ∂xa/∂r   = −cos(yaw)       (larger radius pushes plate further from center)
+  //
+  //   ∂ya/∂yc  = 1               (same logic for Y axis)
+  //   ∂ya/∂yaw = −r·cos(yaw)     (tangential coupling in Y)
+  //   ∂ya/∂r   = −sin(yaw)       (radial coupling in Y)
+  //
+  //   ∂za/∂za  = 1               (direct pass-through)
+  //   ∂yaw/∂yaw = 1              (direct pass-through)
+  //
+  // All velocity columns (v_xc, v_yc, v_za, v_yaw) are 0: velocities don't
+  // appear in h() — they affect the *next* prediction, not the current measurement.
   auto j_h = [](const Eigen::VectorXd & x) {
     Eigen::MatrixXd h(4, 9);
     double yaw = x(6), r = x(8);
@@ -135,15 +185,33 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
     // clang-format on
     return h;
   };
-  // update_Q - process noise covariance matrix
+  // --- update_Q: Process Noise Covariance Matrix ---
+  // Q models how much the state can change due to unmodeled dynamics (random
+  // accelerations, vibrations, etc.) between consecutive frames.
+  //
+  // Derivation: assume piece-wise constant acceleration noise a ~ N(0, σ²).
+  // Integrating over timestep dt gives the standard discrete-time noise model:
+  //   Q_pos_pos   = σ² · dt⁴/4    (position uncertainty from acceleration)
+  //   Q_pos_vel   = σ² · dt³/2    (cross-correlation between pos and vel)
+  //   Q_vel_vel   = σ² · dt²      (velocity uncertainty from acceleration)
+  //
+  // Each [pos, vel] pair (xc/v_xc, yc/v_yc, za/v_za) uses σ²_xyz.
+  // The [yaw, v_yaw] pair uses σ²_yaw (different because rotational dynamics
+  // are noisier than translational — spinning motors, backlash, etc.).
+  //
+  // σ²_r is near-zero because radius is managed by external scalar KFs;
+  // decoupleState() overwrites P_rr every frame anyway.
   s2qxyz_ = declare_parameter("ekf.sigma2_q_xyz", 5.0);
   s2qyaw_ = declare_parameter("ekf.sigma2_q_yaw", 10.0);
-  s2qr_   = declare_parameter("ekf.sigma2_q_r",   2.0);
+  s2qr_   = declare_parameter("ekf.sigma2_q_r",   1e-6);
   auto u_q = [this]() {
     Eigen::MatrixXd q(9, 9);
     double t = dt_, x = s2qxyz_, y = s2qyaw_, r = s2qr_;
+    // XYZ block: σ²_xyz integrated over dt (pos-vel cross-correlation)
     double q_x_x = pow(t, 4) / 4 * x, q_x_vx = pow(t, 3) / 2 * x, q_vx_vx = pow(t, 2) * x;
+    // Yaw block: same structure but with σ²_yaw (typically larger than σ²_xyz)
     double q_y_y = pow(t, 4) / 4 * y, q_y_vy = pow(t, 3) / 2 * y, q_vy_vy = pow(t, 2) * y;
+    // Radius block: near-zero (externally managed)
     double q_r = pow(t, 4) / 4 * r;
     // clang-format off
     //    xc      v_xc    yc      v_yc    za      v_za    yaw     v_yaw   r
@@ -159,40 +227,83 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
     // clang-format on
     return q;
   };
-  // update_R - distance-dependent measurement noise covariance matrix
+  // --- update_R: Measurement Noise Covariance Matrix ---
+  // R models how noisy the PnP measurement is.  It depends on two factors:
+  //
+  // 1. DISTANCE: further targets have larger pixel-space error because the
+  //    armor plate subtends fewer pixels → PnP becomes less accurate.
+  //    R_pos = (base + slope × distance)²   (linear in distance, squared for variance)
+  //    R_yaw = (base + slope × distance)²
+  //
+  // 2. OBLIQUE VIEWING ANGLE: when the camera views the armor plate at a
+  //    steep angle, the plate appears as a thin line and PnP yaw is poorly
+  //    constrained.  We inflate noise based on face_angle (0=face-on, π/2=edge):
+  //    XYZ noise × 1/cos²(angle)    — geometric depth uncertainty
+  //    Yaw noise × 1/cosⁿ(angle)    — PnP orientation degrades much faster
+  //
+  // At extreme obliquity (>65°), yaw_angle_factor → 1e6, which makes the
+  // Kalman gain for yaw ≈ 0 → the filter effectively ignores the yaw
+  // measurement while still fusing the XYZ position.
   r_xyz_base_  = declare_parameter("ekf.r_xyz_base",  0.04);
   r_xyz_slope_ = declare_parameter("ekf.r_xyz_slope", 0.03);
   r_yaw_base_  = declare_parameter("ekf.r_yaw_base",  0.05);
   r_yaw_slope_ = declare_parameter("ekf.r_yaw_slope", 0.002);
+  r_yaw_angle_power_    = declare_parameter("ekf.r_yaw_angle_power",    4.0);
+  max_yaw_oblique_deg_  = declare_parameter("ekf.max_yaw_oblique_deg",  65.0);
   auto u_r = [this](const Eigen::VectorXd & z) {
     Eigen::DiagonalMatrix<double, 4> r;
     double dist = std::sqrt(z[0]*z[0] + z[1]*z[1] + z[2]*z[2]);
     double ps = r_xyz_base_ + r_xyz_slope_ * dist;
     double ys = r_yaw_base_ + r_yaw_slope_ * dist;
 
-    // Angle-aware noise: PnP accuracy degrades as ~1/cos²(oblique_angle)
-    // because projected width shrinks as cos(angle), amplifying pixel errors.
-    // z = [xa, ya, za, yaw]. Bearing from armor→camera is opposite of camera→armor.
-    double bearing_opp = std::atan2(-z[1], -z[0]);
-    double face_angle = std::abs(std::remainder(z[3] - bearing_opp, 2.0 * M_PI));
-    double cos_fa = std::cos(face_angle);
-    // Clamp at cos²=0.04 (≈78°) to cap inflation at 25x
-    double angle_factor = 1.0 / std::max(cos_fa * cos_fa, 0.04);
+    // Angle-aware noise: PnP accuracy degrades with oblique viewing angle.
+    // XYZ degrades as ~1/cos²(angle); yaw degrades much faster (~1/cos⁴)
+    // because at high obliquity the plate is a thin line and PnP yaw is
+    // nearly unresolvable.
+    double xyz_angle_factor;
+    double yaw_angle_factor;
+    if (z[0] * z[0] + z[1] * z[1] < 1e-12) {
+      xyz_angle_factor = 1.0;
+      yaw_angle_factor = 1.0;
+    } else {
+      double bearing_opp = std::atan2(-z[1], -z[0]);
+      double face_angle = std::abs(std::remainder(z[3] - bearing_opp, 2.0 * M_PI));
+      double cos_fa = std::cos(face_angle);
 
-    r.diagonal() << ps*ps*angle_factor, ps*ps*angle_factor,
-                     ps*ps*angle_factor, ys*ys*angle_factor;
+      // XYZ: 1/cos²(angle), capped at 25x (same as before)
+      xyz_angle_factor = 1.0 / std::max(cos_fa * cos_fa, 0.04);
+
+      // Yaw: 1/cos^p(angle) with configurable power, much steeper degradation
+      double cos_pow = std::pow(std::abs(cos_fa), r_yaw_angle_power_);
+      yaw_angle_factor = 1.0 / std::max(cos_pow, 1e-4);
+
+      // Hard gate: beyond max oblique angle, yaw measurement is garbage —
+      // set noise so high that Kalman gain for yaw → 0
+      double max_oblique_rad = max_yaw_oblique_deg_ * M_PI / 180.0;
+      if (face_angle > max_oblique_rad) {
+        yaw_angle_factor = 1e6;
+      }
+    }
+
+    r.diagonal() << ps*ps*xyz_angle_factor, ps*ps*xyz_angle_factor,
+                     ps*ps*xyz_angle_factor, ys*ys*yaw_angle_factor;
     return r;
   };
   // P - initial error covariance
   Eigen::DiagonalMatrix<double, 9> p0;
   //       xc    v_xc  yc    v_yc  za    v_za  yaw   v_yaw  r
-  p0.diagonal() << 0.1, 1.0, 0.1, 1.0, 0.1, 0.2, 0.1, 3.0, 0.015;
+  // P_rr small: scalar KFs own radius estimation; decoupleState() overwrites each frame.
+  p0.diagonal() << 0.1, 1.0, 0.1, 1.0, 0.1, 0.2, 0.1, 3.0, 0.001;
   tracker_->ekf = ExtendedKalmanFilter{f, h, j_f, j_h, u_q, u_r, p0};
+
+  // Sync oblique angle threshold to tracker for yaw gate bypass
+  tracker_->setMaxYawObliqueAngle(max_yaw_oblique_deg_ * M_PI / 180.0);
 
   // Covariance upper bounds — safety net against P explosion during TEMP_LOST
   Eigen::VectorXd max_cov(9);
   //          xc    v_xc   yc    v_yc   za    v_za   yaw    v_yaw   r
-  max_cov << 1.0,  10.0,  1.0,  10.0,  1.0,  2.0,   1.0,   30.0,  0.03;
+  // r max_cov >= r_kf_P_init (0.0064) so the clamp doesn't fight the scalar KF.
+  max_cov << 1.0,  10.0,  1.0,  10.0,  1.0,  2.0,   1.0,   30.0,  0.01;
   tracker_->ekf.max_covariance = max_cov;
 
   // Reset tracker service
@@ -391,12 +502,29 @@ void ArmorTrackerNode::imuCallback(const sensor_msgs::msg::Imu::ConstSharedPtr m
   prev_gimbal_pitch_ = gimbal_pitch_;
 }
 
+// ---------------------------------------------------------------------------
+// broadcastGimbalTF — publish the transform from "odom" to "camera_color_optical_frame".
+//
+// This transform tells TF2 where the camera is in world coordinates so that
+// armor positions measured in camera frame can be converted to odom frame.
+//
+// Decomposition (right-to-left multiplication order):
+//
+//   T(odom → camera) = Translate(0, 0, gimbal_height)   ← vertical offset
+//     × R_z(chassis_yaw) × R_y(chassis_pitch)           ← chassis ego-motion (from IMU)
+//     × R_z(gimbal_yaw) × R_y(gimbal_pitch)             ← gimbal joints (from lower computer)
+//     × R_convention                                     ← optical frame convention
+//
+// R_convention = RPY(−π/2, 0, −π/2) converts from the ROS camera_color_optical_frame
+// convention (X-right, Y-down, Z-forward) to the robotics convention (X-forward,
+// Y-left, Z-up).  When both gimbal angles are 0, this matches the old static TF.
+//
+// The transform is written directly into tf2_buffer_ (via setTransform) so
+// that lookupTransform() later in the same callback sees it immediately,
+// even before the /tf topic message is received by other subscribers.
+// ---------------------------------------------------------------------------
 void ArmorTrackerNode::broadcastGimbalTF(const rclcpp::Time & stamp)
 {
-  // T(odom → camera) = Translate(0,0,height)
-  //   × R_z(chassis_yaw) × R_y(chassis_pitch)   ← NEW: ego-motion from IMU
-  //   × R_z(gimbal_yaw) × R_y(gimbal_pitch)
-  //   × R_convention
 
   // Chassis rotation from IMU (identity if IMU inactive/stale)
   tf2::Quaternion q_chassis_yaw, q_chassis_pitch;
@@ -442,6 +570,21 @@ void ArmorTrackerNode::broadcastGimbalTF(const rclcpp::Time & stamp)
   tf2_broadcaster_->sendTransform(t);
 }
 
+// ---------------------------------------------------------------------------
+// armorsCallback — main pipeline entry point, called once per YOLO detection frame.
+//
+// Processing steps:
+//   1. Broadcast gimbal TF (odom → camera) so TF2 can transform this frame.
+//   2. For each YOLO bounding box:
+//      a. Subtract letterbox padding (YOLO pads images to square).
+//      b. Filter by YOLO class ID (only track configured enemy color).
+//      c. Scale bbox inward by light_ratio_ to approximate light-bar corners.
+//      d. Run PnP solver → 3D position + orientation in camera frame.
+//   3. Transform all armor poses from camera frame → odom frame via TF2.
+//   4. Filter out armors with physically impossible Z or beyond max range.
+//   5. Feed the Armors message into the Tracker (init or update).
+//   6. Publish Target msg, TrackerInfo debug msg, optimal bbox, and RViz markers.
+// ---------------------------------------------------------------------------
 void ArmorTrackerNode::armorsCallback(
   const vision_msgs::msg::Detection2DArray::ConstSharedPtr detection_msg)
 {
@@ -489,8 +632,12 @@ void ArmorTrackerNode::armorsCallback(
       }
     }
 
-    // Create a fake Armor object for PnP
-    // We assume the bbox covers the armor lights
+    // Build an Armor object from the YOLO bbox for PnP solving.
+    // WHY PnP FROM BBOXES?  YOLO gives us 2D bounding boxes, but the EKF
+    // needs 3D positions.  PnP (Perspective-n-Point) recovers the 3D pose
+    // from 2D-3D point correspondences.  We approximate the 4 light-bar
+    // corners from the bbox, then PnP finds the rotation + translation
+    // that best maps the known real-world armor dimensions to those 2D points.
     Armor armor_obj;
     armor_obj.center = cv::Point2f(center_x, center_y);
 
@@ -552,8 +699,12 @@ void ArmorTrackerNode::armorsCallback(
   // Pointer to the converted message
   auto armors_ptr = std::make_shared<auto_aim_interfaces::msg::Armors>(armors_msg);
 
-  // Transform armor positions from image frame to world coordinate
-  // Look up the transform once and apply it to all armors (avoids N redundant buffer lookups)
+  // Transform armor positions from camera frame to odom (world) frame.
+  // WHY: PnP gives positions relative to the camera.  But the EKF tracks the
+  // robot in world coordinates (odom frame), so we need to know where the camera
+  // is in the world.  The gimbal TF (broadcast above) provides this transform.
+  // Without it, every time the gimbal moves, the target would appear to jump
+  // in camera frame even though it's stationary in the world.
   if (!armors_ptr->armors.empty()) {
     geometry_msgs::msg::TransformStamped tf_stamped;
     try {
@@ -573,7 +724,12 @@ void ArmorTrackerNode::armorsCallback(
     }
   }
 
-  // Filter abnormal armors (keep detection_indices in sync)
+  // Filter physically impossible detections.
+  // WHY: PnP can produce wildly wrong 3D positions from noisy bboxes, especially
+  // at frame edges or with partial occlusions.  An armor at Z=2.0m (2 meters
+  // above the camera) or 15m away horizontally is obviously wrong — no robot
+  // is that tall or that far.  Filtering here prevents these garbage measurements
+  // from ever reaching the tracker, where they could corrupt the EKF state.
   auto & armors_vec = armors_ptr->armors;
 
   // Log yaw for all detections (debug)
@@ -613,14 +769,37 @@ void ArmorTrackerNode::armorsCallback(
     tracker_->init(armors_ptr);
     target_msg.tracking = false;
   } else {
+    // Compute timestep dt, clamped to [10ms, 100ms].
+    // Lower bound prevents division-by-zero in velocity estimates.
+    // Upper bound prevents the EKF from making a huge state jump after a
+    // long gap (e.g. YOLO stall), which would corrupt position and velocity.
     dt_ = std::min(std::max((time - last_time_).seconds(), 0.01), 0.10);
+    // Convert lost_time_thres_ (seconds) to a frame count based on current dt.
+    // E.g. 0.3s at 30fps ≈ 9 frames of coasting before LOST.
     tracker_->lost_thres = static_cast<int>(lost_time_thres_ / dt_);
 
-    // --- Adaptive Velocity Damping ---
-    // The EKF process model applies per-step velocity decay: v_new = alpha^(dt/T) * v_old.
-    // alpha=1.0 means no decay (track freely); alpha<1.0 attenuates velocity each step.
-    // We choose alpha dynamically each frame based on tracker state and innovation signal
-    // to balance responsiveness (track real motion) vs. stability (damp filter runaway).
+    // === ADAPTIVE VELOCITY DAMPING ===
+    // WHY THIS EXISTS:
+    //   A pure constant-velocity EKF has a fundamental problem: when the target
+    //   stops moving, the filter's velocity estimate doesn't go to zero — it
+    //   slowly decays over many frames because there's no direct "acceleration"
+    //   state.  Meanwhile, the filter keeps predicting the target will move,
+    //   creating persistent overshooting that makes the aim wobble.
+    //
+    //   Conversely, if we always apply strong damping, the filter can't track
+    //   fast-moving targets because it constantly brakes the velocity estimate.
+    //
+    // SOLUTION: Adapt the damping strength each frame based on the innovation
+    //   signal (the difference between what we predicted and what we measured).
+    //
+    //   - If the innovation OPPOSES the velocity (overshooting), increase damping
+    //     to brake the filter.
+    //   - If the innovation AGREES with the velocity (still catching up), disable
+    //     damping so the filter can accelerate freely.
+    //   - If the target is slow/stationary, apply base damping to prevent drift.
+    //   - In TEMP_LOST (no detection), apply stronger damping because the
+    //     prediction is all we have and we'd rather it decays toward zero than
+    //     runs away.
     if (tracker_->tracker_state == Tracker::TRACKING) {
 
       // --- Position damping (XYZ) ---
@@ -692,10 +871,14 @@ void ArmorTrackerNode::armorsCallback(
     // Publish info
     info_msg.position_diff    = tracker_->info_position_diff;
     info_msg.yaw_diff         = tracker_->info_yaw_diff;
-    info_msg.position.x       = tracker_->measurement(0);
-    info_msg.position.y       = tracker_->measurement(1);
-    info_msg.position.z       = tracker_->measurement(2);
-    info_msg.yaw              = tracker_->measurement(3);
+    info_msg.face_angle       = tracker_->info_face_angle;
+    if (tracker_->measurement_valid) {
+      info_msg.position.x     = tracker_->measurement(0);
+      info_msg.position.y     = tracker_->measurement(1);
+      info_msg.position.z     = tracker_->measurement(2);
+      info_msg.yaw            = tracker_->measurement(3);
+      last_measurement_time_  = time;
+    }
     info_msg.xyz_damping_alpha = xyz_damping_alpha_;
     info_msg.yaw_damping_alpha = yaw_damping_alpha_;
     info_pub_->publish(info_msg);
@@ -727,6 +910,7 @@ void ArmorTrackerNode::armorsCallback(
       target_msg.radius_2   = tracker_->another_r;
       target_msg.dz         = tracker_->dz;
       target_msg.v_yaw_variance = tracker_->ekf.getVariance(7);
+      target_msg.last_measurement_stamp = last_measurement_time_;
     }
   }
 

@@ -62,6 +62,8 @@ private:
   double s2qxyz_, s2qyaw_, s2qr_;
   double r_xyz_base_, r_xyz_slope_;   // R_pos(d) = (base + slope*d)²
   double r_yaw_base_, r_yaw_slope_;   // R_yaw(d) = (base + slope*d)²
+  double r_yaw_angle_power_;          // exponent for yaw angle factor (default 4.0)
+  double max_yaw_oblique_deg_;        // face angle beyond which yaw is effectively ignored
   double lost_time_thres_;
   std::unique_ptr<Tracker> tracker_;
 
@@ -127,6 +129,9 @@ private:
   bool enable_imu_compensation_ = true;
   double imu_gyro_alpha_ = 0.3;
   double imu_timeout_ = 0.1;
+
+  // Last time a valid measurement was fused into the EKF
+  rclcpp::Time last_measurement_time_{0, 0, RCL_ROS_TIME};
 
   // Visualization marker publisher
   visualization_msgs::msg::Marker position_marker_;

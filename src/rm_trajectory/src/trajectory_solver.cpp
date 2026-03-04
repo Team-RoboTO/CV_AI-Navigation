@@ -41,6 +41,7 @@ TrajectorySolverNode::TrajectorySolverNode(const rclcpp::NodeOptions &options)
   min_fire_dist_   = this->declare_parameter("min_fire_dist",    0.5);
   max_fire_dist_   = this->declare_parameter("max_fire_dist",   10.0);
   angular_window_              = this->declare_parameter("angular_window",               0.09);
+  max_measurement_age_         = this->declare_parameter("max_measurement_age",          0.10);
   accel_ema_alpha_ = this->declare_parameter("accel_ema_alpha", 0.3);
   max_accel_       = this->declare_parameter("max_accel",       6.0);
   latency_gate_sigma_ = this->declare_parameter("latency_gate_sigma", 2.5);
@@ -48,6 +49,8 @@ TrajectorySolverNode::TrajectorySolverNode(const rclcpp::NodeOptions &options)
   indirect_timing_tolerance_  = this->declare_parameter("indirect_timing_tolerance",  0.02);
   indirect_max_candidates_    = this->declare_parameter("indirect_max_candidates",    8);
   oblique_exponent_           = this->declare_parameter("oblique_exponent",            2.0);
+  gimbal_pitch_max_ = this->declare_parameter("gimbal_pitch_max",  0.524);  // +30°
+  gimbal_pitch_min_ = this->declare_parameter("gimbal_pitch_min", -0.524);  // -30°
 
   // Match RELIABLE QoS used by armor_tracker's target publisher
   auto target_qos = rclcpp::SensorDataQoS()
@@ -74,7 +77,8 @@ TrajectorySolverNode::TrajectorySolverNode(const rclcpp::NodeOptions &options)
   // Subscribe to current gimbal pose to calculate relative commands
   yaw_sign_      = this->declare_parameter("gimbal_yaw_sign", 1.0);
   pitch_sign_    = this->declare_parameter("gimbal_pitch_sign", 1.0);
-  
+  micro_pose_timeout_ = this->declare_parameter("micro_pose_timeout", 0.15);
+
   micro_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
       "/micro_pose", rclcpp::SensorDataQoS(),
       [this](const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg) {
@@ -85,6 +89,7 @@ TrajectorySolverNode::TrajectorySolverNode(const rclcpp::NodeOptions &options)
           current_pitch_ = p;
           current_yaw_   = y;
         }
+        last_micro_pose_time_ = this->now();
       });
 }
 
@@ -107,12 +112,12 @@ TrajectorySolverNode::TrajectorySolverNode(const rclcpp::NodeOptions &options)
 // Returns {pitch [rad], flight_time [s]}.  Returns {0,0} on invalid input or
 // non-finite result.
 // ---------------------------------------------------------------------------
-std::pair<double, double> TrajectorySolverNode::solveTrajectory(
+std::tuple<double, double, bool> TrajectorySolverNode::solveTrajectory(
     const double ground_dist, const double target_z, const double v)
 {
   // Input validation — avoid division-by-zero and degenerate geometry
   if (ground_dist < 1e-3 || v < 1e-3) {
-    return {0.0, 0.0};
+    return {0.0, 0.0, false};
   }
 
   // Seed: assume bullet travels horizontally at full speed (no drag, no gravity)
@@ -126,9 +131,9 @@ std::pair<double, double> TrajectorySolverNode::solveTrajectory(
     double dz = 0.5 * gravity_ * t * t;
     pitch = std::atan2(target_z + dz, ground_dist);
 
-    // Clamp pitch to prevent division-by-zero in cos(pitch) (~80 degrees)
-    if (pitch > 1.4) pitch = 1.4;
-    else if (pitch < -1.4) pitch = -1.4;
+    // Clamp pitch to physical gimbal limits (avoids cos(pitch)→0 and unreachable angles)
+    if (pitch > gimbal_pitch_max_) pitch = gimbal_pitch_max_;
+    else if (pitch < gimbal_pitch_min_) pitch = gimbal_pitch_min_;
 
     // Step 2: actual path length is longer than ground_dist because of pitch
     double cos_pitch = std::cos(pitch);
@@ -156,10 +161,20 @@ std::pair<double, double> TrajectorySolverNode::solveTrajectory(
   // Final validity check — catches NaN/Inf from edge cases
   if (!std::isfinite(pitch) || !std::isfinite(t)) {
     RCLCPP_WARN(this->get_logger(), "Trajectory solver produced non-finite result");
-    return {0.0, 0.0};
+    return {0.0, 0.0, false};
   }
 
-  return {pitch, t};
+  // Check whether the unclamped pitch (what physics requires) is within gimbal
+  // limits.  The solver loop clamps pitch for numerical stability, so we
+  // recompute the true required angle here.  If it exceeds the limits the
+  // target is physically unreachable even though we still return a clamped
+  // pitch (so the gimbal tracks as closely as possible).
+  double dz_final = 0.5 * gravity_ * t * t;
+  double unclamped_pitch = std::atan2(target_z + dz_final, ground_dist);
+  bool reachable = (unclamped_pitch >= gimbal_pitch_min_) &&
+                   (unclamped_pitch <= gimbal_pitch_max_);
+
+  return {pitch, t, reachable};
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +199,7 @@ double TrajectorySolverNode::nextAlignmentTime(
     double yaw, double v_yaw, double face_idx,
     double face_spacing, double bearing) const
 {
+  if (std::abs(v_yaw) < 0.1) return 1e9;  // EKF divergence guard — avoid division by zero
   // Current angular position of this face
   double face_angle = yaw + face_idx * face_spacing;
   // How far the face must rotate to reach the bearing
@@ -253,9 +269,31 @@ void TrajectorySolverNode::targetCallback(
     return;
   }
 
-  // EKF is coasting (no vision update) — predictions are less reliable,
-  // so suppress firing to avoid shooting at a stale/wrong position.
+  // === FIRE SUPPRESSION CONDITIONS ===
+  // We compute several conditions that will PREVENT firing even if the aim
+  // looks good.  Each addresses a specific failure mode:
+  //
+  // temp_lost: The EKF has no detection this frame and is coasting on its
+  //   motion model.  The predicted position drifts further from reality each
+  //   frame.  Firing at a stale prediction wastes ammo and risks hitting
+  //   the wrong spot (or a teammate if the robot moved).
+  //
+  // measurement_stale: Even if the tracker says TRACKING, if the last actual
+  //   measurement was > 100ms ago (e.g. YOLO dropped frames but tracker hasn't
+  //   timed out yet), the position is unreliable.
+  //
+  // micro_pose_stale: We publish RELATIVE gimbal angles (target − current).
+  //   If the gimbal feedback (/micro_pose) is stale or never received, we
+  //   don't know the current gimbal position, so the relative angle is wrong.
+  //   Firing with wrong angles sends the bullet in the wrong direction.
   bool temp_lost = (msg->tracker_state == auto_aim_interfaces::msg::Target::TEMP_LOST);
+  double measurement_age =
+    (rclcpp::Time(msg->header.stamp) - rclcpp::Time(msg->last_measurement_stamp)).seconds();
+  bool measurement_stale = (measurement_age > max_measurement_age_);
+
+  double micro_pose_age = (this->now() - last_micro_pose_time_).seconds();
+  bool micro_pose_stale = (last_micro_pose_time_.nanoseconds() == 0) ||
+                          (micro_pose_age > micro_pose_timeout_);
 
   // -------------------------------------------------------------------------
   // Adaptive latency compensation (EMA with outlier rejection)
@@ -271,11 +309,21 @@ void TrajectorySolverNode::targetCallback(
   // deviations of the running mean to prevent those from corrupting time_bias_.
   // -------------------------------------------------------------------------
   double measured_latency = (this->now() - msg->header.stamp).seconds();
-  if (measured_latency > 0.0 && measured_latency < 0.5) {
+  if (measured_latency <= 0.0) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+      "Measured latency %.4fs is near-zero — skipping EMA update (clock sync issue?)",
+      measured_latency);
+  }
+  if (measured_latency >= 0.001 && measured_latency < 0.5) {
     double residual = measured_latency - time_bias_;
     double sigma = std::sqrt(std::max(time_bias_var_, 1e-8));
-    // Reject outlier spikes (GPU thermal throttle, USB stall)
-    if (std::abs(residual) < latency_gate_sigma_ * sigma) {
+    // Accept first N samples unconditionally to bootstrap the EMA,
+    // then apply outlier rejection (GPU thermal throttle, USB stall)
+    bool in_warmup = latency_warmup_count_ < kLatencyWarmupSamples;
+    if (in_warmup || std::abs(residual) < latency_gate_sigma_ * sigma) {
+      if (in_warmup) {
+        ++latency_warmup_count_;
+      }
       time_bias_ = time_bias_alpha_ * measured_latency
                    + (1.0 - time_bias_alpha_) * time_bias_;
       // Update variance only for accepted samples to prevent outlier spikes
@@ -326,8 +374,19 @@ void TrajectorySolverNode::targetCallback(
   prev_target_time_ = msg->header.stamp;
   prev_vx_ = vx; prev_vy_ = vy; prev_vz_ = vz;
 
-  // Evenly-spaced face angles around the robot (2π / number of armor plates)
+  // Validate armor geometry fields before any trajectory math
   int n_faces = std::max(msg->armors_num, 1);
+  if (msg->radius_1 <= 0.0 || (n_faces == 4 && msg->radius_2 <= 0.0)) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+      "Invalid armor radii (r1=%.3f r2=%.3f) — skipping frame", msg->radius_1, msg->radius_2);
+    auto_aim_interfaces::msg::GimbalCmd safe;
+    safe.header = msg->header;
+    safe.fire_cmd = false;
+    cmd_pub_->publish(safe);
+    return;
+  }
+
+  // Evenly-spaced face angles around the robot (2π / number of armor plates)
   double face_spacing = 2.0 * M_PI / n_faces;
 
   // -------------------------------------------------------------------------
@@ -351,12 +410,27 @@ void TrajectorySolverNode::targetCallback(
 
   if (indirect_mode_active_) {
     // -----------------------------------------------------------------------
-    // INDIRECT AIMING — for fast-spinning robots
+    // INDIRECT AIMING — for fast-spinning robots (|v_yaw| > ~3 rad/s)
     //
-    // Strategy: instead of chasing the currently-visible face, enumerate all
-    // upcoming moments when *any* face will be aligned with our barrel, solve
-    // the ballistic trajectory to that future position, and fire when the
-    // timing residual (|t_align − t_flight|) is within tolerance.
+    // WHY A SEPARATE MODE?
+    //   When a robot spins fast, each face is only visible for ~50ms before
+    //   the next face rotates in.  The bullet takes ~100-200ms to fly there.
+    //   So by the time the bullet arrives, the face we aimed at is gone and
+    //   a different face (or the gap between faces) is in its place.
+    //
+    //   Direct aiming fails because it aims at WHERE the face IS, not where
+    //   it WILL BE.  Even with flight-time compensation, the face rotates
+    //   too fast for the correction to keep up.
+    //
+    // STRATEGY:
+    //   Don't chase the current face.  Instead, ask: "when will ANY face next
+    //   be pointing at my barrel?"  For each face, compute its next alignment
+    //   window.  Solve the ballistic trajectory to that future position.  The
+    //   best candidate is the one where the bullet flight time most closely
+    //   matches the alignment time (smallest timing residual).
+    //
+    //   Fire only when the residual is small enough that the bullet arrives
+    //   within the angular window of the aligned face.
     // -----------------------------------------------------------------------
 
     // Coarse flight-time seed: distance to robot center / muzzle velocity
@@ -387,6 +461,7 @@ void TrajectorySolverNode::targetCallback(
       double yaw;       // required gimbal yaw [rad]
       double range;     // 3-D distance to predicted impact point [m]
       double tx, ty, tz; // predicted impact position in camera frame [m]
+      bool reachable;   // true if unclamped pitch is within gimbal limits
     };
     std::vector<Candidate> candidates;
     candidates.reserve(indirect_max_candidates_);
@@ -426,8 +501,9 @@ void TrajectorySolverNode::targetCallback(
         double gdist = std::sqrt(ctx * ctx + cty * cty);
         double cyaw = std::atan2(cty, ctx);
         auto result = solveTrajectory(gdist, ctz - gimbal_height_, bullet_speed_);
-        double cpitch = result.first;
-        double ct_flight = result.second;
+        double cpitch = std::get<0>(result);
+        double ct_flight = std::get<1>(result);
+        bool creachable = std::get<2>(result);
         if (ct_flight < 1e-6) continue;  // Solver returned degenerate result
 
         double crange = std::sqrt(ctx * ctx + cty * cty + ctz * ctz);
@@ -435,7 +511,7 @@ void TrajectorySolverNode::targetCallback(
         // the moment the face is aligned? Smaller = better shot opportunity.
         double res = std::abs(t_a - (ct_flight + time_bias_));
 
-        candidates.push_back({i, t_a, res, cpitch, cyaw, crange, ctx, cty, ctz});
+        candidates.push_back({i, t_a, res, cpitch, cyaw, crange, ctx, cty, ctz, creachable});
       }
     }
 
@@ -461,11 +537,18 @@ void TrajectorySolverNode::targetCallback(
       return;
     }
 
-    // Select the candidate whose timing residual is smallest (best shot window)
-    auto best = &candidates[0];
+    // Select the candidate with the smallest timing residual, preferring
+    // reachable candidates.  Fall back to unreachable only for tracking aim
+    // (fire will be suppressed anyway if !reachable).
+    Candidate *best = &candidates[0];
+    Candidate *best_reachable = nullptr;
     for (auto &c : candidates) {
-      if (c.residual < best->residual) best = &c;
+      if (c.reachable && (!best_reachable || c.residual < best_reachable->residual))
+        best_reachable = &c;
+      if (c.residual < best->residual)
+        best = &c;
     }
+    if (best_reachable) best = best_reachable;
 
     // -----------------------------------------------------------------------
     // Newton-like refinement (2 passes)
@@ -518,8 +601,9 @@ void TrajectorySolverNode::targetCallback(
       double gdist = std::sqrt(best->tx * best->tx + best->ty * best->ty);
       best->yaw = std::atan2(best->ty, best->tx);
       auto result = solveTrajectory(gdist, best->tz - gimbal_height_, bullet_speed_);
-      best->pitch = result.first;
-      double t_fl = result.second;
+      best->pitch = std::get<0>(result);
+      double t_fl = std::get<1>(result);
+      best->reachable = std::get<2>(result);
       if (t_fl < 1e-6) break;
       best->range = std::sqrt(best->tx * best->tx + best->ty * best->ty + best->tz * best->tz);
       best->residual = std::abs(best->t_align - (t_fl + time_bias_));
@@ -539,10 +623,12 @@ void TrajectorySolverNode::targetCallback(
     // -----------------------------------------------------------------------
     bool dist_ok = (best->range >= min_fire_dist_) && (best->range <= max_fire_dist_);
     bool fire = false;
-    if (dist_ok && !temp_lost) {
+    if (dist_ok && !temp_lost && !measurement_stale && !micro_pose_stale && best->reachable) {
       double sigma_vyaw = std::sqrt(std::max(msg->v_yaw_variance, 1e-6));
       // Angular uncertainty at impact time → convert to time via spin rate
-      double timing_tol = (angular_window_ + sigma_vyaw * best->t_align) / abs_vyaw;
+      double timing_tol = (abs_vyaw > 0.1)
+          ? (angular_window_ + sigma_vyaw * best->t_align) / abs_vyaw
+          : indirect_timing_tolerance_;
       timing_tol = std::max(timing_tol, indirect_timing_tolerance_);
       fire = (best->residual < timing_tol);
     }
@@ -621,11 +707,15 @@ void TrajectorySolverNode::targetCallback(
   // Score = distance / cos²(oblique_angle)
   //   - A close, square-on face scores low (good).
   //   - A far, oblique face scores high (bad).
-  //   - cos(oblique) < 0.1 means the face is >84° away — skip entirely.
+  //   - cos(oblique) < 0.26 means the face is >75° away — not a good target.
   //
   // The cos² penalty ensures face-on armor is preferred even at close range,
   // where the radius offset makes the oblique face significantly closer.
   // With single cos, the distance advantage can dominate at ranges < 1m.
+  //
+  // If all faces are too oblique, all_faces_oblique is set true and the
+  // least-bad face is returned (for aiming), but the caller suppresses fire.
+  bool all_faces_oblique = false;
   auto findBestFace = [&](double predict_time) -> int {
     double pred_yaw = msg->yaw + msg->v_yaw * predict_time;
     double pred_cx = xc + vx * predict_time + 0.5 * ax * predict_time * predict_time;
@@ -633,11 +723,16 @@ void TrajectorySolverNode::targetCallback(
     double pred_cz = za + vz * predict_time + 0.5 * az * predict_time * predict_time;
 
     double best_score = 1e9;
-    int best_f = 0;
+    int best_f = -1;
+    // Fallback: track the least-bad face (lowest raw distance) when all are oblique
+    double fallback_dist = 1e9;
+    int fallback_f = 0;
     for (int i = 0; i < n_faces; i++) {
+      // Each face is at yaw + i × (2π/n) from the robot center
       double face_yaw = pred_yaw + i * face_spacing;
 
-      // Compute actual face position (same geometry as the aiming code below)
+      // Face position = center − r · [cos(face_yaw), sin(face_yaw)]
+      // For 4-armor robots: even faces (0,2) use r1/za, odd faces (1,3) use r2/za+dz
       bool is_current_pair = (i % 2 == 0);
       double r = (n_faces == 4 && !is_current_pair) ? msg->radius_2 : msg->radius_1;
       double dz_off = (n_faces == 4 && !is_current_pair) ? msg->dz : 0.0;
@@ -646,10 +741,19 @@ void TrajectorySolverNode::targetCallback(
       double fy = pred_cy - r * std::sin(face_yaw);
       double fz = pred_cz + dz_off;
 
-      // Distance from camera (origin) to this face
+      // Distance from camera (at origin in odom frame) to this face
       double dist = std::sqrt(fx * fx + fy * fy + fz * fz);
 
-      // Oblique angle: angle between face outward normal and face-to-camera direction
+      // Oblique angle: how much the face is turned away from the camera.
+      //
+      //   face_normal: the direction the armor plate faces (outward from center).
+      //                face_yaw points from center → plate, so outward = face_yaw + π.
+      //   face_to_cam: bearing from the plate back to the camera (at origin).
+      //                = atan2(-fy, -fx) because camera is at (0,0).
+      //   oblique = angle between these two directions.
+      //
+      //   oblique = 0°  → face is perfectly facing the camera (ideal shot)
+      //   oblique = 90° → face is edge-on to the camera (bullet hits edge, not plate)
       double face_normal = face_yaw + M_PI;  // outward from center
       double face_to_cam = std::atan2(-fy, -fx);
       double oblique = std::abs(angles::shortest_angular_distance(face_normal, face_to_cam));
@@ -661,26 +765,48 @@ void TrajectorySolverNode::targetCallback(
       RCLCPP_DEBUG(this->get_logger(),
           "  Face[%d] pos=(%.3f,%.3f,%.3f) dist=%.3f oblique=%.1f° cos=%.3f %s",
           i, fx, fy, fz, dist, oblique * 180.0 / M_PI, cos_obl,
-          (cos_obl < 0.26) ? "SKIP" : "");
+          (cos_obl < 0.26) ? "OBLIQUE" : "");
+
+      // Track closest face as fallback regardless of oblique threshold
+      if (dist < fallback_dist) { fallback_dist = dist; fallback_f = i; }
+
       if (cos_obl < 0.26) continue;  // face pointing away (>75°)
       double score = dist / std::pow(cos_obl, oblique_exponent_);
 
       RCLCPP_DEBUG(this->get_logger(), "    -> score=%.3f (best=%.3f)", score, best_score);
       if (score < best_score) { best_score = score; best_f = i; }
     }
+    if (best_f < 0) {
+      // All faces too oblique — return closest for aiming, flag for fire suppression
+      all_faces_oblique = true;
+      return fallback_f;
+    }
+    all_faces_oblique = false;
     return best_f;
   };
 
   // Pick the face that gives the best shot: close + face-on at predicted impact time
   int best_face = findBestFace(pt);
   double pitch = 0.0, t_flight = 0.0;
+  bool reachable = false;
   double tx = 0.0, ty = 0.0, tz = 0.0;
   double ground_dist = 0.0, yaw = 0.0;
 
-  // Two-pass loop:
-  //   pass 0: solve trajectory using t = pt (rough estimate)
-  //           → get real flight time → check if best face is still the same
-  //   pass 1: re-solve with corrected face and flight time (run only if face changed)
+  // === TWO-PASS TRAJECTORY REFINEMENT ===
+  // WHY TWO PASSES?  There's a chicken-and-egg problem:
+  //   - To pick the best face, we need to know the flight time (so we can predict
+  //     where each face will be when the bullet arrives).
+  //   - To compute the flight time, we need to know WHICH face we're aiming at
+  //     (because its 3D position determines the trajectory).
+  //
+  // Pass 0: Use a rough flight-time estimate (straight-line distance / speed)
+  //         to pick a face, then solve the real trajectory to that face.
+  // After pass 0: Check — with the real flight time, is the same face still the
+  //         best?  If yes, we're done (break).  If not, re-solve with the new face.
+  // Pass 1: Only runs if the face changed.  Re-solve trajectory to the new face.
+  //
+  // In practice, the face rarely changes between passes (maybe 5% of frames at
+  // close range where the radius offset matters more).
   for (int pass = 0; pass < 2; pass++) {
     // Use the refined flight time on pass 1
     double total_t = (pass == 0) ? pt : (t_flight + time_bias_);
@@ -706,8 +832,9 @@ void TrajectorySolverNode::targetCallback(
     yaw = std::atan2(ty, tx);
 
     auto result = solveTrajectory(ground_dist, tz - gimbal_height_, bullet_speed_);
-    pitch = result.first;
-    t_flight = result.second;
+    pitch = std::get<0>(result);
+    t_flight = std::get<1>(result);
+    reachable = std::get<2>(result);
 
     if (pass == 0) {
       // Recheck: with refined flight time, is a different face better?
@@ -754,17 +881,16 @@ void TrajectorySolverNode::targetCallback(
   // spacing to avoid accidently allowing shots at non-facing plates.
   // -----------------------------------------------------------------------
   bool in_range = false;
-  if (dist_ok && !temp_lost) {
+  if (dist_ok && !temp_lost && !measurement_stale && !micro_pose_stale && reachable &&
+      !all_faces_oblique) {
     // Predict robot yaw at the moment the bullet hits
     double final_yaw = msg->yaw + msg->v_yaw * (t_flight + time_bias_);
 
-    // Find the face whose normal is closest to our aimed direction
-    double min_face_diff = M_PI;
-    for (int i = 0; i < n_faces; i++) {
-      double fy = final_yaw + i * face_spacing;
-      double diff = std::abs(angles::shortest_angular_distance(yaw, fy));
-      if (diff < min_face_diff) min_face_diff = diff;
-    }
+    // Check only the face we aimed at (best_face), not the nearest face.
+    // Using the nearest face would allow firing when the barrel is aligned
+    // with a neighbour face while best_face is still off-angle.
+    double aimed_fy = final_yaw + best_face * face_spacing;
+    double face_diff = std::abs(angles::shortest_angular_distance(yaw, aimed_fy));
 
     // Variance-based window, capped to half face spacing
     double sigma_vyaw = std::sqrt(std::max(msg->v_yaw_variance, 1e-6));
@@ -772,19 +898,29 @@ void TrajectorySolverNode::targetCallback(
     double max_window = face_spacing * 0.5;  // Can't exceed half the face spacing
     double effective_window = std::min(angular_window_ + yaw_uncertainty, max_window);
 
-    in_range = (min_face_diff < effective_window);
+    in_range = (face_diff < effective_window);
   }
 
-  // Publish GimbalCmd (relative angles!)
+  // -----------------------------------------------------------------------
+  // Publish GimbalCmd — RELATIVE angles (degrees) for the lower computer.
+  //
+  // The lower computer's PID controller expects:
+  //   pitch = (target_pitch − current_pitch) in degrees
+  //   yaw   = shortest_angular_distance(current_yaw, target_yaw) in degrees
+  //
+  // current_pitch_ and current_yaw_ come from /micro_pose (gimbal feedback).
+  // If /micro_pose is stale, the relative angles will be wrong and fire is
+  // already suppressed by the micro_pose_stale check above.
+  // -----------------------------------------------------------------------
   auto_aim_interfaces::msg::GimbalCmd cmd;
   cmd.header = msg->header;
   double rel_pitch = pitch - current_pitch_;
   double rel_yaw = angles::shortest_angular_distance(current_yaw_, yaw);
 
-  cmd.pitch    = rel_pitch * 180.0 / M_PI;
-  cmd.yaw      = rel_yaw * 180.0 / M_PI;
-  cmd.distance = range;
-  cmd.fire_cmd = in_range;
+  cmd.pitch    = rel_pitch * 180.0 / M_PI;   // degrees
+  cmd.yaw      = rel_yaw * 180.0 / M_PI;     // degrees
+  cmd.distance = range;                       // 3D distance to target (m)
+  cmd.fire_cmd = in_range;                    // true = "pull trigger now"
   cmd_pub_->publish(cmd);
 
   RCLCPP_DEBUG(this->get_logger(),
@@ -793,13 +929,19 @@ void TrajectorySolverNode::targetCallback(
       yaw * 180.0 / M_PI, pitch * 180.0 / M_PI,
       rel_yaw * 180.0 / M_PI, rel_pitch * 180.0 / M_PI, in_range);
 
+  // Twist message for /cmd_vel (UART bridge to lower computer):
+  //   angular.x = fire trigger (1.0 = fire, 0.0 = hold)
+  //   angular.y = relative pitch in degrees
+  //   angular.z = relative yaw in degrees
+  // The cmd_vel_subscriber Python node reads these and packs them into
+  // the UART protocol expected by the STM32 lower computer.
   geometry_msgs::msg::Twist twist;
   twist.angular.x = in_range ? 1.0 : 0.0;
   twist.angular.y = rel_pitch * 180.0 / M_PI;
   twist.angular.z = rel_yaw   * 180.0 / M_PI;
   twist_pub_->publish(twist);
 
-  // Visualise predicted impact point
+  // Visualise predicted impact point (green sphere in RViz)
   visualization_msgs::msg::Marker marker;
   marker.header = msg->header;
   marker.ns = "impact_point";
