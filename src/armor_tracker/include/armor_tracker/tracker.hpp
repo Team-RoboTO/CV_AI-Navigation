@@ -119,6 +119,18 @@ public:
 
   void init(const Armors::SharedPtr & armors_msg);
 
+  void initFromArmor(const Armor & armor);
+
+  // Predict-only step: runs EKF predict + scalar KF predict.
+  // Must be called before computeAssignmentCost() and before update().
+  // After calling this, update() will skip its internal predict.
+  Eigen::VectorXd predictStep();
+
+  // Compute Mahalanobis distance from current prediction to an armor detection.
+  // Does NOT modify yaw unwrapping state (safe for cross-tracker comparison).
+  // Must be called after predictStep().
+  double computeAssignmentCost(const Armor & armor);
+
   void update(const Armors::SharedPtr & armors_msg);
 
   void setMaxYawObliqueAngle(double angle_rad) { max_yaw_oblique_angle_ = angle_rad; }
@@ -135,6 +147,7 @@ public:
     TEMP_LOST,
   } tracker_state;
 
+  int tracker_id = -1;
   std::string tracked_id;
   Armor tracked_armor;
   ArmorsNum tracked_armors_num;
@@ -162,10 +175,20 @@ public:
   double r_kf_R_ = 0.0004;           // Measurement noise for radius KFs (sigma≈2cm)
   double r_kf_P_init_ = 0.0064;      // Initial covariance for radius KFs (sigma≈8cm)
   double r_adapt_max_dist_ = 4.0;     // Only adapt r when target range < this [m]
-  double dz_adapt_alpha_ = 0.2;       // EMA factor for dz
+  double dz_adapt_alpha_ = 0.05;      // EMA factor for dz (low = smooth, high = reactive)
+  double r_yaw_uncertainty_scale_ = 50.0;  // Inflate radius KF R by (1 + scale * yaw_var)
   bool dz_initialized_ = false;       // First dz measurement gets full value, subsequent use EMA
   ScalarKF r_active_kf_;              // Scalar KF for the currently-tracked pair's radius
   ScalarKF r_other_kf_;               // Scalar KF for the other pair's radius
+
+  // Configurable thresholds (exposed as ROS parameters)
+  double v_yaw_max_ = 15.0;
+  double maha_match_threshold_ = 13.3;
+  double maha_jump_threshold_ = 20.0;
+
+  // Per-tracker damping alphas (set by the node each frame before predict)
+  double xyz_damping_alpha = 0.95;
+  double yaw_damping_alpha = 0.98;
 
 private:
   void initEKF(const Armor & a);
@@ -187,6 +210,10 @@ private:
   int lost_count_ = 0;
 
   double last_yaw_ = 0.0;
+
+  // Set by predictStep(), cleared by update().
+  // When true, update() skips its internal predict step.
+  bool predicted_ = false;
 };
 
 }  // namespace rm_auto_aim

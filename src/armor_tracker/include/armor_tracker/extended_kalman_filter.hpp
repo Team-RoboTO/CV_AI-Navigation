@@ -101,6 +101,10 @@ public:
   // Per-state covariance upper bounds (set externally; empty = no clamping)
   Eigen::VectorXd max_covariance;
 
+  // Spectral health check: if condition number of P exceeds this, blend with P0.
+  // 0 = disabled.  Typical value: 1e6.
+  double max_condition_number = 0.0;
+
 private:
   // --- Pluggable nonlinear functions (set once at construction) ---
   VecVecFunc f;           // Process model:     x_{k+1} = f(x_k)

@@ -9,6 +9,7 @@
 
 #include "auto_aim_interfaces/msg/gimbal_cmd.hpp"
 #include "auto_aim_interfaces/msg/target.hpp"
+#include "auto_aim_interfaces/msg/targets.hpp"
 
 namespace rm_auto_aim {
 
@@ -46,6 +47,7 @@ public:
 
 private:
   void targetCallback(auto_aim_interfaces::msg::Target::UniquePtr msg);
+  void targetsCallback(auto_aim_interfaces::msg::Targets::UniquePtr msg);
 
   // Solves for the pitch angle given position and velocity
   // Returns tuple<pitch, flight_time, reachable>
@@ -55,7 +57,12 @@ private:
                                                    const double v);
 
   rclcpp::Subscription<auto_aim_interfaces::msg::Target>::SharedPtr target_sub_;
+  rclcpp::Subscription<auto_aim_interfaces::msg::Targets>::SharedPtr targets_sub_;
   rclcpp::Publisher<auto_aim_interfaces::msg::GimbalCmd>::SharedPtr cmd_pub_;
+
+  // Dedup: skip legacy /tracker/target if we already processed the same timestamp
+  // via /tracker/targets
+  rclcpp::Time last_targets_stamp_{0, 0, RCL_ROS_TIME};
 
   // Debug visualization
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr marker_pub_;
@@ -70,7 +77,11 @@ private:
   double min_fire_dist_;   // Minimum engagement range (metres)
   double max_fire_dist_;   // Maximum engagement range (metres)
   double angular_window_;             // Half-width of armor face window (rad)
+  double angular_window_ref_dist_;   // Reference distance for window scaling (metres)
   double max_measurement_age_;        // Maximum allowed measurement staleness (seconds)
+  bool use_quadratic_drag_;          // Use quadratic drag model (F=-c*v^2) instead of linear
+  double max_gimbal_yaw_rate_;       // Max gimbal yaw slew rate (rad/s)
+  double max_gimbal_pitch_rate_;     // Max gimbal pitch slew rate (rad/s)
 
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr twist_pub_;
 
@@ -79,6 +90,7 @@ private:
   // velocity readings and smooth with a time-adjusted EMA to get acceleration,
   // which improves target prediction for accelerating/decelerating robots.
   bool has_prev_target_ = false;          // First frame flag
+  int32_t prev_tracker_id_ = -1;          // Track identity switches to reset accel EMA
   rclcpp::Time prev_target_time_;         // Timestamp of previous target message
   double prev_vx_ = 0.0, prev_vy_ = 0.0, prev_vz_ = 0.0;  // Previous velocities
   double ax_ema_ = 0.0, ay_ema_ = 0.0, az_ema_ = 0.0;      // EMA-smoothed acceleration
@@ -99,21 +111,36 @@ private:
   double gimbal_pitch_max_;  // Physical gimbal pitch upper limit (rad)
   double gimbal_pitch_min_;  // Physical gimbal pitch lower limit (rad)
 
-  // Indirect aiming for fast spinners
-  double indirect_vyaw_threshold_;
-  double indirect_timing_tolerance_;
-  int indirect_max_candidates_;
-  bool indirect_mode_active_ = false;
+  // --- Indirect aiming for fast spinners ---
+  // When |v_yaw| > threshold, switch from aiming at the current face to
+  // pre-aiming at a future alignment window when any face will be face-on.
+  double indirect_vyaw_threshold_;     // Activation threshold [rad/s] (hysteresis at 70%)
+  double indirect_timing_tolerance_;   // Minimum timing residual tolerance [s]
+  int indirect_max_candidates_;        // Max alignment windows to evaluate per frame
+  bool indirect_mode_active_ = false;  // Current mode state (with hysteresis)
 
-  // Gimbal relative angle subscription
+  // --- Current gimbal position (from /micro_pose serial feedback) ---
+  // Used to compute relative commands: target_angle − current_angle
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr micro_pose_sub_;
-  double current_pitch_ = 0.0;
-  double current_yaw_ = 0.0;
-  double yaw_sign_ = 1.0;
-  double pitch_sign_ = 1.0;
+  double current_pitch_ = 0.0;   // Current gimbal pitch [rad]
+  double current_yaw_ = 0.0;     // Current gimbal yaw [rad]
+  double yaw_sign_ = 1.0;        // Sign convention correction for yaw
+  double pitch_sign_ = 1.0;      // Sign convention correction for pitch
   rclcpp::Time last_micro_pose_time_{0, 0, RCL_ROS_TIME};
-  double micro_pose_timeout_;          // Suppress fire when /micro_pose is stale (seconds)
+  double micro_pose_timeout_;     // Suppress fire when /micro_pose is stale [s]
 
+  // --- Gimbal command smoothing (EMA) ---
+  // Filters the relative pitch/yaw commands to suppress frame-to-frame jitter
+  // caused by EKF measurement noise.  Resets on tracker ID change.
+  double cmd_smooth_alpha_;                // EMA weight (0→max smooth, 1→no smooth)
+  double max_cmd_angle_;                   // Hard clamp: max |relative cmd| per frame [deg]
+  double smoothed_rel_yaw_ = 0.0;         // EMA state for yaw command [rad]
+  double smoothed_rel_pitch_ = 0.0;       // EMA state for pitch command [rad]
+  bool cmd_smooth_initialized_ = false;   // First-frame flag
+
+  // Compute when a spinning armor face will next point at the camera.
+  // Used by indirect mode to enumerate alignment windows.
+  // Returns time [s] until next alignment (always >= 0).
   double nextAlignmentTime(double yaw, double v_yaw, double face_idx,
                            double face_spacing, double bearing) const;
 };

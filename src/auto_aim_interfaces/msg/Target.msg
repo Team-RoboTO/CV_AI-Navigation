@@ -1,6 +1,7 @@
 std_msgs/Header header
 bool tracking
 string id
+int32 tracker_id
 int32 armors_num
 
 # Tracker state machine

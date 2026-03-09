@@ -114,6 +114,21 @@ Eigen::MatrixXd ExtendedKalmanFilter::predict()
     }
   }
 
+  // Spectral health check: detect ill-conditioned P from large off-diagonal terms
+  // that per-element clamping cannot catch.  When triggered, blend P towards P0
+  // to restore numerical stability without a full hard reset.
+  if (max_condition_number > 0.0) {
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(P_pri, Eigen::EigenvaluesOnly);
+    if (es.info() == Eigen::Success) {
+      double lmin = es.eigenvalues().minCoeff();
+      double lmax = es.eigenvalues().maxCoeff();
+      if (lmin < 1e-10 || lmax / std::max(lmin, 1e-15) > max_condition_number) {
+        P_pri = 0.7 * P_pri + 0.3 * P0_;
+        P_pri = (P_pri + P_pri.transpose()) * 0.5;
+      }
+    }
+  }
+
   // Copy prior → posterior: if update() is never called (no detection this frame),
   // the next predict() will use these as the "best current estimate".
   x_post = x_pri;

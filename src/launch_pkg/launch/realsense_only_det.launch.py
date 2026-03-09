@@ -176,7 +176,9 @@ def generate_launch_description():
             {'indirect_vyaw_threshold': 3.0},
             {'indirect_timing_tolerance': 0.02},
             {'indirect_max_candidates': 8},
-            {'gimbal_height': 0.5},
+            {'gimbal.height': 0.5},
+            {'gimbal.yaw_sign': 1.0},
+            {'gimbal.pitch_sign': 1.0},
         ],
         extra_arguments=[{'use_intra_process_comms': True}]
     )

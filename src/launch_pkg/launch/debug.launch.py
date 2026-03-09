@@ -328,7 +328,9 @@ def generate_launch_description():
             {'indirect_timing_tolerance': 0.02},     # [s] base timing tolerance for alignment windows
             {'indirect_max_candidates': 8},          # max alignment candidates to evaluate per frame
             # Gimbal
-            {'gimbal_height': 0.325},                # [m] gimbal pivot height (must match tracker's gimbal.height)
+            {'gimbal.height': 0.325},                 # [m] gimbal pivot height (shared with tracker)
+            {'gimbal.yaw_sign': 1.0},                 # sign flip for yaw axis (shared with tracker)
+            {'gimbal.pitch_sign': 1.0},               # sign flip for pitch axis (shared with tracker)
         ],
         extra_arguments=[{'use_intra_process_comms': True}]
     )
