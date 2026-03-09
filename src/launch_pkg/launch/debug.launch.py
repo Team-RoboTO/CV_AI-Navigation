@@ -193,12 +193,14 @@ def generate_launch_description():
             realsense_config_file_path, 
             {'json_file_path': realsense_json_file_path,
             'publish_tf': False}],
-        remappings=[
-            ('color/image_raw', '/image'),      
-            ('color/camera_info', '/camera_info'),
-            ('depth/image_rect_raw', '/depth_image'),
-            ('depth/camera_info', '/depth_info')
-        ]
+        # No topic remappings — let the driver publish on its default
+        # /camera/camera/* topics.  The encoder subscribes to
+        # /camera/camera/color/image_raw and the tracker subscribes to
+        # /camera/camera/color/camera_info, matching these defaults.
+        # Previous remappings created a circular dependency:
+        #   RealSense: /camera/camera/color/camera_info → /camera_info
+        #   Tracker:   /camera_info → /camera/camera/color/camera_info
+        # resulting in the tracker subscribing to a topic nobody publishes on.
     )
 
     encoder_node = ComposableNode(
