@@ -286,7 +286,7 @@ def generate_launch_description():
             {'ekf.sigma2_q_r': 4.0},                # radius process noise variance (keep high so r adapts as target rotates)
             # EKF velocity damping (alpha^(dt/T) decay per step; 1.0 = no decay)
             {'ekf.xyz_damping_alpha': 0.95},         # position velocity damping (lower → stronger braking)
-            {'ekf.yaw_damping_alpha': 1.0},         # yaw velocity damping
+            {'ekf.yaw_damping_alpha': 0.95},         # yaw velocity damping
             {'ekf.coast_damping_factor': 0.85},      # extra damping multiplier during TEMP_LOST coasting
             {'ekf.damping_innov_threshold': 0.10},   # [m] position innovation above which overshoot damping activates
             {'ekf.yaw_innov_threshold': 0.15},       # [rad] yaw innovation above which yaw damping activates

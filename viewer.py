@@ -6,10 +6,9 @@ from vision_msgs.msg import Detection2DArray, Detection2D
 from visualization_msgs.msg import Marker
 from cv_bridge import CvBridge
 import cv2
+import numpy as np
 
-import tf2_ros
-from geometry_msgs.msg import PointStamped
-import tf2_geometry_msgs  # noqa: F401  — registers PointStamped transform
+from geometry_msgs.msg import PoseStamped
 
 class VisualizerNode(Node):
     def __init__(self):
@@ -24,11 +23,29 @@ class VisualizerNode(Node):
         self.tracking_info = None
         self.gimbal_cmd = None
 
+        # Gimbal state from /micro_pose (updated at ~100 Hz)
+        self._gimbal_yaw = 0.0
+        self._gimbal_pitch = 0.0
+        self._yaw_sign = 1.0     # matches gimbal.yaw_sign in debug.launch.py
+        self._pitch_sign = 1.0   # matches gimbal.pitch_sign in debug.launch.py
+        self._gimbal_height = 0.325  # [m] matches gimbal.height in debug.launch.py
+
+        # Precompute RPY(-π/2, 0, -π/2) convention rotation matrix
+        # This maps from gimbal mechanical convention to camera optical frame
+        # and matches the tracker's broadcastGimbalTF exactly.
+        self._R_convention = np.array([
+            [ 0,  0,  1],
+            [-1,  0,  0],
+            [ 0, -1,  0]], dtype=np.float64)
+
         self.create_subscription(Image, '/camera/camera/color/image_raw', self.img_cb, qos_profile_sensor_data)
         self.create_subscription(CameraInfo, '/camera/camera/color/camera_info', self.info_cb, qos_profile_sensor_data)
         self.create_subscription(Detection2DArray, '/detections_output', self.bbox_cb, qos_profile_sensor_data)
         self.create_subscription(Detection2D, '/detections_output/optimal_target', self.optimal_cb, qos_profile_sensor_data)
         self.create_subscription(Marker, '/trajectory/marker', self.marker_cb, qos_profile_sensor_data)
+
+        # Gimbal feedback — fresh angles for impact projection
+        self.create_subscription(PoseStamped, '/micro_pose', self.micro_pose_cb, qos_profile_sensor_data)
 
         # Try subscribing to tracker target and gimbal commands
         try:
@@ -39,10 +56,6 @@ class VisualizerNode(Node):
             self.get_logger().warn("auto_aim_interfaces not found — run: source install/setup.bash")
 
         self.pub = self.create_publisher(Image, '/annotated_image', 10)
-
-        # TF2 for transforming impact point from odom → camera frame
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         self.get_logger().info("Visualizer Node started!")
 
@@ -64,6 +77,14 @@ class VisualizerNode(Node):
 
     def gimbal_cmd_cb(self, msg):
         self.gimbal_cmd = msg
+
+    def micro_pose_cb(self, msg):
+        p = self._pitch_sign * msg.pose.position.x
+        y = self._yaw_sign * msg.pose.position.y
+        # Reject garbage serial data (gimbal angles can't exceed ~90°)
+        if abs(p) < 1.6 and abs(y) < 1.6:
+            self._gimbal_pitch = p
+            self._gimbal_yaw = y
 
     def bbox_cb(self, msg):
         self.latest_detections = msg
@@ -129,34 +150,43 @@ class VisualizerNode(Node):
                 cv2.putText(cv_img, label, (pt1[0], pt1[1] - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
         # 3. Impact point (red) — from trajectory solver marker
-        if self.latest_marker is not None:
-            # Transform from marker frame (odom) → camera optical frame
-            pt_odom = PointStamped()
-            pt_odom.header.frame_id = self.latest_marker.header.frame_id
-            pt_odom.header.stamp = rclpy.time.Time().to_msg()  # latest TF
-            pt_odom.point = self.latest_marker.pose.position
-            try:
-                pt_cam = self.tf_buffer.transform(
-                    pt_odom, 'camera_color_optical_frame',
-                    timeout=rclpy.duration.Duration(seconds=0.05))
-                x = pt_cam.point.x
-                y = pt_cam.point.y
-                z = pt_cam.point.z
-                if z > 0.05:
-                    K = self.camera_info.k
-                    fx, cx_cam = K[0], K[2]
-                    fy, cy_cam = K[4], K[5]
-                    u = int((x / z) * fx + cx_cam)
-                    v = int((y / z) * fy + cy_cam)
-                    if 0 <= u < w_img and 0 <= v < h_img:
-                        cv2.circle(cv_img, (u, v), 6, (0, 0, 255), -1)
-                        cv2.line(cv_img, (u - 20, v), (u + 20, v), (0, 0, 255), 2)
-                        cv2.line(cv_img, (u, v - 20), (u, v + 20), (0, 0, 255), 2)
-                        cv2.putText(cv_img, "IMPACT", (u + 10, v - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-            except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
-                    tf2_ros.ExtrapolationException) as e:
-                self.get_logger().warn(f"Impact TF failed: {e}", throttle_duration_sec=2.0)
+        #    Project using latest /micro_pose gimbal angles instead of TF to
+        #    avoid timing mismatch (TF is broadcast at detection time, but
+        #    the image arrives before YOLO finishes → stale TF while gimbal slews).
+        if self.latest_marker is not None and self.camera_info is not None:
+            p_odom = np.array([
+                self.latest_marker.pose.position.x,
+                self.latest_marker.pose.position.y,
+                self.latest_marker.pose.position.z])
+
+            # odom→camera: p_cam = R_total.T @ (p_odom - translation)
+            yaw = self._gimbal_yaw
+            pitch = self._gimbal_pitch
+            cos_y, sin_y = np.cos(yaw), np.sin(yaw)
+            cos_p, sin_p = np.cos(pitch), np.sin(pitch)
+            R_yaw = np.array([[ cos_y, -sin_y, 0],
+                               [ sin_y,  cos_y, 0],
+                               [ 0,      0,     1]])
+            R_pitch = np.array([[ cos_p, 0, sin_p],
+                                 [ 0,     1, 0    ],
+                                 [-sin_p, 0, cos_p]])
+            R_total = R_yaw @ R_pitch @ self._R_convention
+            p_translated = p_odom - np.array([0.0, 0.0, self._gimbal_height])
+            p_cam = R_total.T @ p_translated
+
+            x, y, z = p_cam
+            if z > 0.05:
+                K = self.camera_info.k
+                fx, cx_cam = K[0], K[2]
+                fy, cy_cam = K[4], K[5]
+                u = int((x / z) * fx + cx_cam)
+                v = int((y / z) * fy + cy_cam)
+                if 0 <= u < w_img and 0 <= v < h_img:
+                    cv2.circle(cv_img, (u, v), 6, (0, 0, 255), -1)
+                    cv2.line(cv_img, (u - 20, v), (u + 20, v), (0, 0, 255), 2)
+                    cv2.line(cv_img, (u, v - 20), (u, v + 20), (0, 0, 255), 2)
+                    cv2.putText(cv_img, "IMPACT", (u + 10, v - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
         # 4. Aim direction (cyan) — where the barrel is pointing
         if self.gimbal_cmd is not None and self.gimbal_cmd.distance > 0.1:
