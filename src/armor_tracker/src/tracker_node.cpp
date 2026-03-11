@@ -48,6 +48,20 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   bbox_padding_y_ = this->declare_parameter("bbox_padding_y", 80.0);
 
   // Tracker parameters (stored for createTracker factory)
+  // - max_match_distance_: Euclidean gate (m) between predicted center and detection; blocks far mis-associations.
+  // - max_track_range_: drop detections outside this planar radius (m) before tracker init/update.
+  // - tracking_thres_: consecutive good updates required to promote DETECTING → TRACKING.
+  // - lost_time_thres_: seconds tolerated without measurement before a tracker is considered TEMP_LOST/LOST.
+  // - initial_r1_ / initial_r2_: initial inner/outer ring radii (m) used by yaw solver for 4-armor robots.
+  // - r_kf_*: process (Q), measurement (R), and initial (P) covariance for the radius Kalman filter.
+  // - r_adapt_max_dist_: maximum allowed jump (m) when adapting armor ring radius frame-to-frame.
+  // - dz_adapt_alpha_: EMA factor for smoothing vertical drift compensation when armors hop faces.
+  // - r_yaw_uncertainty_scale_: scales yaw covariance when radius estimate is poor (guards against overconfidence).
+  // - v_yaw_max_: clamp for yaw rate (rad/s) to prevent numerical blow-ups on bad detections.
+  // - maha_match_threshold_ / maha_jump_threshold_: Mahalanobis gates for normal matching vs armor-jump association.
+  // - tracker_micro_pose_timeout_: max age (s) of gimbal feedback before warning and reusing stale pose.
+  // - max_trackers_: upper bound on simultaneous tracks to keep CPU predictable.
+  // - new_tracker_min_dist_: minimum 3D spacing (m) to spawn a new tracker near an existing one.
   max_match_distance_ = this->declare_parameter("tracker.max_match_distance", 0.15);
   max_track_range_ = this->declare_parameter("tracker.max_track_range", 6.0);
   tracking_thres_ = this->declare_parameter("tracker.tracking_thres", 5);
@@ -70,6 +84,9 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   // EKF parameters
   xyz_damping_alpha_base_ = declare_parameter("ekf.xyz_damping_alpha", 0.95);
   yaw_damping_alpha_base_ = declare_parameter("ekf.yaw_damping_alpha", 0.95);
+  // coast_damping_factor_: extra decay multiplier applied when coasting without
+  // measurements (TEMP_LOST) or when we intentionally brake yaw; <1.0 increases
+  // damping so velocity dies out faster during occlusion.
   coast_damping_factor_   = declare_parameter("ekf.coast_damping_factor", 0.85);
   damping_innov_threshold_ = declare_parameter("ekf.damping_innov_threshold", 0.10);
   yaw_innov_threshold_    = declare_parameter("ekf.yaw_innov_threshold", 0.15);
@@ -346,6 +363,14 @@ void ArmorTrackerNode::imuCallback(const sensor_msgs::msg::Imu::ConstSharedPtr m
 // ---------------------------------------------------------------------------
 void ArmorTrackerNode::broadcastGimbalTF(const rclcpp::Time & stamp)
 {
+  // Purpose: keep odom as a world-fixed frame by publishing the live camera pose
+  // derived from chassis rotation (IMU) + gimbal joints + fixed optical offset.
+  // Without this, every gimbal movement would look like the target jumped in 3D.
+  // Consequences of skipping it: TF2 would reuse a stale camera pose, so after
+  // each gimbal pan/tilt the same physical robot would project to a different
+  // place in odom. The tracker would see fake target motion, inflate Mahalanobis
+  // distances, and either miss associations or spawn ghost tracks.
+
   // Check gimbal pose staleness
   if (last_micro_pose_time_.nanoseconds() > 0) {
     double micro_staleness = (this->now() - last_micro_pose_time_).seconds();
@@ -382,6 +407,7 @@ void ArmorTrackerNode::broadcastGimbalTF(const rclcpp::Time & stamp)
   // R_convention = RPY(-π/2, 0, -π/2) matches the old static TF when yaw=pitch=0
   q_convention.setRPY(-M_PI / 2.0, 0, -M_PI / 2.0);
 
+  // Compose in order: chassis (IMU) → gimbal → optical-frame convention.
   tf2::Quaternion q_final = q_chassis_yaw * q_chassis_pitch * q_yaw * q_pitch * q_convention;
   q_final.normalize();
 
@@ -419,10 +445,28 @@ void ArmorTrackerNode::broadcastGimbalTF(const rclcpp::Time & stamp)
 void ArmorTrackerNode::armorsCallback(
   const vision_msgs::msg::Detection2DArray::ConstSharedPtr detection_msg)
 {
-  // Always broadcast gimbal TF so the transform is available for this frame.
-  // When /micro_pose is active, angles update at 100Hz via microPoseCallback.
-  // When /micro_pose is absent or dies, this keeps TF alive at detection rate
-  // using last-known angles (0,0 at startup = old static TF equivalent).
+  // Always broadcast gimbal TF so this frame uses a fresh odom→camera pose.
+  // WHY: PnP outputs armor poses in camera frame; the tracker works in odom.
+  // A correct odom→camera transform is required to place every detection in
+  // world coordinates before gating/association. If we skip this, a gimbal pan
+  // shifts the camera but TF2 thinks the camera is still at its old pose—so a
+  // stationary robot appears to jump, inflates Mahalanobis distance, and either
+  // gets dropped or spawns ghost tracks. If /micro_pose is live, angles refresh
+  // at 100 Hz; otherwise we reuse last-known angles to keep TF continuous (falls
+  // back to static at startup).
+
+  
+  // TF primer: TF/TF2 is ROS's frame tree; broadcasting a transform inserts the
+  // current odom→camera pose into that tree so lookupTransform can convert PnP
+  // results (camera frame) into odom immediately. Without broadcasting, TF2 would
+  // reuse stale transforms and every gimbal move would be misinterpreted as target
+  // motion. "Broadcast" here means publish to /tf for others AND write into our
+  // local buffer for same-callback lookups.
+
+  // Frames here: "odom" = world-fixed frame we maintain with IMU compensation;
+  // "camera_color_optical_frame" = RealSense optical frame (x-right, y-down, z-forward)
+  // attached to the moving gimbal. We must transform detections from camera frame
+  // into odom to compare across time as the gimbal and chassis move.
   broadcastGimbalTF(detection_msg->header.stamp);
 
   // Convert 2D detections to Armors message
@@ -496,6 +540,12 @@ void ArmorTrackerNode::armorsCallback(
     armor_obj.right_light.top   = cv::Point2f(rx, ty);
     armor_obj.right_light.bottom = cv::Point2f(rx, by);
 
+    // Solve PnP: turn 2D light corners into a 3D pose relative to the camera.
+    // rvec: axis-angle rotation (Rodrigues form: a 3D vector whose direction is the
+    //       rotation axis and whose length is the rotation angle in radians) telling
+    //       how the armor is oriented.
+    // tvec: position of the armor origin measured from the camera (meters) in the
+    //       camera frame (x: right, y: down, z: forward for RealSense optical).
     cv::Mat rvec, tvec;
     bool success = pnp_solver_->solvePnP(armor_obj, rvec, tvec);
     if (success) {
@@ -507,8 +557,9 @@ void ArmorTrackerNode::armorsCallback(
       armor_msg.pose.position.y = tvec.at<double>(1);
       armor_msg.pose.position.z = tvec.at<double>(2);
 
+      // Convert rvec to a quaternion for ROS/TF2 message compatibility.
       cv::Mat rotation_matrix;
-      cv::Rodrigues(rvec, rotation_matrix);
+      cv::Rodrigues(rvec, rotation_matrix);  // Rodrigues vector → 3x3 rotation matrix
       tf2::Matrix3x3 tf2_rotation_matrix(
         rotation_matrix.at<double>(0, 0), rotation_matrix.at<double>(0, 1),
         rotation_matrix.at<double>(0, 2), rotation_matrix.at<double>(1, 0),
@@ -516,7 +567,10 @@ void ArmorTrackerNode::armorsCallback(
         rotation_matrix.at<double>(2, 0), rotation_matrix.at<double>(2, 1),
         rotation_matrix.at<double>(2, 2));
       tf2::Quaternion tf2_q;
-      tf2_rotation_matrix.getRotation(tf2_q);
+      tf2_rotation_matrix.getRotation(tf2_q);  // matrix → quaternion for TF2/ROS msgs
+      // TF2/ROS consumers expect quaternions: Pose/Transform messages and
+      // tf2::doTransform all operate on (x,y,z,w), not Rodrigues vectors or raw
+      // matrices. Converting here lets downstream transforms and publishers work.
       double q_len = tf2_q.length();
       // WHY THIS CHECK: PnP can fail silently (returns success=true but garbage
       // rotation) when the input points are nearly coplanar or extremely noisy.
@@ -548,8 +602,12 @@ void ArmorTrackerNode::armorsCallback(
   // Without it, every time the gimbal moves, the target would appear to jump
   // in camera frame even though it's stationary in the world.
   if (!armors_ptr->armors.empty()) {
+    // lookupTransform grabs the latest odom→camera transform (with a small timeout)
+    // so we can re-express each armor pose in odom.
     geometry_msgs::msg::TransformStamped tf_stamped;
     try {
+      // target_frame_ is the world frame we track in (default "odom", overridable
+      // via parameter). We pull the transform from camera frame into that frame.
       tf_stamped = tf2_buffer_->lookupTransform(
         target_frame_, armors_ptr->header.frame_id,
         armors_ptr->header.stamp, rclcpp::Duration::from_seconds(0.01));
@@ -558,9 +616,16 @@ void ArmorTrackerNode::armorsCallback(
       return;
     }
     for (auto & armor : armors_ptr->armors) {
+      // Wrap pose in a stamped message and apply the TF so orientation + position
+      // move from camera frame into odom frame.
       geometry_msgs::msg::PoseStamped ps_in, ps_out;
       ps_in.header = armors_ptr->header;
       ps_in.pose = armor.pose;
+      // tf2::doTransform composes the pose with tf_stamped (camera→target_frame_):
+      //   p_world = R * p_cam + t, q_world = q_tf * q_cam.  It rotates then translates
+      // the point and left-multiplies the orientation quaternion, producing the armor
+      // pose in the world frame. Required so all armors are compared/tracked in one
+      // coordinate system even while the camera moves.
       tf2::doTransform(ps_in, ps_out, tf_stamped);
       armor.pose = ps_out.pose;
     }
@@ -592,6 +657,8 @@ void ArmorTrackerNode::armorsCallback(
     if (
       std::abs(armor.pose.position.z) > 1.2 ||
       Eigen::Vector2d(armor.pose.position.x, armor.pose.position.y).norm() > max_armor_distance_) {
+      // Drop detections that are unrealistically high or far; keep detection_indices
+      // in sync so downstream mapping to YOLO detections remains correct.
       armors_vec.erase(armors_vec.begin() + i);
       detection_indices.erase(detection_indices.begin() + i);
     } else {
@@ -676,7 +743,7 @@ void ArmorTrackerNode::armorsCallback(
       bool overshoot = (yaw_innov * v_yaw < 0) && (std::abs(v_yaw) > 0.5);
       if (overshoot) {
         double yaw_scale = std::min(tracker.info_yaw_diff / yaw_innov_threshold_, 1.0);
-        // Allow stronger damping than XYZ: multiply base by coast factor
+        // Allow stronger damping than XYZ: multiply base by coast factor to brake harder
         double min_alpha = yaw_damping_alpha_base_ * coast_damping_factor_;
         tracker.yaw_damping_alpha = 1.0 - yaw_scale * (1.0 - min_alpha);
       } else if (std::abs(v_yaw) > 0.5) {
@@ -688,7 +755,8 @@ void ArmorTrackerNode::armorsCallback(
       }
     } else if (tracker.tracker_state == Tracker::TEMP_LOST) {
       // No measurement to correct → aggressively decay velocity so the
-      // prediction doesn't drift far from reality during occlusion
+      // prediction doesn't drift far from reality during occlusion. coast_damping_factor_
+      // makes the decay stronger than the baseline.
       tracker.xyz_damping_alpha = xyz_damping_alpha_base_ * coast_damping_factor_;
       tracker.yaw_damping_alpha = yaw_damping_alpha_base_ * coast_damping_factor_;
     } else {
@@ -708,10 +776,14 @@ void ArmorTrackerNode::armorsCallback(
   // the SAME armor, creating ghost tracks that mirror each other.
   //
   // SOLUTION: For each detection, find the ONE best tracker (lowest Mahalanobis
-  // distance).  Each detection goes to at most one tracker.  Trackers that
-  // receive no detections simply coast on their prediction (TEMP_LOST path).
+  // distance). Mahalanobis uses the tracker covariance, so it naturally gates by
+  // the predicted uncertainty (anisotropic ellipsoid) instead of a fixed Euclidean
+  // radius; this is more robust to stretched covariance along yaw/range. Each
+  // detection goes to at most one tracker. Trackers that receive no detections
+  // simply coast on their prediction (TEMP_LOST path).
   //
-  // detection_owner[i] = tracker_id that owns detection i, or -1 if unassigned.
+  // detection_owner[i] tracks which tracker (id) owns detection i; -1 means
+  // unassigned. This prevents multiple trackers from fusing the same detection.
   // Unassigned detections may spawn new trackers in Step 4 below.
   std::vector<int> detection_owner(armors_ptr->armors.size(), -1);
 
@@ -724,6 +796,7 @@ void ArmorTrackerNode::armorsCallback(
 
     for (auto & kv : trackers_) {
       auto & tracker = *kv.second;
+      // kv.first is tracker_id, kv.second is the shared_ptr<Tracker>
       if (tracker.tracker_state == Tracker::LOST) continue;
       // Class ID must match (e.g. "3" = red).  This prevents cross-team assignment.
       if (armor.number != tracker.tracked_id) continue;
@@ -1237,6 +1310,34 @@ std::unique_ptr<Tracker> ArmorTrackerNode::createTracker()
   return tracker;
 }
 
+// ---------------------------------------------------------------------------
+// fillTargetMsg — pack a tracker's EKF state into a Target ROS message.
+//
+// The Target message is the primary interface between the armor_tracker and
+// the rm_trajectory (ballistic solver) node.  It carries everything the
+// trajectory solver needs to compute a fire solution.
+//
+// EKF state vector → Target message field mapping:
+//   state(0) → position.x   [m]    robot center X in odom frame
+//   state(1) → velocity.x   [m/s]  robot center X velocity
+//   state(2) → position.y   [m]    robot center Y in odom frame
+//   state(3) → velocity.y   [m/s]  robot center Y velocity
+//   state(4) → position.z   [m]    armor plate Z (height) in odom frame
+//   state(5) → velocity.z   [m/s]  armor plate Z velocity
+//   state(6) → yaw          [rad]  robot heading (continuously unwrapped)
+//   state(7) → v_yaw        [rad/s] spin rate (positive = CCW)
+//   state(8) → radius_1     [m]    orbit radius of the currently-tracked pair
+//              radius_2     [m]    orbit radius of the OTHER pair (from r_other_kf_)
+//              dz           [m]    height difference between the two armor pairs
+//              v_yaw_variance [rad²/s²]  P_post(7,7) — EKF spin-rate uncertainty
+//                            (used by trajectory solver to widen fire window)
+//
+// State machine behavior:
+//   DETECTING  → tracking=false  — not yet confirmed; trajectory solver ignores
+//   TRACKING   → tracking=true   — fully confirmed; trajectory solver fires
+//   TEMP_LOST  → tracking=true   — coasting; trajectory solver suppresses fire
+//   LOST       → tracking=false  — removed from the map; never reaches here
+// ---------------------------------------------------------------------------
 void ArmorTrackerNode::fillTargetMsg(
   auto_aim_interfaces::msg::Target & msg,
   Tracker & tracker,
@@ -1246,39 +1347,83 @@ void ArmorTrackerNode::fillTargetMsg(
   msg.header.stamp = time;
   msg.header.frame_id = target_frame_;
   msg.tracker_id = tracker.tracker_id;
+  // tracker_state as uint8 for the trajectory solver's fire suppression checks
   msg.tracker_state = static_cast<uint8_t>(tracker.tracker_state);
 
   if (tracker.tracker_state == Tracker::DETECTING) {
+    // DETECTING: not yet confirmed (< tracking_thres consecutive matches).
+    // Trajectory solver must not fire on an unconfirmed detection.
     msg.tracking = false;
     msg.id = "";
     msg.armors_num = 0;
   } else if (
     tracker.tracker_state == Tracker::TRACKING ||
     tracker.tracker_state == Tracker::TEMP_LOST) {
+    // TRACKING / TEMP_LOST: confirmed target — publish the full EKF state.
+    // TEMP_LOST is included so the trajectory solver keeps aiming during brief
+    // occlusions; it suppresses fire via the tracker_state field check.
     msg.tracking = true;
     const auto & state = tracker.target_state;
-    msg.id         = tracker.tracked_id;
-    msg.armors_num = static_cast<int>(tracker.tracked_armors_num);
-    msg.position.x = state(0);
-    msg.velocity.x = state(1);
-    msg.position.y = state(2);
-    msg.velocity.y = state(3);
-    msg.position.z = state(4);
-    msg.velocity.z = state(5);
-    msg.yaw        = state(6);
-    msg.v_yaw      = state(7);
-    msg.radius_1   = state(8);
-    msg.radius_2   = tracker.another_r;
-    msg.dz         = tracker.dz;
-    msg.v_yaw_variance = tracker.ekf.getVariance(7);
+    msg.id         = tracker.tracked_id;       // YOLO class ID (e.g. "3" = red)
+    msg.armors_num = static_cast<int>(tracker.tracked_armors_num);  // 2, 3, or 4
+    // Robot center position (odom frame):
+    msg.position.x = state(0);   // xc
+    msg.velocity.x = state(1);   // v_xc
+    msg.position.y = state(2);   // yc
+    msg.velocity.y = state(3);   // v_yc
+    // Armor plate height (odom frame):
+    msg.position.z = state(4);   // za  (height of currently tracked armor)
+    msg.velocity.z = state(5);   // v_za
+    // Robot orientation (continuously unwrapped from PnP yaw):
+    msg.yaw        = state(6);   // heading [rad], unwrapped (can exceed ±π)
+    msg.v_yaw      = state(7);   // spin rate [rad/s]; sign = direction of spin
+    // Orbital geometry:
+    msg.radius_1   = state(8);         // active pair radius (from ScalarKF)
+    msg.radius_2   = tracker.another_r; // other pair radius (from r_other_kf_)
+    msg.dz         = tracker.dz;       // height difference between armor pairs [m]
+    // EKF covariance — used by trajectory solver to scale fire window:
+    msg.v_yaw_variance = tracker.ekf.getVariance(7);  // P_post(7,7)
+    // Last real detection timestamp — for trajectory solver's staleness check
     msg.last_measurement_stamp = last_meas_time;
   } else {
+    // LOST: this branch should never execute because LOST trackers are pruned
+    // before fillTargetMsg is called.  Guard against future logic changes.
     msg.tracking = false;
     msg.id = "";
     msg.armors_num = 0;
   }
 }
 
+// ---------------------------------------------------------------------------
+// publishMarkers — publish RViz visualization for the best-target tracker.
+//
+// Published on /tracker/marker as a MarkerArray.  Consumed by RViz to overlay
+// the EKF state on the live camera feed for debugging and tuning.
+//
+// Markers published when tracking=true:
+//   position_marker_  (SPHERE, green)
+//     Centre of the spinning robot (xc, yc, za + dz/2).
+//     Positioned at the midpoint between the two armor-pair heights.
+//
+//   linear_v_marker_  (ARROW, yellow)
+//     Linear velocity of the robot center (vx, vy, vz) as an arrow starting
+//     at the center sphere.  Arrow tip = center + velocity → a 1-second
+//     look-ahead of the robot's ground-truth motion.
+//
+//   angular_v_marker_ (ARROW, cyan)
+//     Spin rate v_yaw represented as a vertical arrow (Z-direction only).
+//     Length = v_yaw / π metres — one full rotation (2π rad/s) → 2m arrow.
+//     Upward = CCW spin (positive v_yaw), downward = CW spin.
+//
+//   armor_marker_     (CUBE, red, repeated n times)
+//     One cube per armor plate, positioned at the predicted plate locations:
+//       face_i_position = center − r_i × [cos(yaw + i × 2π/n), sin(...)]
+//     Scale matches actual plate dimensions (SMALL: 140×125 mm, LARGE: 235×127 mm).
+//     Orientation: pitch=±0.26 rad (armor plate tilted slightly outward from
+//     the robot center, as in the physical design).
+//
+// When tracking=false (no target): all markers are sent with DELETE action.
+// ---------------------------------------------------------------------------
 void ArmorTrackerNode::publishMarkers(const auto_aim_interfaces::msg::Target & target_msg)
 {
   position_marker_.header = target_msg.header;
@@ -1293,11 +1438,15 @@ void ArmorTrackerNode::publishMarkers(const auto_aim_interfaces::msg::Target & t
     double vx = target_msg.velocity.x, vy = target_msg.velocity.y, vz = target_msg.velocity.z;
     double dz = target_msg.dz;
 
+    // Center sphere: positioned at the robot body center, vertically midway
+    // between the two armor pair heights (za and za+dz).
     position_marker_.action = visualization_msgs::msg::Marker::ADD;
     position_marker_.pose.position.x = xc;
     position_marker_.pose.position.y = yc;
     position_marker_.pose.position.z = za + dz / 2;
 
+    // Linear velocity arrow: from center to center + velocity.
+    // A 1 m/s velocity produces a 1 m arrow (intuitive scale).
     linear_v_marker_.action = visualization_msgs::msg::Marker::ADD;
     linear_v_marker_.points.clear();
     linear_v_marker_.points.emplace_back(position_marker_.pose.position);
@@ -1307,6 +1456,8 @@ void ArmorTrackerNode::publishMarkers(const auto_aim_interfaces::msg::Target & t
     arrow_end.z += vz;
     linear_v_marker_.points.emplace_back(arrow_end);
 
+    // Spin rate arrow: vertical, length ∝ v_yaw.
+    // v_yaw / π means: 1 full revolution/s → 2m arrow.
     angular_v_marker_.action = visualization_msgs::msg::Marker::ADD;
     angular_v_marker_.points.clear();
     angular_v_marker_.points.emplace_back(position_marker_.pose.position);
@@ -1314,20 +1465,22 @@ void ArmorTrackerNode::publishMarkers(const auto_aim_interfaces::msg::Target & t
     arrow_end.z += target_msg.v_yaw / M_PI;
     angular_v_marker_.points.emplace_back(arrow_end);
 
+    // Armor cubes: one per face, using alternating r1/r2 and za/za+dz for 4-armor robots.
     armor_marker_.action = visualization_msgs::msg::Marker::ADD;
     bool is_small = false;
     if (best_tracker_id_ >= 0 && trackers_.count(best_tracker_id_)) {
       is_small = (trackers_[best_tracker_id_]->tracked_armor.type == "small");
     }
-    armor_marker_.scale.y = is_small ? 0.140 : 0.235;
-    armor_marker_.scale.z = is_small ? 0.125 : 0.127;
+    armor_marker_.scale.y = is_small ? 0.140 : 0.235;  // armor width [m]
+    armor_marker_.scale.z = is_small ? 0.125 : 0.127;  // armor height [m]
     bool is_current_pair = true;
     size_t a_n = target_msg.armors_num;
     geometry_msgs::msg::Point p_a;
     double r = 0;
     for (size_t i = 0; i < a_n; i++) {
+      // Each face is angularly spaced by 2π/n from the previous
       double tmp_yaw = yaw + i * (2 * M_PI / a_n);
-      // Only 4 armors has 2 radius and height
+      // 4-armor robots alternate between two pairs with different r and z
       if (a_n == 4) {
         r = is_current_pair ? r1 : r2;
         p_a.z = za + (is_current_pair ? 0 : dz);
@@ -1336,21 +1489,27 @@ void ArmorTrackerNode::publishMarkers(const auto_aim_interfaces::msg::Target & t
         r = r1;
         p_a.z = za;
       }
+      // Face position = center − r × [cos, sin] (same formula as EKF h(x))
       p_a.x = xc - r * cos(tmp_yaw);
       p_a.y = yc - r * sin(tmp_yaw);
 
       armor_marker_.id = i;
       armor_marker_.pose.position = p_a;
+      // Pitch of ±0.26 rad (~15°) matches the physical outward tilt of armor plates.
+      // Outpost plates are tilted inward (negative pitch).
       tf2::Quaternion q;
       q.setRPY(0, target_msg.id == "outpost" ? -0.26 : 0.26, tmp_yaw);
       armor_marker_.pose.orientation = tf2::toMsg(q);
       marker_array.markers.emplace_back(armor_marker_);
     }
   } else {
+    // No active tracking — delete all persistent markers
     position_marker_.action = visualization_msgs::msg::Marker::DELETE;
     linear_v_marker_.action = visualization_msgs::msg::Marker::DELETE;
     angular_v_marker_.action = visualization_msgs::msg::Marker::DELETE;
 
+    // Delete all 4 armor slot markers (IDs 0-3) regardless of actual armors_num.
+    // Using DELETE on a non-existent marker is harmless.
     armor_marker_.action = visualization_msgs::msg::Marker::DELETE;
     for (int i = 0; i < 4; i++) {
       armor_marker_.id = i;
