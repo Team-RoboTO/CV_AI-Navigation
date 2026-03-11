@@ -142,6 +142,7 @@ def generate_launch_description():
             {'ekf.coast_damping_factor': 0.85},
             {'ekf.damping_innov_threshold': 0.10},
             {'ekf.yaw_innov_threshold': 0.15},
+            {'ekf.ref_frequency': 30.0},
             # Gimbal TF parameters
             {'gimbal.height': 0.5},
             {'gimbal.yaw_sign': 1.0},
@@ -172,6 +173,7 @@ def generate_launch_description():
             {'angular_window': 0.09},
             {'accel_ema_alpha': 0.3},
             {'max_accel': 6.0},
+            {'ref_frequency': 30.0},
             {'latency_gate_sigma': 2.5},
             {'indirect_vyaw_threshold': 3.0},
             {'indirect_timing_tolerance': 0.02},

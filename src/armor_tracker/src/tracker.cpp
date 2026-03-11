@@ -14,6 +14,94 @@
 #include <string>
 #include <vector>
 
+// ============================================================================
+// HOW TO READ THIS FILE
+// ============================================================================
+//
+// This file implements a single Tracker object — one per tracked robot.
+// tracker_node.cpp owns a map of these and calls them; this file is the
+// per-robot EKF core.
+//
+// ── CONSTRUCTOR ─────────────────────────────────────────────────────────────
+// Sets state to LOST, zeros the measurement/state vectors, stores gate params
+// (max_match_distance_, max_match_yaw_diff_, max_track_range_).
+// The EKF matrices (F, H, Q, R) are injected later by tracker_node via
+// createTracker() — they are NOT initialized here.
+//
+// ── init() ──────────────────────────────────────────────────────────────────
+// Called once when a new tracker is spawned (LOST → DETECTING).
+// Picks the armor closest to the image center (best PnP accuracy) from all
+// detections, then calls initEKF() to seed the 9-state vector from that
+// one 3D pose.  State: DETECTING (needs tracking_thres_ hits to promote).
+//
+// ── update() — MAIN PER-FRAME LOOP ──────────────────────────────────────────
+// Called each frame with all armors assigned to this tracker by the global
+// association in tracker_node.  Steps:
+//
+//  [1] PREDICT
+//      If predictStep() was not yet called this frame (backward-compat path),
+//      advance the EKF forward by dt.  Scalar radius KFs also predict.
+//      Radius KF state is written back into the 9D EKF vector so the process
+//      model stays consistent (radius is decoupled for numerical stability).
+//
+//  [2] ASSOCIATE — find the best matching armor
+//      Filter armors to same class_id (same team color = same robot).
+//      Among those, compute Mahalanobis distance for each.  Distinguish:
+//        MATCH : Δpos < max_match_distance_ AND Δyaw < max_match_yaw_diff_
+//                → normal EKF update on this face.
+//        JUMP  : Δpos close BUT Δyaw ≥ max_match_yaw_diff_
+//                → robot rotated; a different face just came into view.
+//        MISS  : no armor within Δpos gate → no measurement update this frame.
+//
+//  [3] CLASSIFY & UPDATE
+//      MATCH:  Build measurement z = [x, y, z, yaw] of the matched armor.
+//              EKF update step (H·x, S, K, innovation).  Update scalar
+//              radius KF from the armor's geometrically recovered radius.
+//              Save innovation for the adaptive-damping logic in tracker_node.
+//      JUMP:   Call handleArmorJump() — re-orient state to the new face
+//              without resetting velocity.  Then update as normal.
+//      MISS:   No update; increment lost counter.
+//
+//      Secondary face fusion (use_secondary_face_fusion_):
+//        When 2 faces are visible simultaneously, fuse the secondary armor
+//        as an additional measurement with inflated R (secondary_r_inflation_)
+//        to improve yaw observability without destabilising the primary update.
+//
+//  [4] STATE MACHINE
+//      DETECTING → TRACKING  : after tracking_thres_ consecutive updates.
+//      TRACKING  → TEMP_LOST : after lost_thres frames without measurement.
+//      TEMP_LOST → LOST      : after twice lost_thres frames total.
+//      LOST                  : tracker is dead; tracker_node will remove it.
+//
+// ── predictStep() ───────────────────────────────────────────────────────────
+// Runs ONLY the EKF predict phase (no update).  Called by tracker_node BEFORE
+// global data association so all trackers' predictions are ready to compute
+// Mahalanobis assignment costs.  Sets predicted_ = true to prevent double-
+// predict inside update().
+//
+// ── computeAssignmentCost() ─────────────────────────────────────────────────
+// Returns the Mahalanobis distance from the EKF prediction to a candidate
+// armor detection.  Used by tracker_node's global assignment loop to pick the
+// best tracker for each detection (anisotropic gate, not plain Euclidean).
+//
+// ── initEKF() ───────────────────────────────────────────────────────────────
+// Seeds the 9D state vector [xc, vx, yc, vy, za, vz, yaw, vyaw, r] from a
+// single PnP pose.  Velocities initialised to zero; radius from armor geometry.
+// Resets P to a large diagonal (high uncertainty at start).
+//
+// ── handleArmorJump() ───────────────────────────────────────────────────────
+// When the robot rotates and a new face becomes visible, the state yaw must
+// jump to the new face without resetting the robot center position or velocity.
+// Computes the yaw of the new face from the robot center model, wraps it, and
+// updates the state.  dz is adapted with an EMA so the vertical offset between
+// face pairs is learned gradually (dz_adapt_alpha_).
+//
+// ── updateArmorsNum() ───────────────────────────────────────────────────────
+// Infers whether the robot has 2 or 4 armor faces from the YOLO class_id
+// (hero/engineer = 2, standard/sentry = 4).  Sets armors_num_ which controls
+// face_spacing (π vs π/2) in all geometry computations.
+// ============================================================================
+
 namespace rm_auto_aim
 {
 Tracker::Tracker(double max_match_distance, double max_track_range)
@@ -568,7 +656,11 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
       } else if (yaw_diff > max_match_yaw_diff_ && !yaw_oblique) {
         // Yaw jumped (and not oblique) — gate with relaxed Mahalanobis before accepting
         measurement = Eigen::Vector4d(p.x, p.y, p.z, measured_yaw);
-        double maha = ekf.mahalanobis(measurement);
+        // Linearize H at the measured yaw (not x_pri's yaw) for jump gating.
+        // During jumps, x_pri's yaw is ~90° off, making H maximally inaccurate.
+        Eigen::VectorXd x_jump = target_state;
+        x_jump(6) = measured_yaw;
+        double maha = ekf.mahalanobisAt(measurement, x_jump);
         if (maha < maha_jump_threshold_) {  // relaxed gate for jumps
           handleArmorJump(selected_armor);
           matched = true;
@@ -889,6 +981,16 @@ void Tracker::handleArmorJump(const Armor & current_armor)
     // Classify jump angle: [45°, 135°] = pair switch, otherwise same pair
     bool is_pair_switch = (jump_angle > M_PI / 4.0) && (jump_angle < 3.0 * M_PI / 4.0);
     if (is_pair_switch) {
+      // CRITICAL: Negate dz because the reference frame changed.
+      // dz is defined as (za_other - za_current).  After a pair switch, the roles
+      // of "current" and "other" swap, so the stored dz must be negated to stay
+      // consistent.  Without this, the EMA receives measurements with alternating
+      // sign on every pair switch, causing dz to converge toward zero on spinning
+      // robots — effectively losing the height-difference estimate.
+      if (dz_initialized_) {
+        dz = -dz;
+      }
+
       // Measure height difference between the old face (za in state) and new face
       // (current_armor.z).  EMA-smooth to reject single-frame PnP noise.
       double new_dz = target_state(4) - current_armor.pose.position.z;

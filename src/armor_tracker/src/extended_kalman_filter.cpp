@@ -4,6 +4,64 @@
 
 namespace rm_auto_aim
 {
+
+// ---------------------------------------------------------------------------
+// HOW AN EKF WORKS — general math reference for this file
+//
+// The EKF maintains a Gaussian belief over the hidden state x:
+//   mean  x_post  (best estimate after the last correction)
+//   covariance P_post  (uncertainty — large diagonal = high uncertainty)
+//
+// --- PREDICT STEP (time update) ---
+//
+//   x_pri  = f(x_post, u)
+//     f is the nonlinear motion model — integrates velocities, spins yaw, etc.
+//     x_pri is the predicted mean BEFORE seeing the new measurement.
+//
+//   F  = df/dx |_{x_post}
+//     F is the Jacobian (matrix of first-order partial derivatives) of f.
+//     It linearises f locally so we can propagate the covariance.
+//
+//   Q  = process noise covariance
+//     Models unmodelled dynamics / random disturbances (accel, wind, vibration).
+//     Larger Q → trust the motion model less, converge faster to measurements.
+//
+//   P_pri  = F * P_post * F^T + Q
+//     Propagates uncertainty through the linear approximation and adds noise.
+//
+// --- CORRECT STEP (measurement update) ---
+//
+//   y  = z - h(x_pri)
+//     z is the raw measurement (e.g. observed armor position + yaw from PnP).
+//     h is the nonlinear observation model (state → expected measurement).
+//     y is the innovation — how much the prediction was wrong.
+//
+//   H  = dh/dx |_{x_pri}
+//     Jacobian of h — linearises the observation model at the predicted state.
+//
+//   R  = measurement noise covariance
+//     Models sensor accuracy.  Larger R → trust measurements less.
+//
+//   S  = H * P_pri * H^T + R
+//     Innovation covariance — total uncertainty of the prediction in measurement
+//     space.  Used to normalise the innovation and compute Mahalanobis distance.
+//
+//   K  = P_pri * H^T * S^{-1}
+//     Kalman gain — balances how much to trust prediction vs measurement.
+//     High P_pri (uncertain prediction) → large K → lean on measurement.
+//     High R (noisy sensor) → small K → lean on prediction.
+//
+//   x_post  = x_pri + K * y
+//     Corrected mean: nudge the prediction toward the measurement by K.
+//
+//   P_post  = (I - K * H) * P_pri
+//     Corrected covariance: reduces uncertainty along the observed directions.
+//
+// The EKF approximation holds as long as f and h are nearly linear over the
+// uncertainty region.  Highly nonlinear models (e.g., fast spinning yaw) may
+// cause divergence — handled here by innovation gating and safety-net clamps.
+// ---------------------------------------------------------------------------
+
 // ---------------------------------------------------------------------------
 // Constructor — inject all nonlinear functions and set initial covariance.
 //
@@ -325,6 +383,34 @@ double ExtendedKalmanFilter::mahalanobis(const Eigen::VectorXd & z)
     return 1e9;  // degenerate S → treat as extreme outlier
   }
   // d² = yᵀ · S⁻¹ · y — squared Mahalanobis distance
+  return y.transpose() * S_ldlt.solve(y);
+}
+
+// ---------------------------------------------------------------------------
+// mahalanobisAt — Mahalanobis distance with H linearized at a custom state.
+//
+// Same as mahalanobis() but evaluates the Jacobian H = ∂h/∂x at
+// x_linearize instead of x_pri.  Innovation y = z − h(x_pri) still
+// uses x_pri (nonlinear prediction, correct).
+//
+// USE CASE: Armor jumps.  During a jump, x_pri's yaw is ~90° away from
+// the measured yaw.  H contains terms like r·sin(yaw) and -r·cos(yaw),
+// which are maximally wrong at 90° offset.  Linearizing at the measured
+// yaw (via x_linearize) gives a realistic S, producing a more accurate
+// Mahalanobis distance for jump gating decisions.
+// ---------------------------------------------------------------------------
+double ExtendedKalmanFilter::mahalanobisAt(
+  const Eigen::VectorXd & z, const Eigen::VectorXd & x_linearize)
+{
+  if (!z.allFinite()) return 1e9;
+  Eigen::MatrixXd H_tmp = jacobian_h(x_linearize);
+  Eigen::MatrixXd R_tmp = update_R(z);
+  Eigen::MatrixXd S = H_tmp * P_pri * H_tmp.transpose() + R_tmp;
+  Eigen::VectorXd y = z - h(x_pri);
+  Eigen::LDLT<Eigen::MatrixXd> S_ldlt(S);
+  if (S_ldlt.info() != Eigen::Success || !S_ldlt.isPositive()) {
+    return 1e9;
+  }
   return y.transpose() * S_ldlt.solve(y);
 }
 

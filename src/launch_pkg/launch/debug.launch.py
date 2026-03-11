@@ -290,6 +290,7 @@ def generate_launch_description():
             {'ekf.coast_damping_factor': 0.85},      # extra damping multiplier during TEMP_LOST coasting
             {'ekf.damping_innov_threshold': 0.10},   # [m] position innovation above which overshoot damping activates
             {'ekf.yaw_innov_threshold': 0.15},       # [rad] yaw innovation above which yaw damping activates
+            {'ekf.ref_frequency': 30.0},              # [Hz] reference frame rate for time-normalization
             # Gimbal TF
             {'gimbal.height': .325},                 # [m] gimbal pivot height above ground
             {'gimbal.yaw_sign': 1.0},                # sign flip for yaw axis (+1 or -1)
@@ -324,6 +325,7 @@ def generate_launch_description():
             # Acceleration estimator
             {'accel_ema_alpha': 0.3},                # EMA smoothing for target acceleration estimate (0–1)
             {'max_accel': 6.0},                      # [m/s²] clamp on estimated acceleration
+            {'ref_frequency': 30.0},                  # [Hz] reference frame rate for time-normalization
             {'latency_gate_sigma': 2.5},             # sigma multiplier for timing tolerance in indirect mode
             # Indirect mode (fast-spinning targets)
             {'indirect_vyaw_threshold': 3.0},        # [rad/s] spin rate above which indirect aiming activates

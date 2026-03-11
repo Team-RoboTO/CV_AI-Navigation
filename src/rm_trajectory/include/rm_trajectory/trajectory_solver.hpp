@@ -133,6 +133,7 @@ private:
   double ax_ema_ = 0.0, ay_ema_ = 0.0, az_ema_ = 0.0;      // EMA-smoothed acceleration (fallback)
   double accel_ema_alpha_;                // EMA weight (higher = more responsive, noisier)
   double max_accel_;                      // Clamp on raw accel (rejects EKF jumps)
+  double ref_frequency_;                  // [Hz] reference frame rate for time-normalization
 
   // --- Latency EMA with outlier rejection ---
   // Tracks pipeline delay (camera → YOLO → EKF → here) as an EMA of
@@ -171,8 +172,8 @@ private:
   // caused by EKF measurement noise.  Resets on tracker ID change.
   double cmd_smooth_alpha_;                // EMA weight (0→max smooth, 1→no smooth)
   double max_cmd_angle_;                   // Hard clamp: max |relative cmd| per frame [deg]
-  double smoothed_rel_yaw_ = 0.0;         // EMA state for yaw command [rad]
-  double smoothed_rel_pitch_ = 0.0;       // EMA state for pitch command [rad]
+  double smoothed_abs_yaw_ = 0.0;         // EMA state for absolute target yaw [rad]
+  double smoothed_abs_pitch_ = 0.0;       // EMA state for absolute target pitch [rad]
   bool cmd_smooth_initialized_ = false;   // First-frame flag
 
   // Compute when a spinning armor face will next point at the camera.

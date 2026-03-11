@@ -10,6 +10,106 @@
 #include <vector>
 #include <opencv2/calib3d.hpp>
 
+// ============================================================================
+// HOW TO READ THIS FILE
+// ============================================================================
+//
+// ── CONSTRUCTOR ─────────────────────────────────────────────────────────────
+// Declares all ROS parameters (tracker gates, EKF sigmas, gimbal signs, etc.),
+// creates publishers/subscribers, builds the EKF F/H/Q/R matrices via
+// initEKF(), and sets up TF2 infrastructure (buffer + broadcaster).
+//
+// ── CALLBACKS (run in the ROS executor spin loop) ───────────────────────────
+//   microPoseCallback  – receives gimbal yaw/pitch from the lower computer
+//                        (/micro_pose).  Stores angles and calls
+//                        broadcastGimbalTF() to keep TF2 current.
+//   imuCallback        – receives D455 IMU gyro.  EMA-filters the angular
+//                        velocity, rotates it into chassis frame, subtracts
+//                        gimbal velocity (finite-diff), integrates to get
+//                        chassis yaw/pitch for world-frame compensation.
+//   armorsCallback     – MAIN PIPELINE (see below).
+//
+// ── broadcastGimbalTF ───────────────────────────────────────────────────────
+// Composes: T(odom→camera) = chassis_R(IMU) × gimbal_R(lower_computer) × optical_convention
+// Writes the transform into both tf2_buffer_ (immediate lookup in same callback)
+// and /tf topic (for rviz, other nodes).  Without this, every gimbal move
+// looks like target motion to the EKF.
+//
+// ── armorsCallback ──────────────────────────────────────────────────────────-
+//
+//  [0] Broadcast fresh gimbal TF so this frame's lookupTransform is accurate.
+//
+//  [1] YOLO bbox → Armor (2D → structured)
+//      • Subtract letterbox padding (bbox_padding_y_) from Y — the DNN
+//        encoder pads 480-tall images to 640×640, shifting all Y coords.
+//      • Filter by YOLO class_id (skip teammates, dead robots).
+//      • Determine plate type (SMALL / LARGE) from bbox aspect ratio > 1.5.
+//      • Scale bbox inward by light_ratio_ (~0.85) to approximate the 4
+//        light-bar corner positions YOLO doesn't explicitly give us.
+//
+//  [2] PnP solve (2D → 3D, camera frame)
+//      • pnp_solver_->solvePnP() uses solvePnP() (OpenCV) with the 4
+//        approximated light-bar corners and the known real-world armor
+//        dimensions → outputs rvec (Rodrigues rotation) + tvec (translation
+//        in metres, camera frame: x-right, y-down, z-forward).
+//      • Convert rvec → quaternion for ROS; drop degenerate results (|q|≈0).
+//
+//  [3] TF2 transform (camera frame → odom frame)
+//      • lookupTransform("odom", "camera_color_optical_frame") gives the
+//        live camera pose in the world.
+//      • tf2::doTransform applies it to every armor pose so all positions are
+//        in the same world-fixed odom frame for EKF association and tracking.
+//
+//  [4] Sanity filter
+//      • Drop armors with |z| > 1.2 m (physically too high) or planar
+//        distance > max_armor_distance_ (too far away).
+//
+//  [5] STEP 1 — Adaptive damping + predictStep()
+//      • Per-tracker: compute innovation vs velocity dot-product.
+//        Overshoot (dot < 0) → reduce alpha (stronger velocity decay).
+//        Moving & no overshoot → alpha = 1.0 (trust velocity).
+//        Stationary → baseline alpha (gentle decay).
+//        TEMP_LOST → coast alpha × coast_damping_factor_ (aggressive decay).
+//      • Call tracker.predictStep() to advance EKF state forward by dt_.
+//        Predict happens BEFORE association so predictions are fresh.
+//
+//  [6] STEP 2 — Global data association (Mahalanobis assignment)
+//      • For each detection find the ONE tracker with lowest Mahalanobis
+//        distance (uses tracker P covariance → anisotropic gate, not just
+//        Euclidean radius).  DETECTING trackers penalised ×4 so established
+//        TRACKING trackers win ties.
+//      • Each detection assigned to at most one tracker (detection_owner[]).
+//
+//  [7] STEP 3 — Update / coast
+//      • Tracker has detections → tracker.update() feeds them into the EKF;
+//        promotes DETECTING → TRACKING after tracking_thres_ hits.
+//      • Tracker has no detections → increments lost counter; TRACKING →
+//        TEMP_LOST → LOST as lost_time_thres_ is exceeded.
+//
+//  [8] STEP 4 — Spawn new trackers for unmatched detections
+//      • If total tracks < max_trackers_ and the detection is far enough
+//        from all existing trackers (new_tracker_min_dist_), call
+//        createTracker() which initialises a fresh EKF from the 3D pose.
+//
+//  [9] STEP 5 — Best-target selection & publish
+//      • Score each TRACKING tracker: score = range × state_penalty
+//        (+ v_yaw variance bonus).  Lowest score wins.
+//      • fillTargetMsg() packs EKF state + EMA-smoothed acceleration into
+//        the Target message.
+//      • Publish /tracker/target (legacy, single best) and /tracker/targets
+//        (all active trackers).  Also publishes the optimal 2D bbox
+//        (/detections_output/optimal_target) and RViz markers.
+//
+// ── HELPER METHODS ──────────────────────────────────────────────────────────
+//   initEKF()        – builds shared EKF matrices (F, H, Q, R).
+//   createTracker()  – factory: allocates Tracker, injects EKF matrices and
+//                      per-tracker damping alphas, calls tracker.init().
+//   fillTargetMsg()  – converts EKF state vector → Target ROS message,
+//                      computes EMA acceleration.
+//   publishMarkers() – emits rviz markers (position sphere, velocity arrows,
+//                      armor cubes).
+// ============================================================================
+
 namespace rm_auto_aim
 {
 ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
@@ -97,6 +197,7 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   // signal is now ~3× cleaner so the same α yields less distortion.
   // Higher → more responsive to real acceleration, noisier.
   // Lower → smoother, but more phase lag on maneuvering targets.
+  ref_frequency_   = declare_parameter("ekf.ref_frequency", 30.0);
   accel_ema_alpha_ = declare_parameter("ekf.accel_ema_alpha", 0.3);
   s2qxyz_ = declare_parameter("ekf.sigma2_q_xyz", 5.0);
   s2qyaw_ = declare_parameter("ekf.sigma2_q_yaw", 10.0);
@@ -237,6 +338,9 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   enable_imu_compensation_ = declare_parameter("imu.enable", true);
   imu_gyro_alpha_ = declare_parameter("imu.gyro_alpha", 0.3);
   imu_timeout_ = declare_parameter("imu.timeout", 0.1);
+  gyro_bias_alpha_ = declare_parameter("imu.gyro_bias_alpha", 0.005);
+  gyro_stationary_threshold_ = declare_parameter("imu.gyro_stationary_threshold", 0.03);
+  gyro_stationary_min_frames_ = declare_parameter("imu.gyro_stationary_min_frames", 30);
 
   imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
     "/imu", rclcpp::SensorDataQoS(),
@@ -338,9 +442,22 @@ void ArmorTrackerNode::imuCallback(const sensor_msgs::msg::Imu::ConstSharedPtr m
   double chassis_wy = omega_c_in_chassis.y() - gimbal_wy;
   double chassis_wz = omega_c_in_chassis.z() - gimbal_wz;
 
+  // Gyro bias estimation: during low-motion periods (|omega| < threshold for
+  // gyro_stationary_min_frames_ consecutive frames), the measured angular velocity
+  // is pure bias. Update bias estimate via slow EMA, then subtract before integration.
+  if (std::abs(chassis_wz) < gyro_stationary_threshold_ &&
+      std::abs(chassis_wy) < gyro_stationary_threshold_) {
+    if (++gyro_stationary_count_ >= gyro_stationary_min_frames_) {
+      gyro_bias_wz_ = gyro_bias_alpha_ * chassis_wz + (1.0 - gyro_bias_alpha_) * gyro_bias_wz_;
+      gyro_bias_wy_ = gyro_bias_alpha_ * chassis_wy + (1.0 - gyro_bias_alpha_) * gyro_bias_wy_;
+    }
+  } else {
+    gyro_stationary_count_ = 0;
+  }
+  chassis_wz -= gyro_bias_wz_;
+  chassis_wy -= gyro_bias_wy_;
+
   // Euler integration of chassis rotation.
-  // Accumulates over time — note: no drift correction, so this will
-  // slowly accumulate error over minutes of operation.
   chassis_yaw_ += chassis_wz * dt;
   chassis_pitch_ += chassis_wy * dt;
 
@@ -734,7 +851,7 @@ void ArmorTrackerNode::armorsCallback(
       // Overshoot test: if position innovation (measurement − prediction) points
       // opposite to the velocity, the EKF overshot.  dot < 0 means they oppose.
       double dot = tracker.info_position_innov.dot(vel);
-      bool pos_overshoot = (dot < 0.0) && (speed > 0.3);
+      bool pos_overshoot = (dot < 0.0) && (speed > 0.3); // pointing in different directions and speed is relevant.
 
       if (pos_overshoot) {
         // Scale damping strength by how large the innovation is relative to
@@ -866,16 +983,28 @@ void ArmorTrackerNode::armorsCallback(
     bool too_close = false;
     for (auto & kv : trackers_) {
       auto & tracker = *kv.second;
+      // Skip LOST trackers — they have stale state and will be pruned shortly,
+      // so they should not block spawning a fresh tracker nearby.
       if (tracker.tracker_state == Tracker::LOST) continue;
+      // Compute Euclidean distance between the unassigned detection and this
+      // tracker's estimated robot center (xc = state(0), yc = state(2), za = state(4)).
+      // We use plain Euclidean rather than Mahalanobis because two robots that
+      // happen to face different directions can have wildly different yaw, which
+      // would inflate Mahalanobis even if they are physically close in XYZ.
       double dx = armor.pose.position.x - tracker.target_state(0);
       double dy = armor.pose.position.y - tracker.target_state(2);
       double ddz = armor.pose.position.z - tracker.target_state(4);
       if (std::sqrt(dx * dx + dy * dy + ddz * ddz) < new_tracker_min_dist_) {
+        // Detection is within the exclusion radius of an existing tracker:
+        // do NOT spawn a duplicate tracker — the detection may be a second
+        // armor plate of the same robot or a momentary misdetection.
         too_close = true;
         break;
       }
     }
+    // Guard 1: skip if there is already a live tracker covering this region.
     if (too_close) continue;
+    // Guard 2: hard cap on concurrent trackers to bound CPU and memory usage.
     if (static_cast<int>(trackers_.size()) >= max_trackers_) continue;
 
     auto new_tracker = createTracker();
@@ -1072,13 +1201,12 @@ std::unique_ptr<Tracker> ArmorTrackerNode::createTracker()
   //   pos_new = pos + v_damped × dt
   //   v_new   = v × damping_factor
   //
-  // Damping factor is time-adjusted: b = alpha^(dt / dt_nominal).
-  //   At 30Hz (dt=33ms, nominal): b = alpha^1 = alpha
-  //   At 60Hz (dt=16ms):          b = alpha^0.5 ≈ sqrt(alpha) — weaker per frame
-  //   At 15Hz (dt=66ms):          b = alpha^2 — stronger per frame
+  // Damping factor is time-adjusted: b = alpha^(dt * ref_frequency_).
+  //   At ref_frequency_ Hz (nominal): b = alpha^1 = alpha
+  //   At 2× ref:                      b = alpha^0.5 ≈ sqrt(alpha) — weaker per frame
+  //   At ½× ref:                      b = alpha^2 — stronger per frame
   // This keeps the effective decay rate (per second) constant regardless of
-  // frame rate.  Without time-adjustment, running at 60Hz would halve the
-  // damping compared to 30Hz.
+  // frame rate.
   //
   // State layout: [xc, v_xc, yc, v_yc, za, v_za, yaw, v_yaw, r]
   //                 0    1     2    3     4    5     6     7     8
@@ -1086,8 +1214,8 @@ std::unique_ptr<Tracker> ArmorTrackerNode::createTracker()
   auto f = [this, tracker_ptr](const Eigen::VectorXd & x) {
     Eigen::VectorXd x_new = x;
     // Time-adjusted damping factors (see explanation above)
-    double b = std::pow(tracker_ptr->xyz_damping_alpha, dt_ / (1.0 / 30.0));  // XYZ decay
-    double a = std::pow(tracker_ptr->yaw_damping_alpha, dt_ / (1.0 / 30.0));  // Yaw decay
+    double b = std::pow(tracker_ptr->xyz_damping_alpha, dt_ * ref_frequency_);  // XYZ decay
+    double a = std::pow(tracker_ptr->yaw_damping_alpha, dt_ * ref_frequency_);  // Yaw decay
     // Apply velocity decay (models friction / resistance)
     double damped_vx   = x(1) * b;    // v_xc after damping
     double damped_vy   = x(3) * b;    // v_yc after damping
@@ -1122,8 +1250,8 @@ std::unique_ptr<Tracker> ArmorTrackerNode::createTracker()
   //          vel depends only on old vel (b ×, decayed).
   // -----------------------------------------------------------------------
   auto j_f = [this, tracker_ptr](const Eigen::VectorXd &) {
-    double b = std::pow(tracker_ptr->xyz_damping_alpha, dt_ / (1.0 / 30.0));
-    double a = std::pow(tracker_ptr->yaw_damping_alpha, dt_ / (1.0 / 30.0));
+    double b = std::pow(tracker_ptr->xyz_damping_alpha, dt_ * ref_frequency_);
+    double a = std::pow(tracker_ptr->yaw_damping_alpha, dt_ * ref_frequency_);
     Eigen::MatrixXd f(9, 9);
     //              xc   v_xc  yc   v_yc  za   v_za  yaw  v_yaw  r
     // clang-format off
@@ -1459,11 +1587,11 @@ void ArmorTrackerNode::fillTargetMsg(
     //   α_dt = 1 − (1 − α)^(dt / dt_nominal)
     //   ema[k] = α_dt · clamp(raw) + (1 − α_dt) · ema[k-1]
     //
-    // WHY TIME-ADJUSTED:  If the camera runs at 60Hz instead of 30Hz,
-    // each sample covers half the time interval.  Without adjustment,
-    // the EMA would filter twice as aggressively (lower bandwidth).
-    // The formula α_dt = 1−(1−α)^(dt/dt_ref) normalizes to a reference
-    // frame rate (30 Hz), keeping the bandwidth consistent regardless
+    // WHY TIME-ADJUSTED:  If the camera runs at a different rate than
+    // ref_frequency_, each sample covers a different time interval.
+    // Without adjustment, the EMA bandwidth would change with frame rate.
+    // The formula α_dt = 1−(1−α)^(dt*ref_frequency_) normalizes to the
+    // reference frame rate, keeping the bandwidth consistent regardless
     // of actual frame timing.
     //
     // WHY CLAMP TO ±12 m/s²:  RoboMaster robots can accelerate at
@@ -1482,7 +1610,18 @@ void ArmorTrackerNode::fillTargetMsg(
       double raw_ax = (state(1) - tracker.prior_vx) / dt_;
       double raw_ay = (state(3) - tracker.prior_vy) / dt_;
       double raw_az = (state(5) - tracker.prior_vz) / dt_;
-      double alpha_dt = 1.0 - std::pow(1.0 - accel_ema_alpha_, dt_ / (1.0 / 30.0));
+      // Remove phantom acceleration caused by velocity damping.
+      // v_prior = b * v_prev (damped), so raw_accel includes (1-b)*v_prev/dt artifact.
+      // Correction: subtract v_prior * (1/b - 1) / dt.
+      // Verification: constant v → raw = v(1-b)/dt, corr = v(1-b)/dt → result = 0.
+      double b_xyz = std::pow(tracker.xyz_damping_alpha, dt_ * ref_frequency_);
+      if (b_xyz > 1e-6) {
+        double corr = (1.0 / b_xyz - 1.0) / dt_;
+        raw_ax -= tracker.prior_vx * corr;
+        raw_ay -= tracker.prior_vy * corr;
+        raw_az -= tracker.prior_vz * corr;
+      }
+      double alpha_dt = 1.0 - std::pow(1.0 - accel_ema_alpha_, dt_ * ref_frequency_);
       auto clamp = [](double v, double lim) { return std::max(-lim, std::min(v, lim)); };
       tracker_ax_ema_[tid] = alpha_dt * clamp(raw_ax, 12.0) + (1.0 - alpha_dt) * tracker_ax_ema_[tid];
       tracker_ay_ema_[tid] = alpha_dt * clamp(raw_ay, 12.0) + (1.0 - alpha_dt) * tracker_ay_ema_[tid];

@@ -95,7 +95,8 @@ private:
 
   // The time when the last message was received
   rclcpp::Time last_time_;
-  double dt_ = 1.0 / 30.0;
+  double ref_frequency_ = 30.0;          // [Hz] reference frame rate for time-normalization
+  double dt_ = 1.0 / ref_frequency_;
 
   // --- EKF noise model parameters (used in createTracker lambdas) ---
   double s2qxyz_, s2qyaw_, s2qr_;    // Process noise σ² for xyz, yaw, radius
@@ -228,6 +229,13 @@ private:
   bool enable_imu_compensation_ = true;  // Master enable for chassis compensation
   double imu_gyro_alpha_ = 0.3;          // EMA weight for gyro low-pass filter
   double imu_timeout_ = 0.1;             // Staleness threshold for IMU data [s]
+  // Gyro bias estimation: corrects IMU drift during low-motion periods
+  double gyro_bias_wz_ = 0.0;
+  double gyro_bias_wy_ = 0.0;
+  double gyro_bias_alpha_;               // Slow EMA weight (default 0.005)
+  double gyro_stationary_threshold_;     // Low-motion threshold [rad/s] (default 0.03)
+  int gyro_stationary_count_ = 0;        // Consecutive low-motion frames
+  int gyro_stationary_min_frames_;       // Frames before bias updates begin (default 30)
 
   // Visualization marker publisher
   visualization_msgs::msg::Marker position_marker_;

@@ -172,62 +172,50 @@ std::tuple<double, double, bool> TrajectorySolverNode::solveTrajectory(
     return {0.0, 0.0, false};
   }
 
-  // Seed: assume bullet travels horizontally at full speed (no drag, no gravity).
-  // WHY THIS SEED: it gives a lower-bound flight time (reality is always longer
-  // because drag slows the bullet and pitch lengthens the path).  Starting from
-  // an underestimate converges monotonically upward — more stable than starting
-  // from an overestimate which can oscillate.
+
+  // Seed: assume bullet travels horizontally at full speed (no drag, no gravity).           
+  // WHY THIS SEED: it gives a lower-bound flight time (reality is always longer             
+  // because drag slows the bullet and pitch lengthens the path).  Starting from      
+  // an underestimate converges monotonically upward — more stable than starting             
+  // from an overestimate which can oscillate.   
   double t = ground_dist / v;
   double pitch = 0.0;
-  // WHY 10 max iterations: convergence typically takes 3-5 iterations (verified
-  // empirically over ranges 0.5-8m).  10 is a generous safety margin that
-  // handles extreme cases (high arcs, strong drag) without infinite-looping.
+  // WHY 10 max iterations: convergence typically takes 3-5 iterations (verified      
+// empirically over ranges 0.5-8m).  10 is a generous safety margin that            
+// handles extreme cases (high arcs, strong drag) without infinite-looping.   
   const int max_iter = 10;
 
   for (int i = 0; i < max_iter; i++) {
-    // Step 1: how much does gravity pull the bullet down over t seconds?
-    // The barrel must point high enough to compensate for this drop.
+    // Step 1 (vertical): pitch to compensate gravity drop over t seconds.
+    //   z(t) = v·sin(pitch)·t − ½g·t²  =  target_z
+    //   ⇒  pitch = atan2(target_z + ½g·t², ground_dist)
     double dz = 0.5 * gravity_ * t * t;
     pitch = std::atan2(target_z + dz, ground_dist);
 
-    // Clamp pitch to physical gimbal limits (avoids cos(pitch)→0 and unreachable angles)
     if (pitch > gimbal_pitch_max_) pitch = gimbal_pitch_max_;
     else if (pitch < gimbal_pitch_min_) pitch = gimbal_pitch_min_;
 
-    // Step 2: actual path length is longer than ground_dist because of pitch
-    double cos_pitch = std::cos(pitch);
-    double path_len = ground_dist / cos_pitch;
-
-    // Effective bullet speed accounting for air drag.
+    // Step 2 (horizontal): solve for flight time from horizontal drag equation.
+    //   v_h = v·cos(pitch)  (horizontal muzzle velocity component)
     //
-    // Drag slows the bullet during flight, so the average speed is less
-    // than the muzzle velocity.  We compute v_eff = (distance / time),
-    // which gives us the time-averaged speed to use in the next iteration.
-    //
-    // Two models:
-    //   LINEAR (default):   F = -k·v  →  v(t) = v0·e^(-kt)
-    //     Mean speed = v0·(1 − e^(-kt)) / (kt)
-    //     k is in [1/s], typical value ~0.01
-    //
-    //   QUADRATIC:           F = -c·v²  →  v(t) = v0 / (1 + v0·c·t)
-    //     Mean speed = ln(1 + v0·c·t) / (c·t)
-    //     c is in [1/m], different physical unit than linear k!
-    double v_eff;
-    if (use_quadratic_drag_) {
-      double v_h = v * std::cos(pitch);  // horizontal component of muzzle velocity
-      double ct = k_ * v_h * t;
-      v_eff = (ct > 1e-6) ? std::log(1.0 + ct) / (k_ * t) : v_h;
+    //   No drag:    ground_dist = v_h·t             ⇒  t = d / v_h
+    //   Linear:     ground_dist = v_h·(1−e^(−kt))/k ⇒  t = −ln(1 − k·d/v_h) / k
+    //   Quadratic:  ground_dist = ln(1+k·v_h·t)/k   ⇒  t = (e^(k·d) − 1) / (k·v_h)
+    double v_h = v * std::cos(pitch);
+    double new_t;
+    if (k_ < 1e-6) {
+      new_t = ground_dist / v_h;
+    } else if (use_quadratic_drag_) {
+      new_t = (std::exp(k_ * ground_dist) - 1.0) / (k_ * v_h);
     } else {
-      double kt = k_ * t;
-      v_eff = (kt > 1e-6) ? v * (1.0 - std::exp(-kt)) / kt : v;
+      double alpha = k_ * ground_dist / v_h;
+      if (alpha >= 1.0) {
+        return {pitch, ground_dist / v_h, false};
+      }
+      new_t = -std::log(1.0 - alpha) / k_;
     }
 
-    // Refine flight-time estimate
-    double new_t = path_len / v_eff;
-    // WHY 1e-4 (0.1ms): at 25 m/s muzzle velocity, 0.1ms flight-time error
-    // corresponds to ~2.5mm position error — well below PnP noise (~5cm).
-    // Tighter convergence wastes CPU with no measurable accuracy gain.
-    if (std::abs(new_t - t) < 1e-4) {  // converged (< 0.1 ms change)
+    if (std::abs(new_t - t) < 1e-4) {
       t = new_t;
       break;
     }

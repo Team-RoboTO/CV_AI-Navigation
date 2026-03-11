@@ -104,6 +104,11 @@ public:
   // Returns (z - h(x_pri))^T S^{-1} (z - h(x_pri)) where S = H P_pri H^T + R.
   double mahalanobis(const Eigen::VectorXd & z);
 
+  // Mahalanobis distance with H linearized at a custom point.
+  // For armor jumps where x_pri's yaw is ~90° off, linearizing at
+  // the measured yaw produces a more accurate innovation covariance.
+  double mahalanobisAt(const Eigen::VectorXd & z, const Eigen::VectorXd & x_linearize);
+
   // Get posterior variance of a single state element
   double getVariance(int idx) const { return P_post(idx, idx); }
 
