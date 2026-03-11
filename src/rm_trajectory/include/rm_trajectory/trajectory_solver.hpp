@@ -73,6 +73,24 @@ private:
   double k_;               // Air resistance coefficient
   double time_bias_;       // Adaptive latency compensation (EMA)
   double time_bias_alpha_; // EMA smoothing factor for time_bias_
+  // ---------------------------------------------------------------------------
+  // Gimbal response delay — constant offset added to the prediction horizon.
+  //
+  // PROBLEM: time_bias_ models camera→solver latency (measured via EMA), but
+  // the additional delay from solver→serial→gimbal PID response is NOT
+  // captured.  The gimbal doesn't instantly reach the commanded angle — the
+  // STM32 reads the UART packet, the PID loop settles, and the motor moves.
+  //
+  // IMPACT: At 1 m/s target speed and 15ms unmodeled gimbal delay, the bullet
+  // hits 15mm behind the target — a systematic bias that cannot be tuned away
+  // with angular_window because it's directional (always behind, never ahead).
+  //
+  // SOLUTION: total_prediction_time = t_flight + time_bias_ + gimbal_response_delay_
+  // Default 0.0 (no change until measured on real hardware).
+  // TUNING: Start at 0, increase in 5ms steps while observing systematic aim
+  // offset on a moving target.  Typical value: 10-20ms.
+  // ---------------------------------------------------------------------------
+  double gimbal_response_delay_;
   double gimbal_height_;   // Barrel height above odom origin (metres)
   double min_fire_dist_;   // Minimum engagement range (metres)
   double max_fire_dist_;   // Maximum engagement range (metres)
@@ -86,14 +104,33 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr twist_pub_;
 
   // --- Acceleration estimation (2nd-order motion model) ---
-  // The EKF only provides position + velocity.  We differentiate consecutive
-  // velocity readings and smooth with a time-adjusted EMA to get acceleration,
-  // which improves target prediction for accelerating/decelerating robots.
-  bool has_prev_target_ = false;          // First frame flag
+  //
+  // The solver uses acceleration to predict where the target will be at
+  // bullet impact time: pos(t) = pos + vel·t + ½·accel·t².
+  //
+  // Two modes are available:
+  //
+  //   use_msg_acceleration_ = true (DEFAULT, RECOMMENDED):
+  //     Read acceleration directly from msg->acceleration, which the tracker
+  //     computes via the innovation-based method (v_posterior - v_prior) / dt.
+  //     This is ~3× less noisy than finite-differencing (see Target.msg
+  //     comments for the math) and has no additional phase lag because the
+  //     EMA is applied at the source (in the tracker).
+  //
+  //   use_msg_acceleration_ = false (FALLBACK):
+  //     Differentiates consecutive EKF velocity outputs and EMA-smooths.
+  //     This is the legacy approach, kept as a safety net in case the
+  //     tracker-published acceleration proves worse in real testing.
+  //     To switch: ros2 param set /trajectory_solver use_msg_acceleration false
+  //
+  // When use_msg_acceleration_=true, the fallback members (prev_vx_, ax_ema_,
+  // etc.) are still updated each frame so a runtime switch is seamless.
+  bool use_msg_acceleration_;             // Use tracker-published acceleration
+  bool has_prev_target_ = false;          // First frame flag (fallback mode)
   int32_t prev_tracker_id_ = -1;          // Track identity switches to reset accel EMA
   rclcpp::Time prev_target_time_;         // Timestamp of previous target message
-  double prev_vx_ = 0.0, prev_vy_ = 0.0, prev_vz_ = 0.0;  // Previous velocities
-  double ax_ema_ = 0.0, ay_ema_ = 0.0, az_ema_ = 0.0;      // EMA-smoothed acceleration
+  double prev_vx_ = 0.0, prev_vy_ = 0.0, prev_vz_ = 0.0;  // Previous velocities (fallback)
+  double ax_ema_ = 0.0, ay_ema_ = 0.0, az_ema_ = 0.0;      // EMA-smoothed acceleration (fallback)
   double accel_ema_alpha_;                // EMA weight (higher = more responsive, noisier)
   double max_accel_;                      // Clamp on raw accel (rejects EKF jumps)
 

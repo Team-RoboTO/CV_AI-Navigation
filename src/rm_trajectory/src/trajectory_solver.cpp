@@ -45,6 +45,12 @@ TrajectorySolverNode::TrajectorySolverNode(const rclcpp::NodeOptions &options)
   time_bias_       = this->declare_parameter("time_bias",        0.08);  // Initial pipeline latency estimate [s]
   time_bias_alpha_ = this->declare_parameter("time_bias_alpha",  0.35);  // EMA learning rate for latency
   latency_gate_sigma_ = this->declare_parameter("latency_gate_sigma", 2.5);  // Outlier rejection: N·σ from mean
+  // Gimbal response delay: constant offset modeling the solver→serial→gimbal
+  // PID latency that time_bias_ (camera→solver only) does not capture.
+  // Default 0.0 — no compensation until measured on real hardware.
+  // At 1 m/s target speed, every 1ms of unmodeled delay = 1mm systematic miss.
+  // See trajectory_solver.hpp for full motivation and tuning guide.
+  gimbal_response_delay_ = this->declare_parameter("gimbal_response_delay", 0.0);
 
   // --- Fire gate parameters ---
   min_fire_dist_   = this->declare_parameter("min_fire_dist",    0.5);   // Minimum engagement range [m]
@@ -54,8 +60,17 @@ TrajectorySolverNode::TrajectorySolverNode(const rclcpp::NodeOptions &options)
   max_measurement_age_         = this->declare_parameter("max_measurement_age",          0.10);  // Suppress fire if last detection older than this [s]
 
   // --- Acceleration estimation ---
-  accel_ema_alpha_ = this->declare_parameter("accel_ema_alpha", 0.3);   // EMA weight for velocity→accel differentiation
-  max_accel_       = this->declare_parameter("max_accel",       12.0);  // Clamp raw accel to reject EKF jumps [m/s²]
+  // use_msg_acceleration: when true (default), use the tracker's innovation-based
+  // acceleration published in msg->acceleration.  This is ~3× less noisy than the
+  // fallback finite-difference approach (see Target.msg and trajectory_solver.hpp
+  // comments for detailed noise analysis).
+  // Set to false to revert to legacy behavior if tracker-side accel proves problematic.
+  use_msg_acceleration_ = this->declare_parameter("use_msg_acceleration", true);
+  // Fallback parameters — used only when use_msg_acceleration=false.
+  // accel_ema_alpha: EMA weight for finite-differenced velocity → acceleration.
+  // max_accel: clamp on raw acceleration to reject EKF state jumps.
+  accel_ema_alpha_ = this->declare_parameter("accel_ema_alpha", 0.3);
+  max_accel_       = this->declare_parameter("max_accel",       12.0);
 
   // --- Indirect mode (fast spinners) ---
   indirect_vyaw_threshold_    = this->declare_parameter("indirect_vyaw_threshold",    3.0);   // Switch to indirect above this |v_yaw| [rad/s]
@@ -453,41 +468,63 @@ void TrajectorySolverNode::targetCallback(
   double vx = msg->velocity.x, vy = msg->velocity.y, vz = msg->velocity.z;
 
   // -------------------------------------------------------------------------
-  // Acceleration estimation — EMA of finite-difference velocity derivatives
+  // Acceleration estimation — used for 2nd-order kinematic prediction:
+  //   predicted_position(t) = pos + vel·t + ½·accel·t²
   //
-  // The EKF state only carries velocity, not acceleration.  We estimate
-  // acceleration by differencing consecutive velocity readings and then
-  // smoothing with an EMA to suppress noise.
+  // Two modes (selected by the `use_msg_acceleration` ROS parameter):
   //
-  // Time-adjusted alpha: α_dt = 1 − (1−α)^(dt / dt_nominal)
-  //   This keeps the filter bandwidth consistent regardless of whether frames
-  //   arrive at 30 Hz or 60 Hz (normalised to a 30 Hz reference).
+  //   PRIMARY (use_msg_acceleration_=true):
+  //     Read directly from msg->acceleration, computed by the tracker node
+  //     using the innovation-based method: (v_posterior − v_prior) / dt.
+  //     This signal is ~3× less noisy than finite-differencing because the
+  //     Kalman gain K acts as an adaptive filter on the velocity correction.
+  //     (See Target.msg and tracker_node.cpp fillTargetMsg for detailed math.)
   //
-  // Raw acceleration estimates are clamped to max_accel_ before filtering to
-  // reject sensor glitches or large EKF jumps.
+  //   FALLBACK (use_msg_acceleration_=false):
+  //     Legacy approach: differentiate consecutive velocity readings and
+  //     EMA-smooth.  Kept as a safety net.  Noisier (σ_a ≈ 0.8 m/s² vs
+  //     0.25 m/s² for innovation-based) and laggier (EMA adds ~78ms phase
+  //     lag), but completely independent of the tracker node's acceleration
+  //     computation — useful for debugging or if the tracker-side code
+  //     has a bug.
+  //
+  // NOTE: prev_vx_/vy_/vz_ and ax_ema_/ay_ema_/az_ema_ are always updated
+  // regardless of mode, so switching between modes at runtime is seamless.
   // -------------------------------------------------------------------------
   double ax = 0.0, ay = 0.0, az = 0.0;
-  if (has_prev_target_) {
-    double dt_tgt = (rclcpp::Time(msg->header.stamp) - prev_target_time_).seconds();
-    // WHY [5ms, 200ms]: below 5ms the velocity difference is dominated by
-    // floating-point noise → huge artificial acceleration.  Above 200ms a
-    // frame was clearly dropped; the velocity jump spans multiple frames and
-    // the finite-difference acceleration is no longer valid.
-    if (dt_tgt > 0.005 && dt_tgt < 0.2) {
-      auto clamp = [this](double val) {
-        return std::max(-max_accel_, std::min(val, max_accel_));
-      };
-      // Time-adjusted alpha: consistent bandwidth regardless of frame rate
-      double alpha_dt = 1.0 - std::pow(1.0 - accel_ema_alpha_, dt_tgt / (1.0 / 30.0));
-      ax_ema_ = alpha_dt * clamp((vx - prev_vx_) / dt_tgt)
-                + (1.0 - alpha_dt) * ax_ema_;
-      ay_ema_ = alpha_dt * clamp((vy - prev_vy_) / dt_tgt)
-                + (1.0 - alpha_dt) * ay_ema_;
-      az_ema_ = alpha_dt * clamp((vz - prev_vz_) / dt_tgt)
-                + (1.0 - alpha_dt) * az_ema_;
+  if (use_msg_acceleration_) {
+    // Innovation-based acceleration from the tracker (see Target.msg).
+    // No additional filtering needed — the tracker already EMA-smoothed it.
+    ax = msg->acceleration.x;
+    ay = msg->acceleration.y;
+    az = msg->acceleration.z;
+  } else {
+    // FALLBACK: finite-difference consecutive EKF velocity outputs.
+    // raw_accel = (v[k] − v[k-1]) / dt, then EMA-smoothed.
+    // WHY [5ms, 200ms] guard: below 5ms the velocity delta is dominated by
+    // floating-point noise (tiny Δv / tiny Δt → huge noise amplification).
+    // Above 200ms a frame was dropped and the velocity jump spans multiple
+    // real-world frames — the implied acceleration is physically meaningless.
+    if (has_prev_target_) {
+      double dt_tgt = (rclcpp::Time(msg->header.stamp) - prev_target_time_).seconds();
+      if (dt_tgt > 0.005 && dt_tgt < 0.2) {
+        auto clamp = [this](double val) {
+          return std::max(-max_accel_, std::min(val, max_accel_));
+        };
+        // Time-adjusted alpha: α_dt = 1 − (1−α)^(dt/dt_ref), normalized to
+        // 30 Hz reference so the EMA bandwidth is frame-rate independent.
+        double alpha_dt = 1.0 - std::pow(1.0 - accel_ema_alpha_, dt_tgt / (1.0 / 30.0));
+        ax_ema_ = alpha_dt * clamp((vx - prev_vx_) / dt_tgt)
+                  + (1.0 - alpha_dt) * ax_ema_;
+        ay_ema_ = alpha_dt * clamp((vy - prev_vy_) / dt_tgt)
+                  + (1.0 - alpha_dt) * ay_ema_;
+        az_ema_ = alpha_dt * clamp((vz - prev_vz_) / dt_tgt)
+                  + (1.0 - alpha_dt) * az_ema_;
+      }
     }
+    ax = ax_ema_; ay = ay_ema_; az = az_ema_;
   }
-  ax = ax_ema_; ay = ay_ema_; az = az_ema_;
+  // Always update prev_v regardless of mode so a runtime switch is seamless.
   has_prev_target_ = true;
   prev_target_time_ = msg->header.stamp;
   prev_vx_ = vx; prev_vy_ = vy; prev_vz_ = vz;
@@ -568,10 +605,14 @@ void TrajectorySolverNode::targetCallback(
     }
     double t0 = dist_center / bullet_speed_;
 
-    // Approximate bearing to the predicted center position at impact time
-    // (will be refined per-candidate below)
-    double bearing0 = std::atan2(yc + vy * (t0 + time_bias_),
-                                 xc + vx * (t0 + time_bias_));
+    // Approximate bearing to the predicted center position at impact time.
+    // Total prediction time includes: bullet flight (t0) + pipeline latency
+    // (time_bias_) + gimbal PID response delay (gimbal_response_delay_).
+    // All three must be accounted for to predict where the robot will be
+    // when the bullet actually arrives and the gimbal has finished slewing.
+    // (Will be refined per-candidate below with exact trajectory solving.)
+    double bearing0 = std::atan2(yc + vy * (t0 + time_bias_ + gimbal_response_delay_),
+                                 xc + vx * (t0 + time_bias_ + gimbal_response_delay_));
 
     // Each candidate represents one future alignment window: a specific face
     // at a specific time when it will be squarely facing the camera.
@@ -647,10 +688,13 @@ void TrajectorySolverNode::targetCallback(
         if (ct_flight < 1e-6) continue;          // degenerate (target at origin)
 
         double crange = std::sqrt(ctx * ctx + cty * cty + ctz * ctz);
-        // Timing residual: bullet flight time vs face alignment time.
+        // Timing residual: difference between when the face aligns (t_a) and
+        // when the bullet actually arrives (flight time + all latencies).
         // The smaller this is, the more precisely the bullet arrives when
         // the face is pointing at us.
-        double res = std::abs(t_a - (ct_flight + time_bias_));
+        // gimbal_response_delay_ is included because the gimbal takes time
+        // to physically reach the commanded angle after the solver computes it.
+        double res = std::abs(t_a - (ct_flight + time_bias_ + gimbal_response_delay_));
 
         candidates.push_back({i, t_a, res, cpitch, cyaw, crange, ctx, cty, ctz, creachable});
       }
@@ -704,8 +748,9 @@ void TrajectorySolverNode::targetCallback(
     // Two passes are enough because convergence is fast once the face is chosen.
     // -----------------------------------------------------------------------
     for (int iter = 0; iter < 2; iter++) {
-      // Expected total time from now until bullet hits: flight time + latency
-      double t_target = best->range / bullet_speed_ + time_bias_;
+      // Expected total time from now until bullet actually hits the target:
+      // flight time (range/speed) + pipeline latency + gimbal PID response.
+      double t_target = best->range / bullet_speed_ + time_bias_ + gimbal_response_delay_;
       // Recompute bearing at the refined impact time (includes acceleration)
       double bearing_new = std::atan2(yc + vy * t_target + 0.5 * ay * t_target * t_target,
                                       xc + vx * t_target + 0.5 * ax * t_target * t_target);
@@ -749,7 +794,7 @@ void TrajectorySolverNode::targetCallback(
       best->reachable = std::get<2>(result);
       if (t_fl < 1e-6) break;
       best->range = std::sqrt(best->tx * best->tx + best->ty * best->ty + best->tz * best->tz);
-      best->residual = std::abs(best->t_align - (t_fl + time_bias_));
+      best->residual = std::abs(best->t_align - (t_fl + time_bias_ + gimbal_response_delay_));
     }
 
     // -----------------------------------------------------------------------
@@ -785,6 +830,30 @@ void TrajectorySolverNode::targetCallback(
       double timing_tol = (abs_vyaw > 0.1)
           ? (base_window + sigma_vyaw * best->t_align) / abs_vyaw
           : indirect_timing_tolerance_;
+      // Add position uncertainty as timing uncertainty.
+      //
+      // WHY: The yaw-rate uncertainty above only accounts for SPIN uncertainty
+      // (where the face is pointing).  But the robot CENTER position is also
+      // uncertain (EKF P[0,0] and P[2,2]).  In indirect mode, position
+      // uncertainty affects WHEN the face aligns (because the bearing to the
+      // camera changes if the robot is shifted sideways).
+      //
+      // CONVERSION: position → angular → timing uncertainty:
+      //   σ_cross = √(P[0,0]·sin²(bearing) + P[2,2]·cos²(bearing))
+      //   σ_angular_pos = σ_cross / range        [rad]
+      //   σ_timing_pos  = σ_angular_pos / |v_yaw| [s]
+      //
+      // Combined with yaw-rate timing tolerance via RSS (root sum of squares)
+      // since the two error sources are independent.
+      double bearing_i = std::atan2(best->ty, best->tx);
+      double sin_bi = std::sin(bearing_i), cos_bi = std::cos(bearing_i);
+      double sigma_cross_i = std::sqrt(std::max(
+          msg->position_variance_x * sin_bi * sin_bi +
+          msg->position_variance_y * cos_bi * cos_bi, 1e-8));
+      double pos_timing_unc = (abs_vyaw > 0.1)
+          ? (sigma_cross_i / std::max(best->range, 0.5)) / abs_vyaw
+          : 0.0;
+      timing_tol = std::sqrt(timing_tol * timing_tol + pos_timing_unc * pos_timing_unc);
       // Floor: never fire tighter than the hardware minimum tolerance
       timing_tol = std::max(timing_tol, indirect_timing_tolerance_);
       fire = (best->residual < timing_tol);
@@ -895,8 +964,18 @@ void TrajectorySolverNode::targetCallback(
     return;
   }
   double t0 = dist_center / bullet_speed_;
-  // Total prediction horizon = flight time + pipeline latency
-  double pt = t0 + time_bias_;
+  // Total prediction horizon: rough flight time + all downstream latencies.
+  // This is the seed used by pass 0 of the two-pass trajectory refinement.
+  //
+  // WHY THREE TERMS:
+  //   t0 = range / bullet_speed — how long the bullet flies
+  //   time_bias_ = camera→solver pipeline latency (EMA-tracked)
+  //   gimbal_response_delay_ = solver→serial→gimbal PID response time
+  //
+  // All three contribute to "how far into the future must we predict the
+  // target position?"  Missing any one causes a systematic aim offset
+  // proportional to the target's velocity × the missing delay.
+  double pt = t0 + time_bias_ + gimbal_response_delay_;
 
   // findBestFace: given a prediction time, return the index of the armor face
   // that is the best shooting target, considering both distance and oblique angle.
@@ -1022,8 +1101,9 @@ void TrajectorySolverNode::targetCallback(
   // mainly at close range where the radius offset matters more).
   // -----------------------------------------------------------------------
   for (int pass = 0; pass < 2; pass++) {
-    // Pass 0 uses the rough seed; pass 1 uses the refined flight time
-    double total_t = (pass == 0) ? pt : (t_flight + time_bias_);
+    // Pass 0 uses the rough seed (pt); pass 1 uses the refined flight time.
+    // In both cases, total prediction time includes all latencies.
+    double total_t = (pass == 0) ? pt : (t_flight + time_bias_ + gimbal_response_delay_);
 
     // Predict where the aimed face will be at total_t
     double yaw_at = msg->yaw + msg->v_yaw * total_t;  // robot heading at impact
@@ -1056,7 +1136,7 @@ void TrajectorySolverNode::targetCallback(
 
     if (pass == 0) {
       // Recheck with refined flight time: might a different face be better?
-      int new_face = findBestFace(t_flight + time_bias_);
+      int new_face = findBestFace(t_flight + time_bias_ + gimbal_response_delay_);
       if (new_face == best_face) break;  // converged — same face, done
       best_face = new_face;  // face changed — re-solve in pass 1
     }
@@ -1130,8 +1210,12 @@ void TrajectorySolverNode::targetCallback(
   bool in_range = false;
   if (dist_ok && !temp_lost && !measurement_stale && !micro_pose_stale && reachable &&
       !all_faces_oblique) {
-    // Predict where the aimed face will point when the bullet arrives
-    double final_yaw = msg->yaw + msg->v_yaw * (t_flight + time_bias_);
+    // Predict where the aimed face will point when the bullet arrives.
+    // The prediction horizon includes gimbal_response_delay_ because the
+    // face continues rotating during the time it takes the gimbal servo to
+    // reach the commanded angle.  Without this, the fire gate checks the
+    // face position at the wrong time — too early by gimbal_response_delay_.
+    double final_yaw = msg->yaw + msg->v_yaw * (t_flight + time_bias_ + gimbal_response_delay_);
 
     // Angular position of the specific face we aimed at.
     // IMPORTANT: Check only best_face, not the nearest face at impact time.
@@ -1147,15 +1231,60 @@ void TrajectorySolverNode::targetCallback(
     double dist_scale = std::min(angular_window_ref_dist_ / std::max(range, 0.5), 2.0);
     double base_window = angular_window_ * dist_scale;
 
-    // Widen the window by EKF spin-rate uncertainty × prediction time.
-    // If the EKF isn't sure about v_yaw, the face position at impact is uncertain
-    // → we need a wider tolerance to avoid suppressing valid shots.
+    // -----------------------------------------------------------------
+    // Widen the window by total angular uncertainty.
+    //
+    // Previously, only yaw-rate uncertainty (σ_vyaw × t_predict) was used.
+    // This ignored the angular uncertainty from the EKF's position error.
+    //
+    // PROBLEM (quantified):
+    //   At 3m, σ_pos = 10cm (P[0,0]=P[2,2]=0.01 m²):
+    //     σ_angular_pos = 0.1 / 3 = 33 mrad
+    //   The base angular_window is 90 mrad, so position uncertainty alone
+    //   is 37% of the window — completely ignored before this change.
+    //
+    // SOLUTION: Combine both sources via RSS (root sum of squares):
+    //   σ_total = √( (σ_vyaw · t)² + (σ_cross / range)² )
+    //
+    // WHY RSS: The two error sources are independent:
+    //   - σ_vyaw·t: uncertainty about WHERE THE FACE is pointing (spin rate)
+    //   - σ_cross/range: uncertainty about WHERE THE ROBOT CENTER is (position)
+    //   Independent errors add in quadrature (RSS), not linearly.
+    //
+    // CROSS-RANGE PROJECTION:
+    //   The EKF provides variances in the odom x and y axes independently:
+    //     P[0,0] = var(xc), P[2,2] = var(yc)
+    //   We project onto the direction perpendicular to the line-of-sight
+    //   (the "cross-range" direction), because position uncertainty ALONG
+    //   the line-of-sight doesn't move the angular aim point — it only
+    //   affects range (a much smaller effect).
+    //     σ²_cross = P[0,0]·sin²(bearing) + P[2,2]·cos²(bearing)
+    //   Then convert to angular: σ_angular = σ_cross / range.
+    //
+    // EFFECT: The fire gate correctly widens when position is uncertain
+    // (early tracking, far range, TEMP_LOST) and narrows when confident
+    // (close range, steady tracking).
+    // -----------------------------------------------------------------
+    double total_t = t_flight + time_bias_ + gimbal_response_delay_;
     double sigma_vyaw = std::sqrt(std::max(msg->v_yaw_variance, 1e-6));
-    double yaw_uncertainty = sigma_vyaw * (t_flight + time_bias_);
+    double yaw_uncertainty = sigma_vyaw * total_t;
+    // Position uncertainty projected onto cross-range direction.
+    // `yaw` (= atan2(ty,tx)) is the bearing to the impact point, computed
+    // during the two-pass trajectory refinement above.
+    double sin_b = std::sin(yaw), cos_b = std::cos(yaw);
+    double sigma_cross = std::sqrt(std::max(
+        msg->position_variance_x * sin_b * sin_b +
+        msg->position_variance_y * cos_b * cos_b, 1e-8));
+    // Convert to angular uncertainty: radians = meters / meters
+    // Floor range at 0.5m to prevent division-by-nearly-zero at point-blank.
+    double pos_angular_unc = sigma_cross / std::max(range, 0.5);
+    // RSS combination of independent yaw-rate and position angular errors
+    double total_uncertainty = std::sqrt(yaw_uncertainty * yaw_uncertainty
+                                       + pos_angular_unc * pos_angular_unc);
     // Hard cap: window can't exceed half the face spacing, otherwise we'd
     // accept shots aimed at the gap between two faces.
     double max_window = face_spacing * 0.5;
-    double effective_window = std::min(base_window + yaw_uncertainty, max_window);
+    double effective_window = std::min(base_window + total_uncertainty, max_window);
 
     // Gimbal saturation check: can the gimbal physically slew from its current
     // position to the target in the available time?  If not, the bullet will

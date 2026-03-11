@@ -103,6 +103,9 @@ private:
   double r_yaw_base_, r_yaw_slope_;   // R_yaw = (base + slope × dist)² — range-dependent
   double r_yaw_angle_power_;          // Exponent n for obliquity inflation: 1/cos^n(face_angle)
   double max_yaw_oblique_deg_;        // Face angle [°] beyond which yaw noise → ∞
+  bool use_secondary_face_fusion_;    // Fuse secondary armor face into 9D EKF
+  double secondary_r_inflation_;      // Safety multiplier on secondary face R matrix
+  double secondary_maha_threshold_;   // Mahalanobis gate for secondary face update
   double lost_time_thres_;            // Seconds in TEMP_LOST before transitioning to LOST
 
   // --- Multi-tracker infrastructure ---
@@ -162,6 +165,30 @@ private:
   double coast_damping_factor_;       // Multiplier for TEMP_LOST: base × factor (e.g. 0.85)
   double damping_innov_threshold_;    // Position innovation threshold for overshoot [m]
   double yaw_innov_threshold_;        // Yaw innovation threshold for overshoot [rad]
+
+  // --- Innovation-based acceleration estimation (per-tracker) ---
+  //
+  // Each tracker maintains its own EMA-smoothed acceleration estimate, keyed
+  // by tracker_id.  This is computed in fillTargetMsg() as:
+  //   raw_accel = (v_posterior − v_prior) / dt
+  // then EMA-smoothed with time-adjusted alpha for frame-rate independence.
+  //
+  // WHY PER-TRACKER: Different robots accelerate independently.  A single
+  // global accel EMA would mix acceleration signals from different targets
+  // after a best-target switch, causing transient prediction errors for
+  // several frames.  Per-tracker EMAs preserve each robot's acceleration
+  // history across target switches and resume cleanly when a robot is
+  // re-selected as best target.
+  //
+  // WHY std::map<int, double>: The map auto-initializes to 0.0 via
+  // operator[], matching the desired zero-acceleration prior for new trackers.
+  // Entries are erased when their tracker is pruned (LOST state) or on reset.
+  //
+  // accel_ema_alpha_: EMA weight (0→max smooth, 1→no filter).  Default 0.3
+  // matches the old trajectory solver parameter, but the input signal is
+  // now ~3× cleaner, so the EMA adds less distortion.
+  std::map<int, double> tracker_ax_ema_, tracker_ay_ema_, tracker_az_ema_;
+  double accel_ema_alpha_;  // EMA weight for acceleration smoothing
 
   // PnP light-bar ratio (bbox → light-bar scaling)
   double light_ratio_;

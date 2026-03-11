@@ -92,6 +92,12 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   yaw_innov_threshold_    = declare_parameter("ekf.yaw_innov_threshold", 0.15);
   xyz_damping_alpha_ = xyz_damping_alpha_base_;
   yaw_damping_alpha_ = yaw_damping_alpha_base_;
+  // EMA weight for innovation-based acceleration smoothing (see fillTargetMsg).
+  // α=0.3 matches the trajectory solver's old finite-diff EMA, but the input
+  // signal is now ~3× cleaner so the same α yields less distortion.
+  // Higher → more responsive to real acceleration, noisier.
+  // Lower → smoother, but more phase lag on maneuvering targets.
+  accel_ema_alpha_ = declare_parameter("ekf.accel_ema_alpha", 0.3);
   s2qxyz_ = declare_parameter("ekf.sigma2_q_xyz", 5.0);
   s2qyaw_ = declare_parameter("ekf.sigma2_q_yaw", 10.0);
   s2qr_   = declare_parameter("ekf.sigma2_q_r",   1e-6);
@@ -101,6 +107,9 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   r_yaw_slope_ = declare_parameter("ekf.r_yaw_slope", 0.002);
   r_yaw_angle_power_    = declare_parameter("ekf.r_yaw_angle_power",    4.0);
   max_yaw_oblique_deg_  = declare_parameter("ekf.max_yaw_oblique_deg",  65.0);
+  use_secondary_face_fusion_ = declare_parameter("ekf.secondary_face_fusion", true);
+  secondary_r_inflation_ = declare_parameter("ekf.secondary_r_inflation", 2.0);
+  secondary_maha_threshold_ = declare_parameter("ekf.secondary_maha_threshold", 13.3);
 
   // Reset tracker service
   using std::placeholders::_1;
@@ -112,6 +121,11 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
                         std_srvs::srv::Trigger::Response::SharedPtr response) {
       trackers_.clear();
       tracker_last_meas_times_.clear();
+      // Clear per-tracker acceleration EMA state — stale acceleration from a
+      // previous tracking session would corrupt predictions for new trackers.
+      tracker_ax_ema_.clear();
+      tracker_ay_ema_.clear();
+      tracker_az_ema_.clear();
       best_tracker_id_ = -1;
       response->success = true;
       RCLCPP_INFO(this->get_logger(), "All trackers reset!");
@@ -878,6 +892,12 @@ void ArmorTrackerNode::armorsCallback(
     if (it->second->tracker_state == Tracker::LOST) {
       RCLCPP_INFO(this->get_logger(), "Removing LOST tracker %d", it->first);
       tracker_last_meas_times_.erase(it->first);
+      // Clean up per-tracker acceleration EMA when the tracker is removed.
+      // Without this, the map would accumulate stale entries for every tracker
+      // that ever existed (monotonically increasing IDs), causing a memory leak.
+      tracker_ax_ema_.erase(it->first);
+      tracker_ay_ema_.erase(it->first);
+      tracker_az_ema_.erase(it->first);
       it = trackers_.erase(it);
     } else {
       ++it;
@@ -1017,6 +1037,15 @@ std::unique_ptr<Tracker> ArmorTrackerNode::createTracker()
   tracker->maha_match_threshold_ = maha_match_threshold_;
   tracker->maha_jump_threshold_ = maha_jump_threshold_;
   tracker->setMaxYawObliqueAngle(max_yaw_oblique_deg_ * M_PI / 180.0);
+  tracker->use_secondary_face_fusion = use_secondary_face_fusion_;
+  tracker->secondary_r_inflation = secondary_r_inflation_;
+  tracker->secondary_maha_threshold = secondary_maha_threshold_;
+  tracker->r_xyz_base_ = r_xyz_base_;
+  tracker->r_xyz_slope_ = r_xyz_slope_;
+  tracker->r_yaw_base_ = r_yaw_base_;
+  tracker->r_yaw_slope_ = r_yaw_slope_;
+  tracker->r_yaw_angle_power_ = r_yaw_angle_power_;
+  tracker->max_yaw_oblique_deg_ = max_yaw_oblique_deg_;
 
   // =========================================================================
   // EKF LAMBDA DEFINITIONS — the mathematical heart of the tracker.
@@ -1383,6 +1412,86 @@ void ArmorTrackerNode::fillTargetMsg(
     msg.dz         = tracker.dz;       // height difference between armor pairs [m]
     // EKF covariance — used by trajectory solver to scale fire window:
     msg.v_yaw_variance = tracker.ekf.getVariance(7);  // P_post(7,7)
+    // -----------------------------------------------------------------
+    // Position covariance diagonals — transmitted to the trajectory solver
+    // for angular uncertainty computation in the fire gate.
+    //
+    // WHY THESE INDICES:  The 9D EKF state is:
+    //   [xc(0), v_xc(1), yc(2), v_yc(3), za(4), v_za(5), yaw(6), v_yaw(7), r(8)]
+    // P_post(0,0) = variance of xc, P_post(2,2) = variance of yc, etc.
+    //
+    // The trajectory solver projects these onto the cross-range direction
+    // (perpendicular to line-of-sight) and divides by range to get angular
+    // uncertainty.  See Target.msg comments for the full math and motivation.
+    //
+    // TYPICAL VALUES:
+    //   Early tracking (DETECTING→TRACKING): ~0.05-0.15 m² (σ=22-39cm)
+    //   Steady tracking at 3m: ~0.005-0.02 m² (σ=7-14cm)
+    //   Close range (<1.5m): ~0.001-0.005 m² (σ=3-7cm)
+    // -----------------------------------------------------------------
+    msg.position_variance_x = tracker.ekf.getVariance(0);  // P_post(0,0)
+    msg.position_variance_y = tracker.ekf.getVariance(2);  // P_post(2,2)
+    msg.position_variance_z = tracker.ekf.getVariance(4);  // P_post(4,4)
+
+    // -----------------------------------------------------------------
+    // Innovation-based acceleration estimation.
+    //
+    // CONCEPT:  The EKF's predict step propagates velocity forward with
+    // the constant-velocity model: v_prior = v_post_prev · damping_alpha.
+    // The update step then corrects this with the Kalman gain:
+    //   v_posterior = v_prior + K · (z - h(x_prior))
+    // The velocity innovation (v_posterior - v_prior) represents how much
+    // the EKF adjusted velocity based on the new measurement.  Dividing
+    // by dt gives an acceleration estimate:
+    //   raw_accel = (v_posterior - v_prior) / dt
+    //
+    // WHY BETTER THAN FINITE-DIFFERENCING v_posterior[k] - v_posterior[k-1]:
+    //   Old approach noise:  σ_diff = √2 · σ_v / dt
+    //     Two independent posterior measurements contribute noise.
+    //     σ_v ≈ 0.04 m/s (from PnP at 3m), dt ≈ 33ms → σ_a ≈ 1.7 m/s²
+    //   New approach noise:  σ_innov ≈ ||K|| · σ_z / dt
+    //     Only one measurement contributes, filtered by the Kalman gain.
+    //     ||K|| ≈ 0.3, σ_z ≈ 0.05 m → σ_a ≈ 0.45 m/s²
+    //   Ratio: ~3.8× less noise in the raw signal.
+    //
+    // EMA SMOOTHING:  The raw signal is still noisy, so we apply a
+    // time-adjusted exponential moving average:
+    //   α_dt = 1 − (1 − α)^(dt / dt_nominal)
+    //   ema[k] = α_dt · clamp(raw) + (1 − α_dt) · ema[k-1]
+    //
+    // WHY TIME-ADJUSTED:  If the camera runs at 60Hz instead of 30Hz,
+    // each sample covers half the time interval.  Without adjustment,
+    // the EMA would filter twice as aggressively (lower bandwidth).
+    // The formula α_dt = 1−(1−α)^(dt/dt_ref) normalizes to a reference
+    // frame rate (30 Hz), keeping the bandwidth consistent regardless
+    // of actual frame timing.
+    //
+    // WHY CLAMP TO ±12 m/s²:  RoboMaster robots can accelerate at
+    // ~5 m/s² peak (4WD swerve).  12 m/s² is 2.4× that — rejecting
+    // EKF jumps from armor-switch or tracker-reset events that would
+    // otherwise create large transient acceleration spikes.
+    //
+    // WHY [5ms, 200ms] GUARD ON dt:  Below 5ms, the velocity difference
+    // is dominated by floating-point noise (dividing a tiny Δv by a tiny
+    // Δt magnifies noise).  Above 200ms, a frame was clearly dropped and
+    // the velocity jump spans multiple real-world frames — the implied
+    // acceleration is no longer physically meaningful.
+    // -----------------------------------------------------------------
+    int tid = tracker.tracker_id;
+    if (dt_ > 0.005 && dt_ < 0.2) {
+      double raw_ax = (state(1) - tracker.prior_vx) / dt_;
+      double raw_ay = (state(3) - tracker.prior_vy) / dt_;
+      double raw_az = (state(5) - tracker.prior_vz) / dt_;
+      double alpha_dt = 1.0 - std::pow(1.0 - accel_ema_alpha_, dt_ / (1.0 / 30.0));
+      auto clamp = [](double v, double lim) { return std::max(-lim, std::min(v, lim)); };
+      tracker_ax_ema_[tid] = alpha_dt * clamp(raw_ax, 12.0) + (1.0 - alpha_dt) * tracker_ax_ema_[tid];
+      tracker_ay_ema_[tid] = alpha_dt * clamp(raw_ay, 12.0) + (1.0 - alpha_dt) * tracker_ay_ema_[tid];
+      tracker_az_ema_[tid] = alpha_dt * clamp(raw_az, 12.0) + (1.0 - alpha_dt) * tracker_az_ema_[tid];
+    }
+    msg.acceleration.x = tracker_ax_ema_[tid];
+    msg.acceleration.y = tracker_ay_ema_[tid];
+    msg.acceleration.z = tracker_az_ema_[tid];
+
     // Last real detection timestamp — for trajectory solver's staleness check
     msg.last_measurement_stamp = last_meas_time;
   } else {

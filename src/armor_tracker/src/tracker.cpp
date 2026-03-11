@@ -122,8 +122,22 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
     ekf_prediction(8) = r_active_kf_.x;
     ekf.setState(ekf_prediction);
     ekf.decoupleState(8, r_active_kf_.P);
+    // Store prior velocities for innovation-based acceleration estimation.
+    // These are the EKF's predicted velocities BEFORE seeing the new detection.
+    // After ekf.update(), the posterior velocities will differ by the Kalman
+    // correction.  The difference (v_post - v_prior) / dt is the EKF's implicit
+    // acceleration estimate — used by the tracker node to populate the Target
+    // message's acceleration field (see fillTargetMsg in tracker_node.cpp).
+    //
+    // WHY HERE AND NOT AFTER ekf.update():  We need the velocity state at the
+    // prior (predicted) stage, which is overwritten by ekf.update().  Capturing
+    // it here ensures we have the correct pre-update values.
+    prior_vx = ekf_prediction(1);  // v_xc predicted
+    prior_vy = ekf_prediction(3);  // v_yc predicted
+    prior_vz = ekf_prediction(5);  // v_za predicted
   } else {
-    // predictStep() already ran — target_state holds the prediction
+    // predictStep() already ran — target_state holds the prediction.
+    // prior_vx/vy/vz were already set in predictStep().
     ekf_prediction = target_state;
   }
   predicted_ = false;
@@ -421,6 +435,122 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
             }
           }
 
+          // -----------------------------------------------------------------
+          // SECONDARY FACE FUSION
+          //
+          // PROBLEM: The primary EKF update only fuses ONE armor face.
+          //   When the robot shows two faces simultaneously (visible at the
+          //   corner), we have a second independent measurement that contains
+          //   information about the robot center from a ~90° different angle.
+          //   Ignoring it wastes valuable geometric constraints.
+          //
+          // WHY IT HELPS (geometrically):
+          //   The primary face constrains the center position along ONE
+          //   direction (the face normal, i.e. yaw direction).  The
+          //   secondary face constrains the center from ~90° away.
+          //   Together, they constrain the center in 2D — reducing the
+          //   position uncertainty from an elongated ellipse to a tight
+          //   circle.  Quantitatively: σ_cross_range drops ~30-50% when
+          //   both faces contribute.
+          //
+          // HOW IT WORKS:
+          //   1. Compute the yaw offset from primary to secondary face
+          //      (should be ~±π/2 for adjacent faces on a 4-armor robot).
+          //      Round to nearest π/2 to reject PnP noise in the offset.
+          //   2. Build h_2(x): the observation model for the secondary face:
+          //        xa₂ = xc − r₂·cos(yaw + offset)
+          //        ya₂ = yc − r₂·sin(yaw + offset)
+          //        za₂ = za + dz
+          //        yaw₂ = yaw + offset
+          //   3. Build H_2 (Jacobian of h_2) and R_2 (noise, with
+          //      secondary_r_inflation multiplier for safety — the secondary
+          //      face may be more oblique or at worse PnP quality).
+          //   4. Mahalanobis gate to reject outliers before fusing.
+          //   5. Call ekf.updateWithModel() — a sequential update that
+          //      treats the primary update's posterior as its prior.
+          //
+          // WHY DEFERRED (not done inline with the primary update):
+          //   The primary EKF update corrects the center position first.
+          //   Using the corrected center (posterior) as the starting point
+          //   for the secondary update gives a better linearisation point
+          //   (smaller Taylor approximation error in H_2).
+          // -----------------------------------------------------------------
+          if (has_other_pair_armor && use_secondary_face_fusion) {
+            double sel_yaw_val = measurement(3);
+            double yaw_offset = angles::shortest_angular_distance(sel_yaw_val, other_pair_yaw);
+            // Round to nearest ±π/2 (guard against PnP noise in yaw)
+            yaw_offset = std::round(yaw_offset / (M_PI / 2)) * (M_PI / 2);
+
+            // Current EKF yaw (from posterior after primary update)
+            double current_yaw = target_state(6);
+            double unwrapped_other_yaw = current_yaw + yaw_offset;
+            double r_other = r_other_kf_.x;
+
+            // Secondary measurement vector
+            Eigen::Vector4d z_2(other_pair_x, other_pair_y, other_pair_z, unwrapped_other_yaw);
+
+            // Predicted measurement from current state: h_2(x)
+            Eigen::Vector4d z_pred_2;
+            z_pred_2(0) = target_state(0) - r_other * std::cos(current_yaw + yaw_offset);
+            z_pred_2(1) = target_state(2) - r_other * std::sin(current_yaw + yaw_offset);
+            z_pred_2(2) = target_state(4) + dz;
+            z_pred_2(3) = current_yaw + yaw_offset;
+
+            // Jacobian H_2 (4×9)
+            Eigen::MatrixXd H_2 = Eigen::MatrixXd::Zero(4, 9);
+            H_2(0, 0) = 1.0;
+            H_2(0, 6) = r_other * std::sin(current_yaw + yaw_offset);
+            H_2(1, 2) = 1.0;
+            H_2(1, 6) = -r_other * std::cos(current_yaw + yaw_offset);
+            H_2(2, 4) = 1.0;
+            H_2(3, 6) = 1.0;
+
+            // R_2: replicate the u_r formula for the secondary face
+            double dist_2 = std::sqrt(
+              other_pair_x * other_pair_x +
+              other_pair_y * other_pair_y +
+              other_pair_z * other_pair_z);
+            double ps_2 = r_xyz_base_ + r_xyz_slope_ * dist_2;
+            double ys_2 = r_yaw_base_ + r_yaw_slope_ * dist_2;
+            double xyz_af_2 = 1.0, yaw_af_2 = 1.0;
+            if (other_pair_x * other_pair_x + other_pair_y * other_pair_y > 1e-12) {
+              double bearing_opp_2 = std::atan2(-other_pair_y, -other_pair_x);
+              double face_angle_2 = std::abs(
+                std::remainder(other_pair_yaw - bearing_opp_2, 2.0 * M_PI));
+              double cos_fa_2 = std::cos(face_angle_2);
+              xyz_af_2 = 1.0 / std::max(cos_fa_2 * cos_fa_2, 0.04);
+              double cos_pow_2 = std::pow(std::abs(cos_fa_2), r_yaw_angle_power_);
+              yaw_af_2 = 1.0 / std::max(cos_pow_2, 1e-4);
+              double max_oblique_rad = max_yaw_oblique_deg_ * M_PI / 180.0;
+              if (face_angle_2 > max_oblique_rad) {
+                yaw_af_2 = 1e6;
+              }
+            }
+            Eigen::Matrix4d R_2 = Eigen::Matrix4d::Zero();
+            R_2(0, 0) = ps_2 * ps_2 * xyz_af_2 * secondary_r_inflation;
+            R_2(1, 1) = ps_2 * ps_2 * xyz_af_2 * secondary_r_inflation;
+            R_2(2, 2) = ps_2 * ps_2 * xyz_af_2 * secondary_r_inflation;
+            R_2(3, 3) = ys_2 * ys_2 * yaw_af_2 * secondary_r_inflation;
+
+            // Mahalanobis gate on the secondary update
+            Eigen::Vector4d innov_2 = z_2 - z_pred_2;
+            Eigen::MatrixXd S_2 = H_2 * ekf.P_post_view() * H_2.transpose() + R_2;
+            Eigen::LDLT<Eigen::MatrixXd> S_2_ldlt(S_2);
+            double maha_2 = 1e9;
+            if (S_2_ldlt.info() == Eigen::Success && S_2_ldlt.isPositive()) {
+              maha_2 = innov_2.transpose() * S_2_ldlt.solve(innov_2);
+            }
+
+            if (maha_2 < secondary_maha_threshold) {
+              // Write current target_state into EKF before the secondary update
+              ekf.setState(target_state);
+              ekf.decoupleState(8, r_active_kf_.P);
+              target_state = ekf.updateWithModel(z_2, z_pred_2, H_2, R_2);
+              RCLCPP_DEBUG(rclcpp::get_logger("armor_tracker"),
+                "Secondary face fusion (maha=%.1f)", maha_2);
+            }
+          }
+
           ekf.setState(target_state);
           // Sync EKF covariance for radius with the scalar KF: zero cross-terms
           // so the externally-managed r doesn't pollute Kalman gains or Mahalanobis.
@@ -602,6 +732,15 @@ Eigen::VectorXd Tracker::predictStep()
   ekf_prediction(8) = r_active_kf_.x;
   ekf.setState(ekf_prediction);
   ekf.decoupleState(8, r_active_kf_.P);
+  // Store prior velocities for innovation-based acceleration estimation.
+  // Same rationale as in update()'s internal predict path above: capture the
+  // EKF's velocity prediction BEFORE the measurement update, so the tracker
+  // node can compute (v_posterior - v_prior) / dt as the acceleration signal.
+  // predictStep() is the primary path (called by the multi-tracker data
+  // association loop), so this is where prior_v* is set most of the time.
+  prior_vx = ekf_prediction(1);  // v_xc predicted
+  prior_vy = ekf_prediction(3);  // v_yc predicted
+  prior_vz = ekf_prediction(5);  // v_za predicted
   target_state = ekf_prediction;
   predicted_ = true;
   return ekf_prediction;
@@ -778,22 +917,54 @@ void Tracker::handleArmorJump(const Armor & current_armor)
   info_yaw_innov_signed = 0.0;
   RCLCPP_WARN(rclcpp::get_logger("armor_tracker"), "Armor jump!");
 
-  // If position difference is larger than max_match_distance_,
-  // take this case as the ekf diverged, reset the state
+  // ---------------------------------------------------------------------------
+  // DIVERGENCE DETECTION & HARD RESET
+  //
+  // PROBLEM: After snapping yaw (and optionally za, r), the EKF's inferred
+  // armor position (from the new state) may be far from where the actual
+  // detection was.  This means the center position (xc, yc) is wrong —
+  // the EKF has diverged, and no amount of Kalman updating can fix it
+  // because the state is in the wrong basin.
+  //
+  // DETECTION: Compare the inferred armor position (from the post-snap
+  // state) with the actual detection.  If the error > max_match_distance_
+  // (~15cm), the center must be wrong.
+  //
+  // WHY THIS CAN HAPPEN:
+  //   1. The EKF was tracking at a wrong center for several frames (e.g.
+  //      velocity overshoot moved xc too far), and the jump exposed it.
+  //   2. A jump was misclassified (90° instead of 180° or vice versa),
+  //      so the wrong radius was applied to back-calculate center.
+  //   3. Two nearby robots confused the data association, and the EKF
+  //      latched onto the wrong one.
+  //
+  // SOLUTION: Hard reset everything — back-calculate center from the
+  // current detection using the current radius estimate, zero all
+  // velocities, restore P0, and reset both radius KFs and dz.
+  // This is expensive (loses all velocity/acceleration history) but is
+  // the only way to recover from a completely wrong center position.
+  //
+  // WHY NOT JUST INFLATE COVARIANCE?
+  //   When xc is off by >15cm and P says σ=3cm, inflating P by 4× gives
+  //   σ=6cm — still nowhere near the true error.  The Kalman gain won't
+  //   be large enough to pull the state back.  A hard reset (P→P0 with
+  //   σ=32cm for position, σ=1m/s for velocity) gives the filter room
+  //   to re-converge from the new position within 3-5 frames.
+  // ---------------------------------------------------------------------------
   auto p = current_armor.pose.position;
   Eigen::Vector3d current_p(p.x, p.y, p.z);
   Eigen::Vector3d infer_p = getArmorPositionFromState(target_state);
   if ((current_p - infer_p).norm() > max_match_distance_) {
     double r = target_state(8);
-    target_state(0) = p.x + r * cos(yaw);  // xc
-    target_state(1) = 0;                   // vxc
+    target_state(0) = p.x + r * cos(yaw);  // xc (back-calculated from armor + radius)
+    target_state(1) = 0;                   // vxc → 0 (no velocity info)
     target_state(2) = p.y + r * sin(yaw);  // yc
-    target_state(3) = 0;                   // vyc
-    target_state(4) = p.z;                 // za
-    target_state(5) = 0;                   // vza
-    target_state(7) = 0;                   // v_yaw
-    ekf.resetCovariance();
-    dz = 0.0;
+    target_state(3) = 0;                   // vyc → 0
+    target_state(4) = p.z;                 // za (from detection)
+    target_state(5) = 0;                   // vza → 0
+    target_state(7) = 0;                   // v_yaw → 0 (spin direction unknown)
+    ekf.resetCovariance();                 // P → P0 (high uncertainty for fast re-convergence)
+    dz = 0.0;                              // reset geometry estimates
     another_r = initial_r2_;
     dz_initialized_ = false;
     r_active_kf_.reset(initial_r1_, r_kf_P_init_);
@@ -807,31 +978,66 @@ void Tracker::handleArmorJump(const Armor & current_armor)
 
   ekf.setState(target_state);
 
-  // The yaw was snapped directly, bypassing the EKF update, so the filter
-  // underestimates its own uncertainty after a jump. Inflate yaw and v_yaw
-  // covariance to reflect this. Skip for BALANCE_2: the ~180° jump always
-  // triggers the divergence reset above which calls resetCovariance() already.
+  // ---------------------------------------------------------------------------
+  // POST-JUMP COVARIANCE INFLATION
+  //
+  // WHY: The yaw (and optionally za, v_yaw) were written directly into the
+  // state vector, bypassing the EKF's principled update mechanism.  The EKF
+  // still thinks P(6,6) reflects the gradual accumulation of process noise —
+  // it has no idea we just jumped yaw by 90°.  If we don't inflate, the
+  // filter will be overconfident about the new yaw value.
+  //
+  // HOW MUCH: Factor of 4 on each snapped state → variance ×4 → σ ×2.
+  //   If P(6,6) was 0.01 rad² (σ≈6°), inflation gives 0.04 rad² (σ≈12°).
+  //   This is reasonable: the snapped yaw comes from a single PnP measurement
+  //   (typical σ≈5-10° at 3m), so doubling the uncertainty reflects that we
+  //   lost the multi-frame averaging benefit.
+  //
+  // WHY NOT BALANCE_2: A 180° jump on a 2-armor robot always triggers the
+  // divergence reset above (the position error is always large because r
+  // doesn't change but the face is on the opposite side).  resetCovariance()
+  // already restores P0, which is even more conservative than 4× inflation.
+  //
+  // WHY ALSO za AND v_za FOR NORMAL_4: On a 90° pair switch, za was snapped
+  // to the new face's height and v_za was zeroed.  Both are now uncertain.
+  // ---------------------------------------------------------------------------
   if (tracked_armors_num != ArmorsNum::BALANCE_2) {
-    ekf.inflateCovariance(6, 4.0);  // yaw:   variance x4 (~2x std-dev)
-    ekf.inflateCovariance(7, 4.0);  // v_yaw: variance x4
+    ekf.inflateCovariance(6, 4.0);  // yaw:   variance ×4 (~2× std-dev)
+    ekf.inflateCovariance(7, 4.0);  // v_yaw: variance ×4
   }
   if (tracked_armors_num == ArmorsNum::NORMAL_4) {
-    ekf.inflateCovariance(4, 4.0);  // za:   variance x4 (snapped, uncertain)
-    ekf.inflateCovariance(5, 4.0);  // v_za: variance x4 (zeroed above)
+    ekf.inflateCovariance(4, 4.0);  // za:   variance ×4 (snapped to new face)
+    ekf.inflateCovariance(5, 4.0);  // v_za: variance ×4 (zeroed, uncertain)
   }
 
-  // Sync prior so update() uses the post-jump state/covariance, not the
-  // stale x_pri/P_pri from the earlier predict() call.
+  // ---------------------------------------------------------------------------
+  // Sync prior → posterior so the subsequent ekf.update() uses the post-jump
+  // state and inflated covariance as its linearisation point.  Without this,
+  // update() would read the OLD x_pri/P_pri from predict() — computing
+  // innovation and Kalman gain against a stale pre-jump state, which would
+  // produce completely wrong corrections (the yaw innovation would be ~90°
+  // instead of ~0°, overwhelming the linear approximation).
+  // ---------------------------------------------------------------------------
   ekf.syncPrior();
 
   // Decouple radius before the EKF update so the Kalman gain for r ≈ 0
   // and the update doesn't introduce spurious cross-covariance.
   ekf.decoupleState(8, r_active_kf_.P);
 
-  // Feed the measurement through the EKF update step so the center position
-  // (xc, yc) is properly corrected via the Kalman gain. Without this, the
-  // jump only snaps yaw/radius/za but leaves xc, yc at the raw predict()
-  // values — the actual armor observation is never fused.
+  // ---------------------------------------------------------------------------
+  // EKF UPDATE AFTER JUMP
+  //
+  // WHY NEEDED: Everything above (yaw snap, za snap, r swap, covariance
+  // inflation) modified the state but didn't fuse the actual measurement.
+  // The center position (xc, yc) is still at the raw prediction value from
+  // predict() — the armor observation hasn't been used to correct it yet.
+  //
+  // By calling ekf.update() with the measurement, the Kalman gain pulls
+  // xc and yc towards the observed armor position, using the post-jump
+  // yaw and radius as the linearisation point.  This is critical: without
+  // it, xc/yc would drift by the prediction error each jump, compounding
+  // over multiple jumps.
+  // ---------------------------------------------------------------------------
   measurement = Eigen::Vector4d(p.x, p.y, p.z, yaw);
   target_state = ekf.update(measurement);
   // Yaw-projected radius measurement for the newly visible pair.

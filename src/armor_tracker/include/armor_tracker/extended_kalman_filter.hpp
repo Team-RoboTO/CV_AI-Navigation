@@ -91,12 +91,24 @@ public:
   // Update the estimated state based on measurement
   Eigen::MatrixXd update(const Eigen::VectorXd & z);
 
+  // Update with an externally-provided observation model.
+  // Use for secondary-face fusion where h() differs from the primary.
+  // Operates on x_post/P_post (i.e., after the primary update()).
+  Eigen::MatrixXd updateWithModel(
+    const Eigen::VectorXd & z,
+    const Eigen::VectorXd & z_pred,
+    const Eigen::MatrixXd & H_ext,
+    const Eigen::MatrixXd & R_ext);
+
   // Compute squared Mahalanobis distance of measurement z from predicted state.
   // Returns (z - h(x_pri))^T S^{-1} (z - h(x_pri)) where S = H P_pri H^T + R.
   double mahalanobis(const Eigen::VectorXd & z);
 
   // Get posterior variance of a single state element
   double getVariance(int idx) const { return P_post(idx, idx); }
+
+  // Read-only access to the posterior covariance (for external gating)
+  const Eigen::MatrixXd & P_post_view() const { return P_post; }
 
   // Per-state covariance upper bounds (set externally; empty = no clamping)
   Eigen::VectorXd max_covariance;
