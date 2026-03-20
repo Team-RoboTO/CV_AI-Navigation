@@ -658,10 +658,6 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
         measurement_valid = true;
         handleArmorJump(selected_armor);
       } else {
-          RCLCPP_WARN(rclcpp::get_logger("armor_tracker"),
-            "Armor jump rejected: Mahalanobis=%.1f > %.1f", maha, maha_jump_threshold_);
-        }
-      } else {
         // No matched armor found
         RCLCPP_WARN(rclcpp::get_logger("armor_tracker"), "No matched armor found!");
       }
