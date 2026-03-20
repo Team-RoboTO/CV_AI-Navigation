@@ -22,14 +22,14 @@
 // ── CALLBACKS (run in the ROS executor spin loop) ───────────────────────────
 //   microPoseCallback  – receives gimbal yaw/pitch from the lower computer
 //                        (/micro_pose).  Stores angles and calls
-//                        broadcastGimbalTF() to keep TF2 current.
+//                        broadcastCameraTF() to keep TF2 current.
 //   imuCallback        – receives D455 IMU gyro.  EMA-filters the angular
 //                        velocity, rotates it into chassis frame, subtracts
 //                        gimbal velocity (finite-diff), integrates to get
 //                        chassis yaw/pitch for world-frame compensation.
 //   armorsCallback     – MAIN PIPELINE (see below).
 //
-// ── broadcastGimbalTF ───────────────────────────────────────────────────────
+// ── broadcastCameraTF ───────────────────────────────────────────────────────
 // Composes: T(odom→camera) = chassis_R(IMU) × gimbal_R(lower_computer) × optical_convention
 // Writes the transform into both tf2_buffer_ (immediate lookup in same callback)
 // and /tf topic (for rviz, other nodes).  Without this, every gimbal move
@@ -159,7 +159,7 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   // - r_yaw_uncertainty_scale_: scales yaw covariance when radius estimate is poor (guards against overconfidence).
   // - v_yaw_max_: clamp for yaw rate (rad/s) to prevent numerical blow-ups on bad detections.
   // - maha_match_threshold_ / maha_jump_threshold_: Mahalanobis gates for normal matching vs armor-jump association.
-  // - tracker_micro_pose_timeout_: max age (s) of gimbal feedback before warning and reusing stale pose.
+  // - tracker_pose_timeout_: max age (s) of gimbal feedback before warning and reusing stale pose.
   // - max_trackers_: upper bound on simultaneous tracks to keep CPU predictable.
   // - new_tracker_min_dist_: minimum 3D spacing (m) to spawn a new tracker near an existing one.
   max_match_distance_ = this->declare_parameter("tracker.max_match_distance", 0.15);
@@ -177,7 +177,7 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   v_yaw_max_          = this->declare_parameter("tracker.v_yaw_max", 15.0);
   maha_match_threshold_ = this->declare_parameter("tracker.maha_match_threshold", 13.3);
   maha_jump_threshold_  = this->declare_parameter("tracker.maha_jump_threshold", 20.0);
-  tracker_micro_pose_timeout_ = this->declare_parameter("tracker.micro_pose_timeout", 0.2);
+  tracker_pose_timeout_ = this->declare_parameter("tracker.micro_pose_timeout", 0.2);
   max_trackers_       = this->declare_parameter("tracker.max_trackers", 5);
   new_tracker_min_dist_ = this->declare_parameter("tracker.new_tracker_min_dist", 0.5);
 
@@ -321,227 +321,69 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
 
   // Dynamic TF from gimbal feedback
   tf2_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
-  gimbal_yaw_ = 0.0;
-  gimbal_pitch_ = 0.0;
+  current_yaw_ = 0.0;
+  current_pitch_ = 0.0;
   gimbal_height_ = declare_parameter("gimbal.height", 0.5);
-  // WHY sign parameters: different robot builds wire the gimbal encoder
-  // with different polarity conventions.  Some STM32 firmwares report pitch
-  // as negative-up, others positive-up.  Rather than reflashing firmware,
-  // a sign flip in software adapts to the convention.  +1.0 = no flip.
   yaw_sign_      = declare_parameter("gimbal.yaw_sign", 1.0);
   pitch_sign_    = declare_parameter("gimbal.pitch_sign", 1.0);
-  micro_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
-    "/micro_pose", rclcpp::SensorDataQoS(),
-    std::bind(&ArmorTrackerNode::microPoseCallback, this, std::placeholders::_1));
+  
+  // Dynamic TF & Pose Source
+  pose_source_ = declare_parameter("pose_source", "none");
+  RCLCPP_INFO(this->get_logger(), "Pose source is set to: %s", pose_source_.c_str());
 
-  // IMU-based chassis rotation compensation
-  enable_imu_compensation_ = declare_parameter("imu.enable", true);
-  imu_gyro_alpha_ = declare_parameter("imu.gyro_alpha", 0.3);
-  imu_timeout_ = declare_parameter("imu.timeout", 0.1);
-  gyro_bias_alpha_ = declare_parameter("imu.gyro_bias_alpha", 0.005);
-  gyro_stationary_threshold_ = declare_parameter("imu.gyro_stationary_threshold", 0.03);
-  gyro_stationary_min_frames_ = declare_parameter("imu.gyro_stationary_min_frames", 30);
-
-  imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
-    "/imu", rclcpp::SensorDataQoS(),
-    std::bind(&ArmorTrackerNode::imuCallback, this, std::placeholders::_1));
+  if (pose_source_ == "micro_pose") {
+    micro_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
+      "/micro_pose", rclcpp::SensorDataQoS(),
+      std::bind(&ArmorTrackerNode::microPoseCallback, this, std::placeholders::_1));
+  } else if (pose_source_ == "camera_imu") {
+    imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
+      "/imu/data", rclcpp::SensorDataQoS(),
+      std::bind(&ArmorTrackerNode::cameraImuCallback, this, std::placeholders::_1));
+  }
 }
+
 
 
 
 void ArmorTrackerNode::microPoseCallback(
   const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg)
 {
-  // Extract gimbal angles from the lower computer.
-  // cmd_vel_subscriber stores: position.x = -pitch, position.y = -yaw (radians)
   double p = pitch_sign_ * msg->pose.position.x;
   double y = yaw_sign_ * msg->pose.position.y;
-  // Reject garbage serial data — gimbal angles physically can't exceed ~90°
+
   if (std::abs(p) < 1.6 && std::abs(y) < 1.6) {
-    gimbal_yaw_   = y;
-    gimbal_pitch_ = p;
+    current_yaw_   = y;
+    current_pitch_ = p;
   }
-  last_micro_pose_time_ = this->now();
-  broadcastGimbalTF(msg->header.stamp);
+  last_pose_time_ = this->now();
+  broadcastCameraTF(msg->header.stamp);
 }
 
-void ArmorTrackerNode::imuCallback(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
+void ArmorTrackerNode::cameraImuCallback(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
 {
-  if (!enable_imu_compensation_) {
-    return;
-  }
-
-  rclcpp::Time now = msg->header.stamp;
-  last_imu_time_ = now;
-
-  if (!imu_initialized_) {
-    prev_imu_time_ = now;
-    prev_gimbal_yaw_ = gimbal_yaw_;
-    prev_gimbal_pitch_ = gimbal_pitch_;
-    imu_initialized_ = true;
-    imu_active_ = true;
-    return;
-  }
-
-  double dt = (now - prev_imu_time_).seconds();
-  if (dt <= 0.0 || dt > 0.5) {
-    prev_imu_time_ = now;
-    prev_gimbal_yaw_ = gimbal_yaw_;
-    prev_gimbal_pitch_ = gimbal_pitch_;
-    return;
-  }
-
-  // -----------------------------------------------------------------------
-  // IMU-based chassis rotation estimation.
-  //
-  // PROBLEM: The camera is mounted on a gimbal that rotates independently
-  // of the chassis.  When the CHASSIS rotates (robot driving/turning), the
-  // entire world shifts in the camera's view.  Without compensation, the
-  // EKF sees this as all targets suddenly moving — corrupting velocity
-  // estimates and causing false armor jumps.
-  //
-  // SOLUTION: Use the D455's onboard IMU (which rotates WITH the camera) to
-  // measure the camera's total angular velocity.  Then subtract the gimbal's
-  // own rotation (known from /micro_pose feedback) to isolate the chassis
-  // rotation.  This chassis rotation is applied to the TF transform so the
-  // odom frame stays fixed in the world, not on the chassis.
-  //
-  // Flow: IMU gyro (camera frame) → rotate to chassis frame → subtract
-  //       gimbal velocity → integrate → chassis yaw/pitch
-  // -----------------------------------------------------------------------
-
-  // EMA low-pass filter on raw gyro to suppress vibration noise.
-  // D455 IMU axes: X-right, Y-down, Z-forward (camera_color_optical_frame).
-  imu_wx_filtered_ = imu_gyro_alpha_ * msg->angular_velocity.x + (1.0 - imu_gyro_alpha_) * imu_wx_filtered_;
-  imu_wy_filtered_ = imu_gyro_alpha_ * msg->angular_velocity.y + (1.0 - imu_gyro_alpha_) * imu_wy_filtered_;
-  imu_wz_filtered_ = imu_gyro_alpha_ * msg->angular_velocity.z + (1.0 - imu_gyro_alpha_) * imu_wz_filtered_;
-
-  // Build the rotation from camera optical frame → chassis frame.
-  // This chains the gimbal joint angles + the optical frame convention:
-  //   q_c2chassis = R_z(gimbal_yaw) × R_y(gimbal_pitch) × R_convention
-  tf2::Quaternion q_yaw, q_pitch, q_convention;
-  q_yaw.setRPY(0, 0, gimbal_yaw_);                    // Gimbal yaw around Z
-  q_pitch.setRPY(0, gimbal_pitch_, 0);                // Gimbal pitch around Y
-  q_convention.setRPY(-M_PI / 2.0, 0, -M_PI / 2.0);  // Camera optical → robotics convention
-
-  tf2::Quaternion q_c2chassis = q_yaw * q_pitch * q_convention;
-  q_c2chassis.normalize();
-
-  // Rotate the IMU angular velocity from camera frame into chassis frame
-  tf2::Vector3 omega_c_in_c(imu_wx_filtered_, imu_wy_filtered_, imu_wz_filtered_);
-  tf2::Vector3 omega_c_in_chassis = tf2::quatRotate(q_c2chassis, omega_c_in_c);
-
-  // Estimate gimbal's own angular velocity from finite differences of
-  // gimbal feedback angles.  The gimbal yaws around chassis Z, pitches around Y.
-  double gimbal_wz = (gimbal_yaw_ - prev_gimbal_yaw_) / dt;
-  double gimbal_wy = (gimbal_pitch_ - prev_gimbal_pitch_) / dt;
-
-  // Isolate chassis angular velocity:
-  //   omega_total = omega_chassis + omega_gimbal
-  //   omega_chassis = omega_total − omega_gimbal
-  double chassis_wy = omega_c_in_chassis.y() - gimbal_wy;
-  double chassis_wz = omega_c_in_chassis.z() - gimbal_wz;
-
-  // Gyro bias estimation: during low-motion periods (|omega| < threshold for
-  // gyro_stationary_min_frames_ consecutive frames), the measured angular velocity
-  // is pure bias. Update bias estimate via slow EMA, then subtract before integration.
-  if (std::abs(chassis_wz) < gyro_stationary_threshold_ &&
-      std::abs(chassis_wy) < gyro_stationary_threshold_) {
-    if (++gyro_stationary_count_ >= gyro_stationary_min_frames_) {
-      gyro_bias_wz_ = gyro_bias_alpha_ * chassis_wz + (1.0 - gyro_bias_alpha_) * gyro_bias_wz_;
-      gyro_bias_wy_ = gyro_bias_alpha_ * chassis_wy + (1.0 - gyro_bias_alpha_) * gyro_bias_wy_;
-    }
-  } else {
-    gyro_stationary_count_ = 0;
-  }
-  chassis_wz -= gyro_bias_wz_;
-  chassis_wy -= gyro_bias_wy_;
-
-  // Euler integration of chassis rotation.
-  chassis_yaw_ += chassis_wz * dt;
-  chassis_pitch_ += chassis_wy * dt;
-
-  RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 500,
-      "IMU chassis_yaw=%.4f chassis_pitch=%.4f gimbal_yaw=%.4f gimbal_pitch=%.4f wz=%.4f wy=%.4f",
-      chassis_yaw_, chassis_pitch_, gimbal_yaw_, gimbal_pitch_, chassis_wz, chassis_wy);
-
-  imu_active_ = true;
-  prev_imu_time_ = now;
-  prev_gimbal_yaw_ = gimbal_yaw_;
-  prev_gimbal_pitch_ = gimbal_pitch_;
+  // Estraiamo pitch e yaw assoluti calcolati dal filtro (Madgwick)
+  tf2::Quaternion q;
+  tf2::fromMsg(msg->orientation, q);
+  double roll, pitch, yaw;
+  tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
+  
+  current_yaw_ = yaw;
+  current_pitch_ = pitch;
+  
+  broadcastCameraTF(msg->header.stamp);
 }
 
-// ---------------------------------------------------------------------------
-// broadcastGimbalTF — publish the transform from "odom" to "camera_color_optical_frame".
-//
-// This transform tells TF2 where the camera is in world coordinates so that
-// armor positions measured in camera frame can be converted to odom frame.
-//
-// Decomposition (right-to-left multiplication order):
-//
-//   T(odom → camera) = Translate(0, 0, gimbal_height)   ← vertical offset
-//     × R_z(chassis_yaw) × R_y(chassis_pitch)           ← chassis ego-motion (from IMU)
-//     × R_z(gimbal_yaw) × R_y(gimbal_pitch)             ← gimbal joints (from lower computer)
-//     × R_convention                                     ← optical frame convention
-//
-// R_convention = RPY(−π/2, 0, −π/2) converts from the ROS camera_color_optical_frame
-// convention (X-right, Y-down, Z-forward) to the robotics convention (X-forward,
-// Y-left, Z-up).  When both gimbal angles are 0, this matches the old static TF.
-//
-// The transform is written directly into tf2_buffer_ (via setTransform) so
-// that lookupTransform() later in the same callback sees it immediately,
-// even before the /tf topic message is received by other subscribers.
-// ---------------------------------------------------------------------------
-void ArmorTrackerNode::broadcastGimbalTF(const rclcpp::Time & stamp)
+void ArmorTrackerNode::broadcastCameraTF(const rclcpp::Time & stamp)
 {
-  // Purpose: keep odom as a world-fixed frame by publishing the live camera pose
-  // derived from chassis rotation (IMU) + gimbal joints + fixed optical offset.
-  // Without this, every gimbal movement would look like the target jumped in 3D.
-  // Consequences of skipping it: TF2 would reuse a stale camera pose, so after
-  // each gimbal pan/tilt the same physical robot would project to a different
-  // place in odom. The tracker would see fake target motion, inflate Mahalanobis
-  // distances, and either miss associations or spawn ghost tracks.
-
-  // Check gimbal pose staleness
-  if (last_micro_pose_time_.nanoseconds() > 0) {
-    double micro_staleness = (this->now() - last_micro_pose_time_).seconds();
-    if (micro_staleness > tracker_micro_pose_timeout_) {
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 2000,
-        "Gimbal pose stale (%.3fs > %.3fs), using last-known angles",
-        micro_staleness, tracker_micro_pose_timeout_);
-    }
-  }
-
-  // Chassis rotation from IMU (identity if IMU inactive/stale)
-  tf2::Quaternion q_chassis_yaw, q_chassis_pitch;
-  q_chassis_yaw.setRPY(0, 0, 0);
-  q_chassis_pitch.setRPY(0, 0, 0);
-
-  if (enable_imu_compensation_ && imu_active_) {
-    double staleness = (stamp - last_imu_time_).seconds();
-    if (staleness < imu_timeout_) {
-      q_chassis_yaw.setRPY(0, 0, chassis_yaw_);
-      q_chassis_pitch.setRPY(0, chassis_pitch_, 0);
-    } else {
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 2000,
-        "IMU data stale (%.3fs > %.3fs), falling back to gimbal-only TF",
-        staleness, imu_timeout_);
-    }
-  }
-
-  // Gimbal rotation from lower computer feedback
-  tf2::Quaternion q_yaw, q_pitch, q_convention;
-  q_yaw.setRPY(0, 0, gimbal_yaw_);
-  q_pitch.setRPY(0, gimbal_pitch_, 0);
-  // R_convention = RPY(-π/2, 0, -π/2) matches the old static TF when yaw=pitch=0
-  q_convention.setRPY(-M_PI / 2.0, 0, -M_PI / 2.0);
-
-  // Compose in order: chassis (IMU) → gimbal → optical-frame convention.
-  tf2::Quaternion q_final = q_chassis_yaw * q_chassis_pitch * q_yaw * q_pitch * q_convention;
-  q_final.normalize();
-
+  // T(odom -> camera) = Translate(0,0,gimbal_height) * Rotate(pitch/yaw) * R_convention
+  tf2::Quaternion q_camera;
+  q_camera.setRPY(0.0, current_pitch_, current_yaw_);
+  
+  tf2::Quaternion q_convention;
+  q_convention.setRPY(-M_PI / 2.0, 0.0, -M_PI / 2.0);
+  
+  tf2::Quaternion q_final = q_camera * q_convention;
+  
   geometry_msgs::msg::TransformStamped t;
   t.header.stamp = stamp;
   t.header.frame_id = "odom";
@@ -551,9 +393,6 @@ void ArmorTrackerNode::broadcastGimbalTF(const rclcpp::Time & stamp)
   t.transform.translation.z = gimbal_height_;
   t.transform.rotation = tf2::toMsg(q_final);
 
-  // Write directly into our own buffer so the transform is available immediately
-  // for the lookupTransform() call later in this same callback.
-  // The broadcast still publishes on /tf for other nodes (e.g. rviz, tf2_echo).
   tf2_buffer_->setTransform(t, "armor_tracker");
   tf2_broadcaster_->sendTransform(t);
 }
@@ -598,7 +437,7 @@ void ArmorTrackerNode::armorsCallback(
   // "camera_color_optical_frame" = RealSense optical frame (x-right, y-down, z-forward)
   // attached to the moving gimbal. We must transform detections from camera frame
   // into odom to compare across time as the gimbal and chassis move.
-  broadcastGimbalTF(detection_msg->header.stamp);
+  broadcastCameraTF(detection_msg->header.stamp);
 
   // Convert 2D detections to Armors message
   auto_aim_interfaces::msg::Armors armors_msg;

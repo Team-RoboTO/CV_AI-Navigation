@@ -6,7 +6,8 @@
     enable_color: true
     enable_depth: false
     enable_gyro: true
-    enable_accel: false
+    enable_accel: true
+    unite_imu_method: 2
 
     rgb_camera.color_profile: "640x480x30"
     depth_module.depth_profile: "640x480x30"

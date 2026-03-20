@@ -13,6 +13,8 @@ find_package(auto_aim_interfaces REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(angles REQUIRED)
 find_package(visualization_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(sensor_msgs REQUIRED)
 
 add_library(${PROJECT_NAME} SHARED
   src/trajectory_solver.cpp
@@ -31,6 +33,8 @@ ament_target_dependencies(${PROJECT_NAME}
   geometry_msgs
   angles
   visualization_msgs
+  tf2
+  sensor_msgs
 )
 
 rclcpp_components_register_node(${PROJECT_NAME}

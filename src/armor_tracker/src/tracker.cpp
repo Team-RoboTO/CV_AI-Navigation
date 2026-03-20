@@ -654,18 +654,10 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
           }
         }
       } else if (yaw_diff > max_match_yaw_diff_ && !yaw_oblique) {
-        // Yaw jumped (and not oblique) — gate with relaxed Mahalanobis before accepting
-        measurement = Eigen::Vector4d(p.x, p.y, p.z, measured_yaw);
-        // Linearize H at the measured yaw (not x_pri's yaw) for jump gating.
-        // During jumps, x_pri's yaw is ~90° off, making H maximally inaccurate.
-        Eigen::VectorXd x_jump = target_state;
-        x_jump(6) = measured_yaw;
-        double maha = ekf.mahalanobisAt(measurement, x_jump);
-        if (maha < maha_jump_threshold_) {  // relaxed gate for jumps
-          handleArmorJump(selected_armor);
-          matched = true;
-          measurement_valid = true;
-        } else {
+        matched = true;
+        measurement_valid = true;
+        handleArmorJump(selected_armor);
+      } else {
           RCLCPP_WARN(rclcpp::get_logger("armor_tracker"),
             "Armor jump rejected: Mahalanobis=%.1f > %.1f", maha, maha_jump_threshold_);
         }
@@ -962,8 +954,8 @@ void Tracker::handleArmorJump(const Armor & current_armor)
   // If that disagrees with v_yaw's sign, the robot changed spin direction.
   double jump_direction = angles::shortest_angular_distance(target_state(6), yaw);
   double jump_angle = std::abs(jump_direction);
-  if (jump_direction * target_state(7) < 0) {
-    // Spin reversal detected — zero v_yaw to prevent EKF from extrapolating in wrong direction
+  // INVERTI IL SEGNO DA < 0 A > 0
+  if (jump_direction * target_state(7) > 0) {
     target_state(7) = 0.0;
     RCLCPP_WARN(rclcpp::get_logger("armor_tracker"), "Spin reversal — v_yaw zeroed");
   }

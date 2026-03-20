@@ -82,11 +82,6 @@ private:
     const rclcpp::Time & time,
     const rclcpp::Time & last_meas_time);
 
-  // Receive gimbal feedback from lower computer → update gimbal angles
-  void microPoseCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg);
-  // Broadcast odom → camera_color_optical_frame TF (includes gimbal + chassis rotation)
-  void broadcastGimbalTF(const rclcpp::Time & stamp);
-
   // Maximum allowable armor distance in the XOY plane
   double max_armor_distance_;
 
@@ -197,45 +192,30 @@ private:
   // Letterbox padding Y offset (pixels)
   double bbox_padding_y_;
 
-  // Dynamic TF from gimbal feedback
+  // --- Dynamic TF & Pose Source ---
+  // pose_source_ detemina da dove prendiamo i dati dell'orientamento:
+  double yaw_sign_;
+  double pitch_sign_;
+  // "micro_pose" (dal microcontrollore), "camera_imu" (dal filtro madgwick), o "none"
+  std::string pose_source_;
+  double gimbal_height_;  // [m] altezza del gimbal da terra
+  
+  // Variabili per memorizzare l'angolo assoluto della telecamera nel mondo
+  double current_pitch_ = 0.0;
+  double current_yaw_ = 0.0;
+  rclcpp::Time last_pose_time_{0, 0, RCL_ROS_TIME};
+  double tracker_pose_timeout_ = 0.2; // tempo [s] prima che il TF venga considerato vecchio
+
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf2_broadcaster_;
+  
+  // Callbacks per le due possibili fonti
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr micro_pose_sub_;
-  double gimbal_yaw_, gimbal_pitch_;
-  double gimbal_height_, yaw_sign_, pitch_sign_;
-  rclcpp::Time last_micro_pose_time_{0, 0, RCL_ROS_TIME};
-  double tracker_micro_pose_timeout_ = 0.2;
-
-  // --- IMU-based chassis rotation compensation ---
-  // The camera IMU measures total angular velocity (chassis + gimbal).
-  // We subtract gimbal velocity (from /micro_pose) to isolate chassis rotation,
-  // then integrate to estimate chassis yaw/pitch.  This is applied to the TF
-  // so armor positions in odom frame aren't corrupted by chassis turning.
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
-  void imuCallback(const sensor_msgs::msg::Imu::ConstSharedPtr msg);
+  void microPoseCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg);
+  void cameraImuCallback(const sensor_msgs::msg::Imu::ConstSharedPtr msg);
 
-  double chassis_yaw_ = 0.0;         // Integrated chassis yaw [rad]
-  double chassis_pitch_ = 0.0;       // Integrated chassis pitch [rad]
-  double imu_wx_filtered_ = 0.0;     // EMA-filtered gyro X (camera frame) [rad/s]
-  double imu_wy_filtered_ = 0.0;     // EMA-filtered gyro Y [rad/s]
-  double imu_wz_filtered_ = 0.0;     // EMA-filtered gyro Z [rad/s]
-  double prev_gimbal_yaw_ = 0.0;     // Previous gimbal yaw (for finite-difference)
-  double prev_gimbal_pitch_ = 0.0;   // Previous gimbal pitch
-  rclcpp::Time prev_imu_time_;       // Timestamp of previous IMU message
-  bool imu_initialized_ = false;     // First IMU message received
-  bool imu_active_ = false;          // IMU data is being received
-  rclcpp::Time last_imu_time_;       // Timestamp of most recent IMU message
-
-  // IMU tuning parameters
-  bool enable_imu_compensation_ = true;  // Master enable for chassis compensation
-  double imu_gyro_alpha_ = 0.3;          // EMA weight for gyro low-pass filter
-  double imu_timeout_ = 0.1;             // Staleness threshold for IMU data [s]
-  // Gyro bias estimation: corrects IMU drift during low-motion periods
-  double gyro_bias_wz_ = 0.0;
-  double gyro_bias_wy_ = 0.0;
-  double gyro_bias_alpha_;               // Slow EMA weight (default 0.005)
-  double gyro_stationary_threshold_;     // Low-motion threshold [rad/s] (default 0.03)
-  int gyro_stationary_count_ = 0;        // Consecutive low-motion frames
-  int gyro_stationary_min_frames_;       // Frames before bias updates begin (default 30)
+  // Trasmettitore per la mappa finale
+  void broadcastCameraTF(const rclcpp::Time & stamp);
 
   // Visualization marker publisher
   visualization_msgs::msg::Marker position_marker_;

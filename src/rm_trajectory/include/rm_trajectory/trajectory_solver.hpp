@@ -2,6 +2,9 @@
 #define RM_TRAJECTORY__TRAJECTORY_SOLVER_HPP_
 
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <sensor_msgs/msg/imu.hpp>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Matrix3x3.h>
 #include <geometry_msgs/msg/twist.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <tuple>
@@ -47,6 +50,8 @@ public:
 
 private:
   void targetCallback(auto_aim_interfaces::msg::Target::UniquePtr msg);
+  void microPoseCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg);
+  void cameraImuCallback(const sensor_msgs::msg::Imu::ConstSharedPtr msg);
   void targetsCallback(auto_aim_interfaces::msg::Targets::UniquePtr msg);
 
   // Solves for the pitch angle given position and velocity
@@ -160,12 +165,14 @@ private:
   // --- Current gimbal position (from /micro_pose serial feedback) ---
   // Used to compute relative commands: target_angle − current_angle
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr micro_pose_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   double current_pitch_ = 0.0;   // Current gimbal pitch [rad]
   double current_yaw_ = 0.0;     // Current gimbal yaw [rad]
   double yaw_sign_ = 1.0;        // Sign convention correction for yaw
   double pitch_sign_ = 1.0;      // Sign convention correction for pitch
-  rclcpp::Time last_micro_pose_time_{0, 0, RCL_ROS_TIME};
-  double micro_pose_timeout_;     // Suppress fire when /micro_pose is stale [s]
+  rclcpp::Time last_pose_time_{0, 0, RCL_ROS_TIME};
+  double pose_timeout_;     // Suppress fire when /micro_pose is stale [s]
+  std::string pose_source_;               // Flag to enable/disable checking for real gimbal/imu data
 
   // --- Gimbal command smoothing (EMA) ---
   // Filters the relative pitch/yaw commands to suppress frame-to-frame jitter

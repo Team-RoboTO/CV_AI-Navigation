@@ -219,7 +219,7 @@ void ExtendedKalmanFilter::inflateCovariance(int idx, double factor)
   double s = std::sqrt(factor);
   P_post.row(idx) *= s;
   P_post.col(idx) *= s;
-  P_post = (P_post + P_post.transpose()) * 0.5;
+  P_post = ((P_post + P_post.transpose()) * 0.5).eval();   // .eval() to force immediate computation and prevent aliasing issues!
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +306,7 @@ Eigen::MatrixXd ExtendedKalmanFilter::predict()
   // Covariance prediction: F·P·Fᵀ propagates old uncertainty through dynamics,
   // Q adds fresh uncertainty from unmodeled accelerations / model mismatch.
   P_pri = F * P_post * F.transpose() + Q;
+  P_pri = ((P_pri + P_pri.transpose()) * 0.5).eval();
 
   // Safety: clamp diagonal covariance elements to configurable upper bounds.
   // During TEMP_LOST, P grows every frame with no measurement correction.
@@ -383,7 +384,7 @@ double ExtendedKalmanFilter::mahalanobis(const Eigen::VectorXd & z)
     return 1e9;  // degenerate S → treat as extreme outlier
   }
   // d² = yᵀ · S⁻¹ · y — squared Mahalanobis distance
-  return y.transpose() * S_ldlt.solve(y);
+  return (y.transpose() * S_ldlt.solve(y)).value();
 }
 
 // ---------------------------------------------------------------------------
@@ -411,7 +412,7 @@ double ExtendedKalmanFilter::mahalanobisAt(
   if (S_ldlt.info() != Eigen::Success || !S_ldlt.isPositive()) {
     return 1e9;
   }
-  return y.transpose() * S_ldlt.solve(y);
+  return (y.transpose() * S_ldlt.solve(y)).value();
 }
 
 // ---------------------------------------------------------------------------
@@ -472,7 +473,7 @@ Eigen::MatrixXd ExtendedKalmanFilter::update(const Eigen::VectorXd & z)
 
   // Force exact symmetry: tiny asymmetries accumulate over thousands of frames
   // and can eventually cause Eigen decompositions to fail.
-  P_post = (P_post + P_post.transpose()) * 0.5;
+  P_post = ((P_post + P_post.transpose()) * 0.5).eval();
 
   return x_post;
 }
@@ -536,7 +537,7 @@ Eigen::MatrixXd ExtendedKalmanFilter::updateWithModel(
   P_post = IKH * P_post * IKH.transpose() + K_ext * R_ext * K_ext.transpose();
 
   // Force symmetry
-  P_post = (P_post + P_post.transpose()) * 0.5;
+  P_post = ((P_post + P_post.transpose()) * 0.5).eval();
 
   return x_post;
 }

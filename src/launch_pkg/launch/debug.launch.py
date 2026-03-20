@@ -194,13 +194,24 @@ def generate_launch_description():
             {'json_file_path': realsense_json_file_path,
             'publish_tf': False}],
         # No topic remappings — let the driver publish on its default
-        # /camera/camera/* topics.  The encoder subscribes to
-        # /camera/camera/color/image_raw and the tracker subscribes to
-        # /camera/camera/color/camera_info, matching these defaults.
-        # Previous remappings created a circular dependency:
-        #   RealSense: /camera/camera/color/camera_info → /camera_info
-        #   Tracker:   /camera_info → /camera/camera/color/camera_info
-        # resulting in the tracker subscribing to a topic nobody publishes on.
+        # /camera/camera/* topics.
+    )
+
+    # Madgwick IMU Filter
+    # Takes raw sensor data (accelerometer + gyroscope) from /camera/camera/imu 
+    # and calculates the absolute orientation (quaternions), publishing it to /imu/data.
+    imu_filter_node = ComposableNode(
+        name='imu_filter',
+        package='imu_filter_madgwick',
+        plugin='ImuFilterMadgwick',
+        parameters=[{
+            'use_mag': False,                   # The Intel RealSense D455 does not have/use a magnetometer
+            'publish_tf': False,                # We rely on the tracker node to publish the TF, not the IMU filter
+            'world_frame': 'odom',              # Reference frame for the absolute orientation
+        }],
+        remappings=[
+            ('/imu/data_raw', '/camera/camera/imu')
+        ]
     )
 
     encoder_node = ComposableNode(
@@ -248,7 +259,7 @@ def generate_launch_description():
         package='isaac_ros_yolov8',
         plugin='nvidia::isaac_ros::yolov8::YoloV8DecoderNode',
         parameters=[{
-            'confidence_threshold': 0.10, # da cambiare dopo test
+            'confidence_threshold': 0.10, # Adjust after initial testing
             'nms_threshold': 0.45,
             'num_classes': 5,
             'in_width': 640.0,
@@ -276,31 +287,30 @@ def generate_launch_description():
             {'max_armor_distance': 10.0},           # [m] discard PnP detections farther than this
             {'light_ratio': 1.0},                   # min light-bar aspect ratio to accept as armor
             # Tracker
-            {'tracker.max_match_distance': 0.60},   # [m] max 3D distance between EKF prediction and detection to match
+            {'tracker.max_match_distance': 0.30},   # [m] tighter gate to prevent matching wrong armor (was 0.60)
             {'tracker.max_track_range': 6.0},        # [m] drop target if farther than this from camera
-            {'tracker.tracking_thres': 2},           # consecutive matches needed to transition DETECTING → TRACKING
-            {'tracker.lost_time_thres': 1.0},        # [s] time without match before TEMP_LOST → LOST
+            {'tracker.tracking_thres': 4},           # require 4 frames of stability before shooting (was 2)
+            {'tracker.lost_time_thres': 0.5},        # [s] die faster to prevent long ghost tracks (was 1.0)
             # EKF process noise
-            {'ekf.sigma2_q_xyz': 8.0},              # position process noise variance (higher → trusts measurements more)
-            {'ekf.sigma2_q_yaw':10.0},             # yaw process noise variance
-            {'ekf.sigma2_q_r': 4.0},                # radius process noise variance (keep high so r adapts as target rotates)
+            {'ekf.sigma2_q_xyz': 1.0},              # position process noise variance (was 8.0, lowered to reduce velocity spikes)
+            {'ekf.sigma2_q_yaw': 3.0},              # yaw process noise variance (was 10.0, lowered to smooth rotations)
+            {'ekf.sigma2_q_r': 1.0},                # radius process noise variance
             # EKF velocity damping (alpha^(dt/T) decay per step; 1.0 = no decay)
-            {'ekf.xyz_damping_alpha': 0.95},         # position velocity damping (lower → stronger braking)
-            {'ekf.yaw_damping_alpha': 0.95},         # yaw velocity damping
-            {'ekf.coast_damping_factor': 0.85},      # extra damping multiplier during TEMP_LOST coasting
-            {'ekf.damping_innov_threshold': 0.10},   # [m] position innovation above which overshoot damping activates
+            {'ekf.xyz_damping_alpha': 0.85},         # position velocity damping (was 0.95, lowered to brake faster on noisy frames)
+            {'ekf.yaw_damping_alpha': 0.85},         # yaw velocity damping
+            {'ekf.coast_damping_factor': 0.60},      # extra damping multiplier during TEMP_LOST coasting
+            {'ekf.damping_innov_threshold': 0.05},   # [m] pos innovation threshold before damping (was 0.10)
             {'ekf.yaw_innov_threshold': 0.15},       # [rad] yaw innovation above which yaw damping activates
             {'ekf.ref_frequency': 30.0},              # [Hz] reference frame rate for time-normalization
+            {'tracker.v_yaw_max': 5.0},              # [rad/s] clamp on yaw spin rate (stops 360-degree glitches)
+            # Pose Info Source ('none', 'micro_pose', 'camera_imu')
+            # 'none' disables hardware limits/requirements, vital for local software/rendering testing.
+            {'pose_source': 'none'},
             # Gimbal TF
             {'gimbal.height': .325},                 # [m] gimbal pivot height above ground
             {'gimbal.yaw_sign': 1.0},                # sign flip for yaw axis (+1 or -1)
             {'gimbal.pitch_sign': 1.0},              # sign flip for pitch axis (+1 or -1)
-            # IMU chassis compensation
-            {'imu.enable': False},                    # enable/disable IMU ego-motion compensation
-            {'imu.gyro_alpha': 0.3},                 # EMA filter weight for gyro smoothing (0–1)
-            {'imu.timeout': 0.1},                    # [s] IMU staleness threshold before fallback
-            {'imu.yaw_axis_sign': -1.0},             # sign correction for D455 gyro Y → world yaw
-            {'imu.pitch_axis_sign': -1.0},           # sign correction for D455 gyro X → world pitch
+            # Legacy IMU parameters have been cleared out. Used 'pose_source' paradigm instead to choose sensor fusion mode.
         ],
         extra_arguments=[{'use_intra_process_comms': True}]
     )
@@ -311,6 +321,7 @@ def generate_launch_description():
         plugin='rm_auto_aim::TrajectorySolverNode',
         name='trajectory_solver',
         parameters=[
+            {'pose_source': 'none'},                  # 'none' bypasses hardware safety checks (ignores motor max-speed limits and serial permissions) allowing pure vision testing
             # Ballistics
             {'bullet_speed': 25.0},                 # [m/s] muzzle velocity of the projectile
             {'gravity': 9.8},                        # [m/s²] gravitational acceleration
@@ -346,6 +357,7 @@ def generate_launch_description():
         executable='component_container_mt',
         composable_node_descriptions=[
             realsense_node,
+            imu_filter_node,
             encoder_node,
             tensor_rt_node,
             yolov8_decoder_node,

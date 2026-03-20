@@ -129,20 +129,18 @@ TrajectorySolverNode::TrajectorySolverNode(const rclcpp::NodeOptions &options)
   // so a single launch config controls both nodes consistently.
   yaw_sign_      = this->declare_parameter("gimbal.yaw_sign", 1.0);
   pitch_sign_    = this->declare_parameter("gimbal.pitch_sign", 1.0);
-  micro_pose_timeout_ = this->declare_parameter("micro_pose_timeout", 0.15);
+  pose_timeout_ = this->declare_parameter("micro_pose_timeout", 0.15);
+  pose_source_   = this->declare_parameter("pose_source", "none");
 
-  micro_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
-      "/micro_pose", rclcpp::SensorDataQoS(),
-      [this](const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg) {
-        double p = pitch_sign_ * msg->pose.position.x;
-        double y = yaw_sign_  * msg->pose.position.y;
-        // Reject garbage serial data — gimbal angles physically can't exceed ~90°
-        if (std::abs(p) < 1.6 && std::abs(y) < 1.6) {
-          current_pitch_ = p;
-          current_yaw_   = y;
-        }
-        last_micro_pose_time_ = this->now();
-      });
+  if (pose_source_ == "micro_pose") {
+    micro_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
+        "/micro_pose", rclcpp::SensorDataQoS(),
+        std::bind(&TrajectorySolverNode::microPoseCallback, this, std::placeholders::_1));
+  } else if (pose_source_ == "camera_imu") {
+    imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
+        "/imu/data", rclcpp::SensorDataQoS(),
+        std::bind(&TrajectorySolverNode::cameraImuCallback, this, std::placeholders::_1));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -396,19 +394,23 @@ void TrajectorySolverNode::targetCallback(
   //   > max_measurement_age_ ago (e.g. YOLO dropped frames), the position
   //   is unreliable.  The EKF hasn't timed out yet, but it's coasting.
   //
-  // micro_pose_stale:
-  //   We publish RELATIVE gimbal angles: target_angle − current_angle.
-  //   current_angle comes from /micro_pose (gimbal serial feedback).
-  //   If that topic is stale or never received, current_angle is wrong,
-  //   and the relative command will point the gimbal in the wrong direction.
+  // pose_stale:
+  //   if we are using the imu (imu.enable = true), we check if the gimbal feedback
+  //   is too old. Se i dati sono vecchi, non sappiamo dove è puntato il gimbal,
+  //   quindi blocchiamo lo sparo (hold).
+  //   se imu.enable = false, stiamo testando senza hardware in fiera, e fingiamo 
+  //   che i dati ci siano sempre per poter visualizzare "fire" nel terminale.
   bool temp_lost = (msg->tracker_state == auto_aim_interfaces::msg::Target::TEMP_LOST);
   double measurement_age =
     (rclcpp::Time(msg->header.stamp) - rclcpp::Time(msg->last_measurement_stamp)).seconds();
   bool measurement_stale = (measurement_age > max_measurement_age_);
 
-  double micro_pose_age = (this->now() - last_micro_pose_time_).seconds();
-  bool micro_pose_stale = (last_micro_pose_time_.nanoseconds() == 0) ||
-                          (micro_pose_age > micro_pose_timeout_);
+  double pose_age = (this->now() - last_pose_time_).seconds();
+  bool pose_stale = false;
+  if (pose_source_ != "none") {
+    pose_stale = (last_pose_time_.nanoseconds() == 0) ||
+                       (pose_age > pose_timeout_);
+  }
 
   // -------------------------------------------------------------------------
   // Adaptive latency compensation (EMA with outlier rejection)
@@ -799,7 +801,7 @@ void TrajectorySolverNode::targetCallback(
     // -----------------------------------------------------------------------
     bool dist_ok = (best->range >= min_fire_dist_) && (best->range <= max_fire_dist_);
     bool fire = false;
-    if (dist_ok && !temp_lost && !measurement_stale && !micro_pose_stale && best->reachable) {
+    if (dist_ok && !temp_lost && !measurement_stale && !pose_stale && best->reachable) {
       // Distance-scaled angular window (same logic as direct mode)
       double dist_scale = std::min(angular_window_ref_dist_ / std::max(best->range, 0.5), 2.0);
       double base_window = angular_window_ * dist_scale;
@@ -855,12 +857,17 @@ void TrajectorySolverNode::targetCallback(
     double rel_pitch = best->pitch - current_pitch_;  // target pitch − current gimbal pitch
     double rel_yaw = angles::shortest_angular_distance(current_yaw_, best->yaw);  // shortest path
 
-    // Gimbal saturation: suppress fire if gimbal can't physically slew to target
+    // gimbal saturation: suppress fire if gimbal can't physically slew to target
     {
       double settling_time = std::max(time_bias_, 0.03);
-      bool gimbal_can_reach =
-        (std::abs(rel_yaw) < max_gimbal_yaw_rate_ * settling_time) &&
-        (std::abs(rel_pitch) < max_gimbal_pitch_rate_ * settling_time);
+      bool gimbal_can_reach = true;
+      if (pose_source_ != "none") {
+        // se l'hardware è attivo (imu_enable = true), calcoliamo se i motori 
+        // sono abbastanza veloci per arrivare al target in tempo.
+        gimbal_can_reach =
+          (std::abs(rel_yaw) < max_gimbal_yaw_rate_ * settling_time) &&
+          (std::abs(rel_pitch) < max_gimbal_pitch_rate_ * settling_time);
+      }
       fire = fire && gimbal_can_reach;
     }
 
@@ -868,14 +875,14 @@ void TrajectorySolverNode::targetCallback(
     // The fire gate uses the raw (unsmoothed) angles so latency isn't added to
     // the trigger decision — only the commanded motion is smoothed.
     if (!cmd_smooth_initialized_) {
-      smoothed_rel_yaw_ = rel_yaw;
-      smoothed_rel_pitch_ = rel_pitch;
+      smoothed_abs_yaw_ = rel_yaw;
+      smoothed_abs_pitch_ = rel_pitch;
       cmd_smooth_initialized_ = true;
     } else {
-      smoothed_rel_yaw_ = cmd_smooth_alpha_ * rel_yaw
-                          + (1.0 - cmd_smooth_alpha_) * smoothed_rel_yaw_;
-      smoothed_rel_pitch_ = cmd_smooth_alpha_ * rel_pitch
-                            + (1.0 - cmd_smooth_alpha_) * smoothed_rel_pitch_;
+      smoothed_abs_yaw_ = cmd_smooth_alpha_ * rel_yaw
+                          + (1.0 - cmd_smooth_alpha_) * smoothed_abs_yaw_;
+      smoothed_abs_pitch_ = cmd_smooth_alpha_ * rel_pitch
+                            + (1.0 - cmd_smooth_alpha_) * smoothed_abs_pitch_;
     }
 
     // Hard clamp on relative gimbal commands (last line of defence).
@@ -890,11 +897,11 @@ void TrajectorySolverNode::targetCallback(
     // never receives a step larger than max_cmd_angle_ (default 15°) per frame.
     // Tunable at runtime: ros2 param set /trajectory_solver max_cmd_angle <deg>
     double max_rad = max_cmd_angle_ * M_PI / 180.0;
-    smoothed_rel_yaw_   = std::max(-max_rad, std::min(smoothed_rel_yaw_,   max_rad));
-    smoothed_rel_pitch_ = std::max(-max_rad, std::min(smoothed_rel_pitch_, max_rad));
+    smoothed_abs_yaw_   = std::max(-max_rad, std::min(smoothed_abs_yaw_,   max_rad));
+    smoothed_abs_pitch_ = std::max(-max_rad, std::min(smoothed_abs_pitch_, max_rad));
 
-    cmd.pitch    = smoothed_rel_pitch_ * 180.0 / M_PI;
-    cmd.yaw      = smoothed_rel_yaw_ * 180.0 / M_PI;
+    cmd.pitch    = smoothed_abs_pitch_ * 180.0 / M_PI;
+    cmd.yaw      = smoothed_abs_yaw_ * 180.0 / M_PI;
     cmd.distance = best->range;
     cmd.fire_cmd = fire;
     cmd_pub_->publish(cmd);
@@ -902,8 +909,8 @@ void TrajectorySolverNode::targetCallback(
     // Publish Twist
     geometry_msgs::msg::Twist twist;
     twist.angular.x = fire ? 1.0 : 0.0;
-    twist.angular.y = smoothed_rel_pitch_ * 180.0 / M_PI;
-    twist.angular.z = smoothed_rel_yaw_   * 180.0 / M_PI;
+    twist.angular.y = smoothed_abs_pitch_ * 180.0 / M_PI;
+    twist.angular.z = smoothed_abs_yaw_   * 180.0 / M_PI;
     twist_pub_->publish(twist);
 
     // Orange marker for indirect impact point
@@ -1190,13 +1197,13 @@ void TrajectorySolverNode::targetCallback(
   // Additional suppressions:
   //   temp_lost         — EKF is coasting, position unreliable
   //   measurement_stale — last real detection was too long ago
-  //   micro_pose_stale  — don't know current gimbal angles → wrong relative cmd
+  //   pose_stale  — don't know current gimbal angles → wrong relative cmd
   //   !reachable        — required pitch exceeds gimbal physical limits
   //   all_faces_oblique — no face is oriented well enough for a hit
   //   gimbal_can_reach  — gimbal servo can't slew fast enough to target
   // -----------------------------------------------------------------------
   bool in_range = false;
-  if (dist_ok && !temp_lost && !measurement_stale && !micro_pose_stale && reachable &&
+  if (dist_ok && !temp_lost && !measurement_stale && !pose_stale && reachable &&
       !all_faces_oblique) {
     // Predict where the aimed face will point when the bullet arrives.
     // The prediction horizon includes gimbal_response_delay_ because the
@@ -1284,9 +1291,13 @@ void TrajectorySolverNode::targetCallback(
     // division-like edge cases when the EMA hasn't warmed up (time_bias_ ≈ 0)
     // and gives the PID at least one servo cycle to act.
     double settling_time = std::max(time_bias_, 0.03);
-    bool gimbal_can_reach =
-      (std::abs(rel_yaw) < max_gimbal_yaw_rate_ * settling_time) &&
-      (std::abs(rel_pitch) < max_gimbal_pitch_rate_ * settling_time);
+    bool gimbal_can_reach = true;
+    if (pose_source_ != "none") {
+      // hardware fisico abilitato: ci assicuriamo che i motori ce la facciano
+      gimbal_can_reach =
+        (std::abs(rel_yaw) < max_gimbal_yaw_rate_ * settling_time) &&
+        (std::abs(rel_pitch) < max_gimbal_pitch_rate_ * settling_time);
+    }
 
     in_range = (face_diff < effective_window) && gimbal_can_reach;
   }
@@ -1300,20 +1311,20 @@ void TrajectorySolverNode::targetCallback(
   //
   // current_pitch_ and current_yaw_ come from /micro_pose (gimbal feedback).
   // If /micro_pose is stale, the relative angles will be wrong and fire is
-  // already suppressed by the micro_pose_stale check above.
+  // already suppressed by the pose_stale check above.
   // -----------------------------------------------------------------------
   // EMA smoothing: suppress high-frequency jitter from EKF measurement noise.
   // The fire gate above uses raw (unsmoothed) rel_pitch/rel_yaw so trigger
   // decisions have zero added latency — only the commanded motion is smoothed.
   if (!cmd_smooth_initialized_) {
-    smoothed_rel_yaw_ = rel_yaw;
-    smoothed_rel_pitch_ = rel_pitch;
+    smoothed_abs_yaw_ = rel_yaw;
+    smoothed_abs_pitch_ = rel_pitch;
     cmd_smooth_initialized_ = true;
   } else {
-    smoothed_rel_yaw_ = cmd_smooth_alpha_ * rel_yaw
-                        + (1.0 - cmd_smooth_alpha_) * smoothed_rel_yaw_;
-    smoothed_rel_pitch_ = cmd_smooth_alpha_ * rel_pitch
-                          + (1.0 - cmd_smooth_alpha_) * smoothed_rel_pitch_;
+    smoothed_abs_yaw_ = cmd_smooth_alpha_ * rel_yaw
+                        + (1.0 - cmd_smooth_alpha_) * smoothed_abs_yaw_;
+    smoothed_abs_pitch_ = cmd_smooth_alpha_ * rel_pitch
+                          + (1.0 - cmd_smooth_alpha_) * smoothed_abs_pitch_;
   }
 
   // Hard clamp on relative gimbal commands (last line of defence).
@@ -1328,14 +1339,14 @@ void TrajectorySolverNode::targetCallback(
   // never receives a step larger than max_cmd_angle_ (default 15°) per frame.
   // Tunable at runtime: ros2 param set /trajectory_solver max_cmd_angle <deg>
   double max_rad = max_cmd_angle_ * M_PI / 180.0;
-  smoothed_rel_yaw_   = std::max(-max_rad, std::min(smoothed_rel_yaw_,   max_rad));
-  smoothed_rel_pitch_ = std::max(-max_rad, std::min(smoothed_rel_pitch_, max_rad));
+  smoothed_abs_yaw_   = std::max(-max_rad, std::min(smoothed_abs_yaw_,   max_rad));
+  smoothed_abs_pitch_ = std::max(-max_rad, std::min(smoothed_abs_pitch_, max_rad));
 
   auto_aim_interfaces::msg::GimbalCmd cmd;
   cmd.header = msg->header;
 
-  cmd.pitch    = smoothed_rel_pitch_ * 180.0 / M_PI;   // degrees
-  cmd.yaw      = smoothed_rel_yaw_ * 180.0 / M_PI;     // degrees
+  cmd.pitch    = smoothed_abs_pitch_ * 180.0 / M_PI;   // degrees
+  cmd.yaw      = smoothed_abs_yaw_ * 180.0 / M_PI;     // degrees
   cmd.distance = range;                                  // 3D distance to target (m)
   cmd.fire_cmd = in_range;                               // true = "pull trigger now"
   cmd_pub_->publish(cmd);
@@ -1344,7 +1355,7 @@ void TrajectorySolverNode::targetCallback(
       "DIRECT body_yaw=%.3f face=%d pos=(%.3f,%.3f,%.3f) abs_yaw=%.1f° abs_pitch=%.1f° rel_yaw=%.1f° rel_pitch=%.1f° fire=%d",
       msg->yaw, best_face, tx, ty, tz,
       yaw * 180.0 / M_PI, pitch * 180.0 / M_PI,
-      smoothed_rel_yaw_ * 180.0 / M_PI, smoothed_rel_pitch_ * 180.0 / M_PI, in_range);
+      smoothed_abs_yaw_ * 180.0 / M_PI, smoothed_abs_pitch_ * 180.0 / M_PI, in_range);
 
   // Twist message for /cmd_vel (UART bridge to lower computer):
   //   angular.x = fire trigger (1.0 = fire, 0.0 = hold)
@@ -1354,8 +1365,8 @@ void TrajectorySolverNode::targetCallback(
   // the UART protocol expected by the STM32 lower computer.
   geometry_msgs::msg::Twist twist;
   twist.angular.x = in_range ? 1.0 : 0.0;
-  twist.angular.y = smoothed_rel_pitch_ * 180.0 / M_PI;
-  twist.angular.z = smoothed_rel_yaw_   * 180.0 / M_PI;
+  twist.angular.y = smoothed_abs_pitch_ * 180.0 / M_PI;
+  twist.angular.z = smoothed_abs_yaw_   * 180.0 / M_PI;
   twist_pub_->publish(twist);
 
   // Visualise predicted impact point (green sphere in RViz)
