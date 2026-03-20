@@ -1004,8 +1004,8 @@ void Tracker::handleArmorJump(const Armor & current_armor)
       // actual radius.
       std::swap(r_active_kf_, r_other_kf_);
       target_state(8) = r_active_kf_.x;
+      r_other_kf_.x = std::max(0.12, std::min(r_other_kf_.x, 0.4));
       another_r = r_other_kf_.x;
-      another_r = std::max(0.12, std::min(another_r, 0.4));  // physical clamp
     }
   }
   info_yaw_innov_signed = 0.0;
