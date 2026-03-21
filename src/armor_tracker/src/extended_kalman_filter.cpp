@@ -99,8 +99,8 @@ ExtendedKalmanFilter::ExtendedKalmanFilter(
   P0_(P0),
   n(P0.rows()),
   I(Eigen::MatrixXd::Identity(n, n)),
-  x_pri(n),
-  x_post(n)
+  x_pri(Eigen::VectorXd::Zero(n)),      // initialized to zero (but will be overwritten by setState() before use)
+  x_post(Eigen::VectorXd::Zero(n))
 {
 }
 

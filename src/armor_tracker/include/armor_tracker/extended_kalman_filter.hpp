@@ -86,15 +86,15 @@ public:
   void syncPrior();
 
   // Compute a predicted state
-  Eigen::MatrixXd predict();
+  Eigen::VectorXd predict();
 
   // Update the estimated state based on measurement
-  Eigen::MatrixXd update(const Eigen::VectorXd & z);
+  Eigen::VectorXd update(const Eigen::VectorXd & z);
 
   // Update with an externally-provided observation model.
   // Use for secondary-face fusion where h() differs from the primary.
   // Operates on x_post/P_post (i.e., after the primary update()).
-  Eigen::MatrixXd updateWithModel(
+  Eigen::VectorXd updateWithModel(
     const Eigen::VectorXd & z,
     const Eigen::VectorXd & z_pred,
     const Eigen::MatrixXd & H_ext,
