@@ -3,6 +3,19 @@ import time    # Import library for delays and timing
 import struct  # Import library to pack/unpack C-style binary data (floats/ints)
 import sys     # Used to exit the program cleanly if needed
 
+
+# Checking the correct port, run the following command on the terminal
+# ls /dev/tty{ACM,USB}*
+
+'''
+For a stable naming convention on the port
+# Find your device's idVendor and idProduct
+udevadm info -a -n /dev/ttyACM0 | grep -E "idVendor|idProduct"
+
+# Then create /etc/udev/rules.d/99-robot-micro.rules:
+SUBSYSTEM=="tty", ATTRS{idVendor}=="XXXX", ATTRS{idProduct}=="YYYY", SYMLINK+="robot_micro"
+'''
+
 def main():
     # --- CONFIGURATION VARIABLES ---
     # We define the size of the package. 
@@ -24,7 +37,7 @@ def main():
     # We initialize the serial port object.
     try:
         ser = serial.Serial(
-            port="/dev/ttyTHS0",       # The physical port on the MiniPC (Jetson/Pi)
+            port="/dev/ttyUSB0",       # The physical port on the MiniPC (Jetson/Pi)
             baudrate=500000,           # 500.000 bps as requested
             bytesize=serial.EIGHTBITS, # 8 Data bits.
             
@@ -36,6 +49,7 @@ def main():
             stopbits=serial.STOPBITS_ONE, # 1 Stop bit
             timeout=0.01               # Read timeout: wait 10ms max then move on if no data
         )
+        print(f"Serial port -> STATUS: OK\n")
     except serial.SerialException as e:
         print(f"Error opening serial port: {e}")
         return
@@ -65,7 +79,7 @@ def main():
                         # We expect: Color, Start, Health, Ammo, Center, Resupply
                         unpacked_data = struct.unpack(STRUCT_FORMAT, rx_bytes)
                         
-                        print(f"[RX] Recv from Micro: {unpacked_data}")
+                        print(f"[RX] Recv from Micro: {unpacked_data}:.2f")
                         
                     except struct.error as e:
                         print(f"Unpacking error: {e}")
@@ -94,7 +108,7 @@ def main():
             # Write the bytes to the wire
             ser.write(tx_bytes)
             
-            print(f"[TX] Sent to Micro:   {data_to_send}")
+            print(f"[TX] Sent to Micro:   {data_to_send:.2f}")
 
             # --- 4. TIMING ---
             # 1ms interval. 
