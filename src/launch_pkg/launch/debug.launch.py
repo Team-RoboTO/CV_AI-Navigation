@@ -321,23 +321,23 @@ def generate_launch_description():
         plugin='rm_auto_aim::TrajectorySolverNode',
         name='trajectory_solver',
         parameters=[
-            {'pose_source': 'none'},                  # 'none' bypasses hardware safety checks (ignores motor max-speed limits and serial permissions) allowing pure vision testing
+            {'pose_source': 'camera_imu'},            # 'none' bypasses hardware safety checks, use camera_imu or micro_pose for hardware
             # Ballistics
             {'bullet_speed': 25.0},                 # [m/s] muzzle velocity of the projectile
-            {'gravity': 9.8},                        # [m/s²] gravitational acceleration
-            {'k': 0.01},                             # air drag coefficient (higher → more drop compensation)
+            {'gravity': 9.8},                       # [m/s²] gravitational acceleration
+            {'linear_drag_coeff': 0.01},            # linear drag coefficient (proportional to velocity), higher values cause more drop at longer ranges
+            {'quadratic_drag_coeff': 0.01},         # quadratic drag coefficient (proportional to velocity squared), higher values cause more drop at longer ranges and high speeds
+            {'use_quadratic_drag': False},          # whether to apply quadratic drag in the ballistics model; if false, only linear drag is applied
             # Latency compensation
             {'time_bias': 0.05},                     # [s] fixed pipeline latency added to flight time
             {'time_bias_alpha': 0.35},               # EMA smoothing factor for adaptive time bias (0–1)
             # Fire gate
             {'min_fire_dist': 0.5},                  # [m] minimum range to allow firing
             {'max_fire_dist': 10.0},                 # [m] maximum range to allow firing
-            {'angular_window': .7},                # [rad] half-width of face-aligned fire gate (~5°)
+            {'angular_window': 0.09},                # [rad] half-width of face-aligned fire gate (~5°)
             # Acceleration estimator
-            {'accel_ema_alpha': 0.3},                # EMA smoothing for target acceleration estimate (0–1)
-            {'max_accel': 6.0},                      # [m/s²] clamp on estimated acceleration
-            {'ref_frequency': 30.0},                  # [Hz] reference frame rate for time-normalization
             {'latency_gate_sigma': 2.5},             # sigma multiplier for timing tolerance in indirect mode
+            {'latency_warmup_samples': 5},
             # Indirect mode (fast-spinning targets)
             {'indirect_vyaw_threshold': 3.0},        # [rad/s] spin rate above which indirect aiming activates
             {'indirect_timing_tolerance': 0.02},     # [s] base timing tolerance for alignment windows

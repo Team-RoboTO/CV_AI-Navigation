@@ -295,7 +295,7 @@ void ExtendedKalmanFilter::decoupleState(int idx, double variance)
 // measurement arrives before the next predict(), the filter gracefully coasts
 // (predict-only mode during TEMP_LOST).
 // ---------------------------------------------------------------------------
-Eigen::MatrixXd ExtendedKalmanFilter::predict()
+Eigen::VectorXd ExtendedKalmanFilter::predict()
 {
   // Evaluate Jacobian F and process noise Q at the current posterior state.
   // Both depend on dt_ (captured via closure), which changes each frame.
@@ -436,7 +436,7 @@ double ExtendedKalmanFilter::mahalanobisAt(
 // but is numerically more stable — it guarantees P_post stays positive
 // semi-definite even with floating-point rounding errors.
 // ---------------------------------------------------------------------------
-Eigen::MatrixXd ExtendedKalmanFilter::update(const Eigen::VectorXd & z)
+Eigen::VectorXd ExtendedKalmanFilter::update(const Eigen::VectorXd & z)
 {
   // Linearize observation model and compute measurement noise at this z
   H = jacobian_h(x_pri), R = update_R(z);
@@ -510,7 +510,7 @@ Eigen::MatrixXd ExtendedKalmanFilter::update(const Eigen::VectorXd & z)
 // Operates on x_post / P_post (the posterior from the primary update),
 // treating them as the prior for this secondary update.
 // ---------------------------------------------------------------------------
-Eigen::MatrixXd ExtendedKalmanFilter::updateWithModel(
+Eigen::VectorXd ExtendedKalmanFilter::updateWithModel(
   const Eigen::VectorXd & z,
   const Eigen::VectorXd & z_pred,
   const Eigen::MatrixXd & H_ext,

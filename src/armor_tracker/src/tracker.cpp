@@ -950,8 +950,8 @@ void Tracker::handleArmorJump(const Armor & current_armor)
   // If that disagrees with v_yaw's sign, the robot changed spin direction.
   double jump_direction = angles::shortest_angular_distance(target_state(6), yaw);
   double jump_angle = std::abs(jump_direction);
-  // INVERTI IL SEGNO DA < 0 A > 0
-  if (jump_direction * target_state(7) > 0) {
+  // Revert back to < 0 to correctly detect spin reversal when signs disagree
+  if (jump_direction * target_state(7) < 0) {
     target_state(7) = 0.0;
     RCLCPP_WARN(rclcpp::get_logger("armor_tracker"), "Spin reversal — v_yaw zeroed");
   }
