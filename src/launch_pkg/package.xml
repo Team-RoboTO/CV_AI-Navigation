@@ -24,6 +24,7 @@
   <depend>isaac_ros_image_pipeline</depend>
   <exec_depend>armor_tracker</exec_depend>
   <exec_depend>rm_trajectory</exec_depend>
+  <exec_depend>auto_aim_targeting</exec_depend>
 
 
   <build_depend>isaac_ros_common</build_depend>

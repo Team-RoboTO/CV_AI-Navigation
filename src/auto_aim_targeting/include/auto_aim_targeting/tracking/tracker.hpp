@@ -1,5 +1,5 @@
-#ifndef ARMOR_PROCESSOR__TRACKER_HPP_
-#define ARMOR_PROCESSOR__TRACKER_HPP_
+#ifndef AUTO_AIM_TARGETING__TRACKING__TRACKER_HPP_
+#define AUTO_AIM_TARGETING__TRACKING__TRACKER_HPP_
 
 // Eigen
 #include <Eigen/Eigen>
@@ -8,17 +8,59 @@
 #include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/quaternion.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
+#include <rclcpp/time.hpp>
 
 // STD
 #include <memory>
 #include <string>
+#include <vector>
 
-#include "armor_tracker/extended_kalman_filter.hpp"
+#include "auto_aim_targeting/tracking/ekf.hpp"
 #include "auto_aim_interfaces/msg/armors.hpp"
-#include "auto_aim_interfaces/msg/target.hpp"
 
 namespace rm_auto_aim
 {
+
+struct FaceBinding
+{
+  bool valid = false;
+  int face_index = 0;
+  bool alternate_pair = false;
+  geometry_msgs::msg::Point position{};
+  double yaw = 0.0;
+  double radius = 0.0;
+  double dz_offset = 0.0;
+  double visibility = 0.0;
+  double obliquity = 0.0;
+  bool observable = false;
+  bool fresh = false;
+};
+
+struct TrackSnapshot
+{
+  int tracker_id = -1;
+  int tracker_state = 0;
+  bool tracking = false;
+  bool temp_lost = false;
+  std::string id;
+  int armors_num = 0;
+  geometry_msgs::msg::Point position{};
+  geometry_msgs::msg::Vector3 velocity{};
+  geometry_msgs::msg::Vector3 acceleration{};
+  double yaw = 0.0;
+  double v_yaw = 0.0;
+  double radius_1 = 0.0;
+  double radius_2 = 0.0;
+  double dz = 0.0;
+  double v_yaw_variance = 0.0;
+  double position_variance_x = 0.0;
+  double position_variance_y = 0.0;
+  double position_variance_z = 0.0;
+  rclcpp::Time last_measurement_stamp{0, 0, RCL_ROS_TIME};
+  bool measurement_fresh = false;
+  FaceBinding matched_face{};
+  double stationary_confidence = 0.0;
+};
 
 // ---------------------------------------------------------------------------
 // Scalar Kalman Filter — 1D KF for quasi-static parameters like orbit radius.
@@ -116,6 +158,16 @@ struct TrackerConfig {
   // Acceleration estimation
   double acceleration_smoothing_factor;
   double refresh_frequency;
+
+  // Stationary handling
+  double stationary_measurement_threshold;
+  double stationary_innovation_threshold;
+  double stationary_speed_threshold;
+  double stationary_yaw_rate_threshold;
+  int stationary_required_frames;
+  double stationary_velocity_collapse_factor;
+  double stationary_zero_velocity_threshold;
+  double visible_direct_obliquity_threshold_deg;
 };
 
 // ---------------------------------------------------------------------------
@@ -180,6 +232,12 @@ public:
   void computeAdaptiveDamping(double dt);
   void updateSmoothedAcceleration(double dt);
   Eigen::Vector3d smoothedAcceleration() const { return smoothed_acceleration_; }
+  TrackSnapshot snapshot() const;
+  Eigen::Vector3d predictCenter(double dt) const;
+  FaceBinding predictFace(int face_index, double dt) const;
+  FaceBinding predictMatchedFace(double dt) const;
+  void setLastMeasurementTime(const rclcpp::Time & stamp) { this->last_measurement_time_ = stamp; }
+  const rclcpp::Time & lastMeasurementTime() const { return this->last_measurement_time_; }
 
   // The 9D EKF instance — one per tracker, created by createTracker() factory.
   // Each tracker's EKF lambdas capture a raw pointer to this Tracker, so the
@@ -292,6 +350,8 @@ public:
   //   - Update tracker_last_meas_times_ (only when a real measurement was fused)
   //   - Decide whether to publish measurement data in TrackerInfo
   bool measurement_valid = false;
+  FaceBinding matched_face_;
+  double stationary_confidence = 0.0;
 
   // The current best estimate of the 9D state vector.
   //
@@ -389,6 +449,57 @@ private:
   // Called when position is close but yaw differs by > max_match_yaw_diff_.
   void handleArmorJump(const Armor & a);
 
+  // --- Decomposed helpers for update() ---
+
+  // Among same-ID armors, pick the best match via Mahalanobis distance.
+  // Also detects whether a second face from the alternate pair is visible.
+  // Returns the selected armor.  Sets has_other_pair_armor and other_pair_*
+  // output parameters when a second face from the other pair is found.
+  Armor selectBestArmor(
+    const std::vector<Armor> & same_id_armors,
+    const Eigen::VectorXd & ekf_prediction,
+    bool & has_other_pair_armor,
+    double & other_pair_x, double & other_pair_y, double & other_pair_z,
+    double & other_pair_yaw);
+
+  // After a Mahalanobis-gated match: run EKF update, adapt the active radius
+  // via the scalar KF, adapt the other-pair radius/dz if a secondary face was
+  // detected, optionally fuse the secondary face, sync state, and update face
+  // context / stationary state.
+  void fuseMatchedMeasurement(
+    const Armor & selected_armor,
+    double max_yaw_oblique_rad,
+    bool has_other_pair_armor,
+    double other_pair_x, double other_pair_y, double other_pair_z,
+    double other_pair_yaw,
+    const rclcpp::Time & stamp);
+
+  // Fuse the secondary (other-pair) face measurement into the EKF as a
+  // sequential update.  Called after the primary EKF update when both faces
+  // are simultaneously visible and use_secondary_face_fusion is enabled.
+  void fuseSecondaryFace(
+    double other_pair_x, double other_pair_y, double other_pair_z,
+    double other_pair_yaw);
+
+  // Clamp radius to physical bounds, clamp v_yaw to max rate, and normalize
+  // yaw to [-pi, pi].
+  void applyStateSafetyClamps();
+
+  // Advance the DETECTING/TRACKING/TEMP_LOST/LOST state machine based on
+  // whether a measurement was matched this frame.
+  void advanceStateMachine(bool matched);
+
+  // --- Decomposed helpers for handleArmorJump() ---
+
+  // Check if the EKF center has diverged after a yaw snap (inferred armor
+  // position too far from the actual detection).  If so, hard-reset the
+  // entire state from the current detection.
+  void detectAndResetDivergence(const Armor & current_armor, double yaw);
+
+  // Inflate covariance on the states that were snapped during the jump
+  // (yaw, v_yaw, and optionally za, v_za for 4-armor pair switches).
+  void inflatePostJumpCovariance();
+
   // Convert quaternion orientation → continuous yaw angle.
   // Uses shortest_angular_distance to unwrap relative to last_yaw_,
   // producing a monotonic yaw signal that doesn't wrap at ±π.
@@ -398,6 +509,13 @@ private:
   // Convert center-based EKF state → armor plate position.
   // Inverse of the observation model: armor = center − r·[cos(yaw), sin(yaw)]
   Eigen::Vector3d getArmorPositionFromState(const Eigen::VectorXd & x);
+  FaceBinding buildFaceBindingFromState(
+    const Eigen::VectorXd & x,
+    int face_index,
+    bool fresh) const;
+  void updateFaceContext(const Armor & selected_armor, const Eigen::VectorXd & state);
+  void updateStationaryState(const Armor & selected_armor);
+  void resetStationaryState();
 
   // Bundled configuration (set once at construction, immutable thereafter).
   const TrackerConfig config_;
@@ -444,8 +562,24 @@ private:
   //   Flow A (multi-tracker):  predictStep() → predicted_=true → update() skips predict
   //   Flow B (legacy single):  update() → predicted_=false → update() does its own predict
   bool predicted_ = false;
+  geometry_msgs::msg::Point last_measurement_point_{};
+  bool has_last_measurement_point_ = false;
+  int stationary_frame_count_ = 0;
+  rclcpp::Time last_measurement_time_{0, 0, RCL_ROS_TIME};
 };
+
+// Pure-geometry helper: given the EKF state and a measured armor pose, find which
+// face index best matches and return a populated FaceBinding.
+// Lives here (not in Trackers) because it is a stateless utility that
+// only depends on types already defined in this header.
+FaceBinding resolveMatchedFace(
+  const Eigen::VectorXd & state,
+  ArmorsNum armors_num,
+  double other_radius,
+  double dz,
+  const auto_aim_interfaces::msg::Armor & armor,
+  double visible_direct_obliquity_threshold_deg);
 
 }  // namespace rm_auto_aim
 
-#endif  // ARMOR_PROCESSOR__TRACKER_HPP_
+#endif  // AUTO_AIM_TARGETING__TRACKING__TRACKER_HPP_

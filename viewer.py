@@ -1,14 +1,16 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from rclpy.duration import Duration
 from sensor_msgs.msg import Image, CameraInfo
 from vision_msgs.msg import Detection2DArray, Detection2D
 from visualization_msgs.msg import Marker
+from geometry_msgs.msg import PointStamped
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
-
-from geometry_msgs.msg import PoseStamped
+import tf2_ros
+import tf2_geometry_msgs
 
 class VisualizerNode(Node):
     def __init__(self):
@@ -23,29 +25,14 @@ class VisualizerNode(Node):
         self.tracking_info = None
         self.gimbal_cmd = None
 
-        # Gimbal state from /micro_pose (updated at ~100 Hz)
-        self._gimbal_yaw = 0.0
-        self._gimbal_pitch = 0.0
-        self._yaw_sign = 1.0     # matches gimbal.yaw_sign in debug.launch.py
-        self._pitch_sign = 1.0   # matches gimbal.pitch_sign in debug.launch.py
-        self._gimbal_height = 0.325  # [m] matches gimbal.height in debug.launch.py
-
-        # Precompute RPY(-π/2, 0, -π/2) convention rotation matrix
-        # This maps from gimbal mechanical convention to camera optical frame
-        # and matches the tracker's broadcastGimbalTF exactly.
-        self._R_convention = np.array([
-            [ 0,  0,  1],
-            [-1,  0,  0],
-            [ 0, -1,  0]], dtype=np.float64)
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         self.create_subscription(Image, '/camera/camera/color/image_raw', self.img_cb, qos_profile_sensor_data)
         self.create_subscription(CameraInfo, '/camera/camera/color/camera_info', self.info_cb, qos_profile_sensor_data)
         self.create_subscription(Detection2DArray, '/detections_output', self.bbox_cb, qos_profile_sensor_data)
         self.create_subscription(Detection2D, '/detections_output/optimal_target', self.optimal_cb, qos_profile_sensor_data)
         self.create_subscription(Marker, '/trajectory/marker', self.marker_cb, qos_profile_sensor_data)
-
-        # Gimbal feedback — fresh angles for impact projection
-        self.create_subscription(PoseStamped, '/micro_pose', self.micro_pose_cb, qos_profile_sensor_data)
 
         # Try subscribing to tracker target and gimbal commands
         try:
@@ -77,14 +64,6 @@ class VisualizerNode(Node):
 
     def gimbal_cmd_cb(self, msg):
         self.gimbal_cmd = msg
-
-    def micro_pose_cb(self, msg):
-        p = self._pitch_sign * msg.pose.position.x
-        y = self._yaw_sign * msg.pose.position.y
-        # Reject garbage serial data (gimbal angles can't exceed ~90°)
-        if abs(p) < 1.6 and abs(y) < 1.6:
-            self._gimbal_pitch = p
-            self._gimbal_yaw = y
 
     def bbox_cb(self, msg):
         self.latest_detections = msg
@@ -128,7 +107,7 @@ class VisualizerNode(Node):
                     cv2.putText(cv_img, f"ID: {class_id}", (pt1[0], pt1[1] - 10), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-        # 2. Tracked armor (cyan) — from optimal_target bbox
+        # 2. Measured armor (cyan) — tracker-selected measurement bbox
         if (self.optimal_target is not None and 
             self.optimal_target.bbox.size_x > 0):
             det = self.optimal_target
@@ -141,54 +120,44 @@ class VisualizerNode(Node):
             cx, cy = center
             cv2.line(cv_img, (cx - 20, cy), (cx + 20, cy), (0, 255, 255), 2)
             cv2.line(cv_img, (cx, cy - 20), (cx, cy + 20), (0, 255, 255), 2)
+            cv2.putText(cv_img, "MEAS", (pt1[0], pt1[1] - 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-            # Tracking info overlay
             if self.tracking_info is not None and self.tracking_info.tracking:
                 tgt = self.tracking_info
                 dist = (tgt.position.x**2 + tgt.position.y**2 + tgt.position.z**2) ** 0.5
                 label = f"d={dist:.2f}m yaw={tgt.yaw:.1f} v={tgt.v_yaw:.1f}r/s"
                 cv2.putText(cv_img, label, (pt1[0], pt1[1] - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-        # 3. Impact point (red) — from trajectory solver marker
-        #    Project using latest /micro_pose gimbal angles instead of TF to
-        #    avoid timing mismatch (TF is broadcast at detection time, but
-        #    the image arrives before YOLO finishes → stale TF while gimbal slews).
+
+        # 3. Raw intercept point (red) — from /trajectory/marker, projected by TF
         if self.latest_marker is not None and self.camera_info is not None:
-            p_odom = np.array([
-                self.latest_marker.pose.position.x,
-                self.latest_marker.pose.position.y,
-                self.latest_marker.pose.position.z])
+            try:
+                pt = PointStamped()
+                pt.header = self.latest_marker.header
+                pt.point = self.latest_marker.pose.position
+                camera_frame = self.camera_info.header.frame_id
+                transformed_pt = self.tf_buffer.transform(
+                    pt, camera_frame, timeout=Duration(seconds=0.1))
+                x = transformed_pt.point.x
+                y = transformed_pt.point.y
+                z = transformed_pt.point.z
+                if z > 0.05:
+                    K = self.camera_info.k
+                    fx, cx_cam = K[0], K[2]
+                    fy, cy_cam = K[4], K[5]
+                    u = int((x / z) * fx + cx_cam)
+                    v = int((y / z) * fy + cy_cam)
+                    if 0 <= u < w_img and 0 <= v < h_img:
+                        cv2.circle(cv_img, (u, v), 6, (0, 0, 255), -1)
+                        cv2.line(cv_img, (u - 20, v), (u + 20, v), (0, 0, 255), 2)
+                        cv2.line(cv_img, (u, v - 20), (u, v + 20), (0, 0, 255), 2)
+                        cv2.putText(cv_img, "IMPACT", (u + 10, v - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+            except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException):
+                pass
 
-            # odom→camera: p_cam = R_total.T @ (p_odom - translation)
-            yaw = self._gimbal_yaw
-            pitch = self._gimbal_pitch
-            cos_y, sin_y = np.cos(yaw), np.sin(yaw)
-            cos_p, sin_p = np.cos(pitch), np.sin(pitch)
-            R_yaw = np.array([[ cos_y, -sin_y, 0],
-                               [ sin_y,  cos_y, 0],
-                               [ 0,      0,     1]])
-            R_pitch = np.array([[ cos_p, 0, sin_p],
-                                 [ 0,     1, 0    ],
-                                 [-sin_p, 0, cos_p]])
-            R_total = R_yaw @ R_pitch @ self._R_convention
-            p_translated = p_odom - np.array([0.0, 0.0, self._gimbal_height])
-            p_cam = R_total.T @ p_translated
-
-            x, y, z = p_cam
-            if z > 0.05:
-                K = self.camera_info.k
-                fx, cx_cam = K[0], K[2]
-                fy, cy_cam = K[4], K[5]
-                u = int((x / z) * fx + cx_cam)
-                v = int((y / z) * fy + cy_cam)
-                if 0 <= u < w_img and 0 <= v < h_img:
-                    cv2.circle(cv_img, (u, v), 6, (0, 0, 255), -1)
-                    cv2.line(cv_img, (u - 20, v), (u + 20, v), (0, 0, 255), 2)
-                    cv2.line(cv_img, (u, v - 20), (u, v + 20), (0, 0, 255), 2)
-                    cv2.putText(cv_img, "IMPACT", (u + 10, v - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-
-        # 4. Aim direction (cyan) — where the barrel is pointing
+        # 4. Commanded aim (cyan diamond) — where the clamped command points
         if self.gimbal_cmd is not None and self.gimbal_cmd.distance > 0.1:
             import math
             cmd = self.gimbal_cmd

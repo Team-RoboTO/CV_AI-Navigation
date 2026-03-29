@@ -29,21 +29,21 @@ double EngagementSelector::computeScore(
     std::pow(std::max(0.0, 1.0 - plan.visibility), ctx.visibility_exponent);
 
   double score = 0.0;
-  score += weights_.range * (plan.range / std::max(ctx.max_fire_dist, 1.0));
-  score += weights_.flight_time * plan.flight_time;
-  score += weights_.uncertainty * uncertainty_cost;
-  score += weights_.slew * slew_cost;
-  score += weights_.staleness * plan.measurement_age;
-  score += weights_.low_visibility * visibility_cost;
+  score += this->weights_.range * (plan.range / std::max(ctx.max_fire_dist, 1.0));
+  score += this->weights_.flight_time * plan.flight_time;
+  score += this->weights_.uncertainty * uncertainty_cost;
+  score += this->weights_.slew * slew_cost;
+  score += this->weights_.staleness * plan.measurement_age;
+  score += this->weights_.low_visibility * visibility_cost;
 
   if (plan.temp_lost) {
-    score += weights_.temp_lost;
+    score += this->weights_.temp_lost;
   }
   if (ctx.previous_tracker_id >= 0 && ctx.previous_tracker_id != target.tracker_id) {
-    score += weights_.switch_target;
+    score += this->weights_.switch_target;
   }
   if (plan.fire_window_margin < 0.0) {
-    score += weights_.negative_margin * std::abs(plan.fire_window_margin);
+    score += this->weights_.negative_margin * std::abs(plan.fire_window_margin);
   }
   if (!plan.ballistic_valid || plan.range < ctx.min_fire_dist || plan.range > ctx.max_fire_dist) {
     score += 10.0;
@@ -85,8 +85,8 @@ std::optional<ShotPlan> EngagementSelector::selectBestTarget(
         ? (abs_vyaw > exit_thr)
         : (abs_vyaw > enter_thr));
 
-    auto plan_opt = use_indirect ? predictor_.solveIndirect(target, ctx)
-                                 : predictor_.solveDirect(target, ctx);
+    auto plan_opt = use_indirect ? this->predictor_.solveIndirect(target, ctx)
+                                 : this->predictor_.solveDirect(target, ctx);
     if (!plan_opt.has_value()) {
       continue;
     }
@@ -99,7 +99,7 @@ std::optional<ShotPlan> EngagementSelector::selectBestTarget(
     plan.measurement_age = measurement_age;
     plan.measurement_stale = measurement_age > ctx.max_measurement_age;
 
-    computeScore(target, ctx, plan);
+    this->computeScore(target, ctx, plan);
     if (!found || plan.score < best.score) {
       best = plan;
       found = true;

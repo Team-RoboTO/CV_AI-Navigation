@@ -25,7 +25,7 @@ private:
   void microPoseCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg);
   void cameraImuCallback(const sensor_msgs::msg::Imu::ConstSharedPtr msg);
 
-  void publishSafeCommand(const std_msgs::msg::Header & header);
+  void publishHoldFireCommand(const std_msgs::msg::Header & header);
   void publishShotPlan(const std_msgs::msg::Header & header, const ShotPlan & plan, bool fire);
 
   SolverContext buildContext(double transport_delay) const;

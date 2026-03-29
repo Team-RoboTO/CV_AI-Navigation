@@ -1,4 +1,12 @@
-#include "rm_trajectory/ballistics_solver.hpp"
+// ============================================================================
+// ballistics_solver.cpp — Iterative bullet flight solver (gravity + drag).
+//
+// ENTRYPOINT: BallisticsSolver::solve()
+//   Given ground distance, target height, and muzzle speed, iteratively
+//   converges on the required pitch angle and flight time.
+//   Supports linear drag (slow projectiles) and quadratic drag (fast).
+// ============================================================================
+#include "auto_aim_targeting/planning/ballistics_solver.hpp"
 
 #include <algorithm>
 #include <cmath>

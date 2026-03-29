@@ -89,7 +89,7 @@ ShotPlan ArmorPredictor::buildPlan(
   out.y = face.y;
   out.z = face.z;
 
-  const BallisticSolution ballistic = ballistics_.solve(
+  const BallisticSolution ballistic = this->ballistics_.solve(
     face.ground_dist, face.z - ctx.gimbal_height, ctx.bullet_speed);
   out.absolute_pitch = ballistic.pitch;
   out.flight_time = ballistic.flight_time;
@@ -140,10 +140,10 @@ std::optional<ShotPlan> ArmorPredictor::solveDirect(
 
     for (int iter = 0; iter < 2; ++iter) {
       const PredictedCenter center = predictCenter(target, local_t);
-      const FaceGeometry face = buildFaceGeometry(
+      const FaceGeometry face = this->buildFaceGeometry(
         target, center, target.yaw + target.v_yaw * local_t, i);
 
-      candidate = buildPlan(target, ctx, face, local_t, false, 0.0);
+      candidate = this->buildPlan(target, ctx, face, local_t, false, 0.0);
       if (!candidate.ballistic_valid) {
         valid = false;
         break;
@@ -211,7 +211,7 @@ std::optional<ShotPlan> ArmorPredictor::solveIndirect(
   const double seed_bearing = std::atan2(seed_center.y, seed_center.x);
 
   for (int i = 0; i < faces && produced < ctx.indirect_max_candidates; ++i) {
-    const double ta0 = nextAlignmentTime(target.yaw, target.v_yaw, i, face_spacing, seed_bearing);
+    const double ta0 = this->nextAlignmentTime(target.yaw, target.v_yaw, i, face_spacing, seed_bearing);
     if (!std::isfinite(ta0)) {
       continue;
     }
@@ -227,12 +227,12 @@ std::optional<ShotPlan> ArmorPredictor::solveIndirect(
 
       for (int iter = 0; iter < 2; ++iter) {
         const PredictedCenter center = predictCenter(target, align_t);
-        const FaceGeometry face = buildFaceGeometry(
+        const FaceGeometry face = this->buildFaceGeometry(
           target, center, target.yaw + target.v_yaw * align_t, i);
 
         const double seed_residual =
           std::abs(align_t - (ctx.time_bias + ctx.gimbal_response_delay));
-        candidate = buildPlan(target, ctx, face, align_t, true, seed_residual);
+        candidate = this->buildPlan(target, ctx, face, align_t, true, seed_residual);
         if (!candidate.ballistic_valid) {
           valid = false;
           break;

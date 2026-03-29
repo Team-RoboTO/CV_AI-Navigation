@@ -1,4 +1,18 @@
-#include "armor_tracker/extended_kalman_filter.hpp"
+// ============================================================================
+// ekf.cpp — Generic 9D Extended Kalman Filter with dependency-injected models.
+//
+// ENTRYPOINTS:
+//   predict          → propagate state + covariance one timestep forward
+//   update           → fuse a measurement into the predicted state
+//   updateWithModel  → sequential update with an external observation model
+//   mahalanobis      → statistical gating metric for outlier rejection
+//   setState         → overwrite state (after jumps / clamps)
+//   resetCovariance  → restore P to initial uncertainty
+//   decoupleState    → sever coupling between one state and the rest
+//   inflateCovariance → increase uncertainty of one state element
+//   syncPrior        → copy posterior into prior (after manual state edits)
+// ============================================================================
+#include "auto_aim_targeting/tracking/ekf.hpp"
 
 #include <cmath>
 
