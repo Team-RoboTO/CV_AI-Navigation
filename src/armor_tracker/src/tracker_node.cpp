@@ -10,6 +10,38 @@
 #include <vector>
 #include <opencv2/calib3d.hpp>
 
+namespace
+{
+
+// Estimate the robot center from a single armor measurement and an assumed
+// armor orbit radius.  This is intentionally simple: it is only used for the
+// "should I spawn a brand-new tracker here?" test, not for the main EKF.
+//
+// Why compare centers instead of raw armor positions?
+//   Two armors from the same robot can be separated by ~20-35 cm, so comparing
+//   a new armor directly against an existing tracker center can reject or accept
+//   spawns for the wrong geometric reason.  Converting both to the same kind of
+//   quantity (robot center estimate) makes the exclusion gate much more honest.
+inline Eigen::Vector3d estimateCenterFromArmorPose(
+  const auto_aim_interfaces::msg::Armor & armor,
+  double assumed_radius)
+{
+  tf2::Quaternion q;
+  tf2::fromMsg(armor.pose.orientation, q);
+  double roll = 0.0;
+  double pitch = 0.0;
+  double yaw = 0.0;
+  tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
+
+  return Eigen::Vector3d(
+    armor.pose.position.x + assumed_radius * std::cos(yaw),
+    armor.pose.position.y + assumed_radius * std::sin(yaw),
+    armor.pose.position.z);
+}
+
+}  // namespace
+
+
 // ============================================================================
 // HOW TO READ THIS FILE
 // ============================================================================
@@ -23,10 +55,8 @@
 //   microPoseCallback  – receives gimbal yaw/pitch from the lower computer
 //                        (/micro_pose).  Stores angles and calls
 //                        broadcastCameraTF() to keep TF2 current.
-//   imuCallback        – receives D455 IMU gyro.  EMA-filters the angular
-//                        velocity, rotates it into chassis frame, subtracts
-//                        gimbal velocity (finite-diff), integrates to get
-//                        chassis yaw/pitch for world-frame compensation.
+//   cameraImuCallback  – receives the filtered IMU orientation produced by
+//                        imu_filter_madgwick and extracts roll/pitch/yaw.
 //   armorsCallback     – MAIN PIPELINE (see below).
 //
 // ── broadcastCameraTF ───────────────────────────────────────────────────────
@@ -43,7 +73,8 @@
 //      • Subtract letterbox padding (bbox_padding_y_) from Y — the DNN
 //        encoder pads 480-tall images to 640×640, shifting all Y coords.
 //      • Filter by YOLO class_id (skip teammates, dead robots).
-//      • Determine plate type (SMALL / LARGE) from bbox aspect ratio > 1.5.
+//      • Build one 2D corner approximation, then test both physical armor models
+//        (SMALL and LARGE) and keep the one with the lower reprojection error.
 //      • Scale bbox inward by light_ratio_ (~0.85) to approximate the 4
 //        light-bar corner positions YOLO doesn't explicitly give us.
 //
@@ -142,10 +173,20 @@ ArmorTrackerNode::ArmorTrackerNode(const rclcpp::NodeOptions & options)
   // geometry (SMALL vs LARGE plates).  0.85 is a compromise that works for both.
   light_ratio_ = this->declare_parameter("light_ratio", 0.85);
 
-  // Letterbox padding: when DNN encoder pads image to square with keep_aspect_ratio,
-  // YOLO bbox Y coordinates are shifted by (network_h - image_h) / 2 pixels.
-  // Default 80 = (640 - 480) / 2 for 640x480 input padded to 640x640.
+  // Letterbox padding: when the DNN encoder pads a 640x480 image to 640x640,
+  // all predicted Y coordinates are shifted by +80 pixels.  We subtract that
+  // offset here before building the PnP points.
   bbox_padding_y_ = this->declare_parameter("bbox_padding_y", 80.0);
+
+  // Average reprojection error threshold for accepting a PnP solution.
+  // This rejects cases where solvePnP numerically converged but the resulting
+  // 3D pose does not geometrically explain the observed 2D points well.
+  pnp_max_reprojection_error_ = this->declare_parameter("pnp.max_reprojection_error", 10.0);
+
+  // Radius used only in the new-tracker spawn guard to convert an unmatched
+  // armor pose into an approximate robot-center hypothesis.
+  new_tracker_assumed_radius_ = this->declare_parameter(
+    "tracker.new_tracker_assumed_radius", 0.26);
 
   // Tracker parameters (stored for createTracker factory)
   // - max_match_distance_: Euclidean gate (m) between predicted center and detection; blocks far mis-associations.
@@ -361,7 +402,7 @@ void ArmorTrackerNode::microPoseCallback(
 
 void ArmorTrackerNode::cameraImuCallback(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
 {
-  // Estraiamo pitch e yaw assoluti calcolati dal filtro (Madgwick)
+  // Extract the filtered absolute orientation produced by imu_filter_madgwick
   tf2::Quaternion q;
   tf2::fromMsg(msg->orientation, q);
   double roll, pitch, yaw;
@@ -477,22 +518,32 @@ void ArmorTrackerNode::armorsCallback(
       }
     }
 
-    // Build an Armor object from the YOLO bbox for PnP solving.
-    // WHY PnP FROM BBOXES?  YOLO gives us 2D bounding boxes, but the EKF
-    // needs 3D positions.  PnP (Perspective-n-Point) recovers the 3D pose
-    // from 2D-3D point correspondences.  We approximate the 4 light-bar
-    // corners from the bbox, then PnP finds the rotation + translation
-    // that best maps the known real-world armor dimensions to those 2D points.
+    // Build an Armor object from the YOLO box for PnP solving.
+    // WHY THIS STEP EXISTS:
+    //   YOLO gives only a 2D bounding box, but the tracker needs a 3D pose.
+    //   PnP (Perspective-n-Point) recovers that pose from 2D-3D correspondences.
+    //
+    // WHAT IS STILL APPROXIMATE HERE:
+    //   We do not have true keypoints yet.  We therefore approximate the two
+    //   light bars from the box and use those synthetic corner points.
+    //
+    // WHAT WE IMPROVED:
+    //   Even with imperfect 2D points, we can still reduce one major source of
+    //   bias by testing both physical armor sizes and choosing the hypothesis
+    //   with the lower reprojection error.
     Armor armor_obj;
     armor_obj.center = cv::Point2f(center_x, center_y);
 
-    // Heuristic for Armor Type (plate aspect: small~1.12, large~1.85)
-    float ratio = width / height;
-    armor_obj.type = (ratio > 1.5) ? ArmorType::LARGE : ArmorType::SMALL;
+    // We intentionally do NOT trust the bbox aspect ratio to classify the armor
+    // as SMALL or LARGE.  A tilted LARGE plate becomes visually narrower inside
+    // an axis-aligned box, so a pure width/height heuristic systematically
+    // misclassifies oblique targets.
+    //
+    // Instead, we let the PnP solver test both physical hypotheses and pick the
+    // one with the lower reprojection error.
+    armor_obj.type = ArmorType::SMALL;  // temporary placeholder before PnP model selection
     armor_obj.number = detection.results.empty() ? "unknown" : detection.results[0].hypothesis.class_id;
     armor_obj.confidence = detection.results.empty() ? 0.0 : detection.results[0].hypothesis.score;
-    // Map class_id to type if possible, but ratio heuristic is good fallback
-    // Set classification result for debug
     armor_obj.classfication_result = armor_obj.number;
 
     // Scale bbox inward by light_ratio to approximate light-bar corners.
@@ -517,8 +568,27 @@ void ArmorTrackerNode::armorsCallback(
     // tvec: position of the armor origin measured from the camera (meters) in the
     //       camera frame (x: right, y: down, z: forward for RealSense optical).
     cv::Mat rvec, tvec;
-    bool success = pnp_solver_->solvePnP(armor_obj, rvec, tvec);
+    ArmorType selected_type = ArmorType::SMALL;
+    double reprojection_error = 0.0;
+    bool success = pnp_solver_->solveBestArmorType(
+      armor_obj, selected_type, rvec, tvec, &reprojection_error);
     if (success) {
+      armor_obj.type = selected_type;
+
+      // A numerically valid PnP result can still be geometrically poor.
+      // Reprojection error is the average pixel mismatch between the measured
+      // points and the image points predicted by the recovered pose.
+      if (!std::isfinite(reprojection_error) ||
+          reprojection_error > pnp_max_reprojection_error_)
+      {
+        RCLCPP_DEBUG(
+          get_logger(),
+          "Rejecting PnP solution: reprojection error %.2f px exceeds threshold %.2f px",
+          reprojection_error, pnp_max_reprojection_error_);
+        detection_idx++;
+        continue;
+      }
+
       armor_msg.type = ARMOR_TYPE_STR[static_cast<int>(armor_obj.type)];
       armor_msg.number = armor_obj.number;
 
@@ -816,27 +886,27 @@ void ArmorTrackerNode::armorsCallback(
     if (detection_owner[i] >= 0) continue;  // already assigned to a tracker
     const auto & armor = armors_ptr->armors[i];
 
-    // Check distance to all existing tracker centers (Euclidean, not Mahalanobis,
-    // because two robots can have very different yaw → high Mahalanobis even when
-    // positionally close — we don't want to spawn a tracker on top of another)
+    // Compare approximate ROBOT CENTERS, not raw armor positions.
+    //
+    // Why this matters:
+    //   A single robot can show different armor plates that are tens of
+    //   centimetres apart.  If we compare an unmatched armor directly against an
+    //   existing tracker center, the geometry is inconsistent: armor vs center.
+    //   That can wrongly block a valid new tracker or wrongly allow a duplicate.
+    //
+    //   We therefore convert the unmatched armor into an approximate center using
+    //   a simple assumed radius, then compare center vs center.
+    const Eigen::Vector3d candidate_center =
+      estimateCenterFromArmorPose(armor, new_tracker_assumed_radius_);
+
     bool too_close = false;
     for (auto & kv : trackers_) {
       auto & tracker = *kv.second;
-      // Skip LOST trackers — they have stale state and will be pruned shortly,
-      // so they should not block spawning a fresh tracker nearby.
       if (tracker.tracker_state == Tracker::LOST) continue;
-      // Compute Euclidean distance between the unassigned detection and this
-      // tracker's estimated robot center (xc = state(0), yc = state(2), za = state(4)).
-      // We use plain Euclidean rather than Mahalanobis because two robots that
-      // happen to face different directions can have wildly different yaw, which
-      // would inflate Mahalanobis even if they are physically close in XYZ.
-      double dx = armor.pose.position.x - tracker.target_state(0);
-      double dy = armor.pose.position.y - tracker.target_state(2);
-      double ddz = armor.pose.position.z - tracker.target_state(4);
-      if (std::sqrt(dx * dx + dy * dy + ddz * ddz) < new_tracker_min_dist_) {
-        // Detection is within the exclusion radius of an existing tracker:
-        // do NOT spawn a duplicate tracker — the detection may be a second
-        // armor plate of the same robot or a momentary misdetection.
+
+      const Eigen::Vector3d tracker_center(
+        tracker.target_state(0), tracker.target_state(2), tracker.target_state(4));
+      if ((candidate_center - tracker_center).norm() < new_tracker_min_dist_) {
         too_close = true;
         break;
       }

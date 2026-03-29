@@ -1,21 +1,38 @@
 /**
  * @file trajectory_solver.cpp
- * @brief Auto-Aim Trajectory Solver Node
- * 
- * [Educational Guide]
- * This node receives the 3D target coordinates from the generic tracker and computes 
- * the required pitch, yaw, and gimbal distances to hit it. 
- * 
- * Key Concepts Introduced:
- * 1. Ballistics (Strada B): We calculate the time of flight and angle considering 
- *    either linear or quadratic drag, plus gravity. This yields the actual pitch required.
- * 2. Ballistic Validity (ballistic_valid): A trajectory might be mathematically solvable 
- *    (valid) even if the robot physically cannot point that high (not reachable). Kept separate
- *    so tracking isn't dropped when bounds are temporarily exceeded.
- * 3. Transport Delay (transport_delay): Used to calculate measurement age without relying
- *    on variable node start times, ensuring time-critical prediction is accurate.
- * 4. Indirect Mode Hysteresis: Prevents the turret from jittering between two modes if
- *    the target is near the threshold of turning away.
+ * @brief Auto-aim trajectory solver node.
+ *
+ * This node receives tracked 3D targets and decides where the gimbal should aim
+ * and whether the system is allowed to fire.
+ *
+ * Educational overview:
+ *   1. Ballistics:
+ *      The bullet does not travel instantly and does not move in a perfectly
+ *      straight line.  Gravity pulls it downward, and drag can slow it down.
+ *      We therefore solve for the pitch angle and flight time instead of aiming
+ *      with a naive straight line.
+ *
+ *   2. Valid vs reachable:
+ *      A ballistic equation may have a mathematically valid solution, but the
+ *      required pitch could still exceed the mechanical limits of the gimbal.
+ *      We keep these concepts separate:
+ *        - valid     = the math produced a real physical trajectory
+ *        - reachable = the robot can mechanically point there
+ *
+ *   3. Measurement age and transport delay:
+ *      The target message already has some age when this node receives it.
+ *      We explicitly model that delay so prediction is done from "where the
+ *      target is now" rather than "where it was when the camera saw it".
+ *
+ *   4. Direct vs indirect mode:
+ *      When the enemy spins slowly, we can aim at the face that is visible now.
+ *      When it spins quickly, it can be better to predict when a face will rotate
+ *      into a good firing position and fire at that future alignment instead.
+ *
+ *   5. Hysteresis:
+ *      Switching between direct and indirect modes with a single threshold can
+ *      cause rapid mode toggling near the boundary.  Hysteresis uses different
+ *      enter/exit thresholds so the mode choice stays stable.
  */
 #include "rm_trajectory/trajectory_solver.hpp"
 
@@ -69,6 +86,20 @@ TrajectorySolverNode::TrajectorySolverNode(
   yaw_sign_ = declare_parameter("gimbal.yaw_sign", 1.0);
   pitch_sign_ = declare_parameter("gimbal.pitch_sign", 1.0);
   latency_warmup_samples_ = declare_parameter("latency_warmup_samples", 5);
+
+  // Engagement cost weights.
+  // These weights control HOW the solver chooses the best shot among multiple
+  // candidates.  Lower total score is better.
+  cost_weights_.range = declare_parameter("cost.range", cost_weights_.range);
+  cost_weights_.flight_time = declare_parameter("cost.flight_time", cost_weights_.flight_time);
+  cost_weights_.uncertainty = declare_parameter("cost.uncertainty", cost_weights_.uncertainty);
+  cost_weights_.slew = declare_parameter("cost.slew", cost_weights_.slew);
+  cost_weights_.switch_target = declare_parameter("cost.switch_target", cost_weights_.switch_target);
+  cost_weights_.staleness = declare_parameter("cost.staleness", cost_weights_.staleness);
+  cost_weights_.temp_lost = declare_parameter("cost.temp_lost", cost_weights_.temp_lost);
+  cost_weights_.low_visibility = declare_parameter("cost.low_visibility", cost_weights_.low_visibility);
+  cost_weights_.negative_margin = declare_parameter(
+    "cost.negative_margin", cost_weights_.negative_margin);
 
   ballistics_params_.gravity = gravity_;
   ballistics_params_.linear_drag_coeff = linear_drag_coeff_;
@@ -154,8 +185,10 @@ void TrajectorySolverNode::microPoseCallback(
   const double pitch = pitch_sign_ * msg->pose.position.x;
   const double yaw = yaw_sign_ * msg->pose.position.y;
   
-  // Rimuovo il check hardcoded su yaw < 1.6 per permettere
-  // rotazioni libere, tengo un limite prudenziale solo sul pitch
+  // We intentionally do NOT clamp yaw here.  Yaw is an angle on a circle and
+  // a free-spinning gimbal may legitimately cross ±90° or even ±180°.
+  // We keep only a loose pitch sanity check because absurd pitch values usually
+  // indicate a malformed upstream packet, not a real robot state.
   if (std::abs(pitch) < 2.0) {
     current_pitch_ = pitch;
     current_yaw_ = yaw;

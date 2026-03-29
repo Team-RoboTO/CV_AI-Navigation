@@ -1,5 +1,35 @@
 build/
 install/
 log/
+
+# IDEs and Editors
 .idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+**/.DS_Store
+._*
+.Trashes
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+.env/
+.pytest_cache/
+
+# ROS 2 & C++
+compile_commands.json
+*.so
+*.o
+*.a
+*.dylib
+
+# Others
 .github/

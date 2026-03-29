@@ -945,15 +945,29 @@ void Tracker::updateArmorsNum(const Armor & armor)
 void Tracker::handleArmorJump(const Armor & current_armor)
 {
   double yaw = orientationToYaw(current_armor.pose.orientation);
-  // Is the robot spinning the same direction as before, or did it reverse?
-  // jump_direction > 0 means the new face is CCW from the old face.
-  // If that disagrees with v_yaw's sign, the robot changed spin direction.
+
+  // jump_direction is the signed shortest rotation from the previously tracked
+  // face yaw to the newly observed face yaw.
+  //
+  // Sign convention:
+  //   jump_direction > 0  -> the new visible face is counter-clockwise (CCW)
+  //   jump_direction < 0  -> the new visible face is clockwise (CW)
+  //
+  // Physical consistency check:
+  //   target_state(7) is the estimated body yaw rate v_yaw.
+  //   If jump_direction and v_yaw have the same sign, the newly observed face
+  //   is consistent with the previously estimated spin direction.
+  //   If they have opposite signs, the robot most likely reversed spin, or the
+  //   previous spin estimate was wrong.
+  //
+  // Therefore we must zero v_yaw only in the INCONSISTENT case.
   double jump_direction = angles::shortest_angular_distance(target_state(6), yaw);
   double jump_angle = std::abs(jump_direction);
-  // Revert back to < 0 to correctly detect spin reversal when signs disagree
-  if (jump_direction * target_state(7) < 0) {
+  if (std::abs(target_state(7)) > 0.2 && jump_direction * target_state(7) < 0.0) {
     target_state(7) = 0.0;
-    RCLCPP_WARN(rclcpp::get_logger("armor_tracker"), "Spin reversal — v_yaw zeroed");
+    RCLCPP_WARN(
+      rclcpp::get_logger("armor_tracker"),
+      "Spin-direction inconsistency detected during armor jump — v_yaw zeroed");
   }
   target_state(6) = yaw;
   updateArmorsNum(current_armor);

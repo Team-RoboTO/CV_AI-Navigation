@@ -11,14 +11,26 @@ namespace rm_auto_aim
 // ---------------------------------------------------------------------------
 // ArmorType — the two physical armor plate sizes used in RoboMaster.
 //
-// SMALL (AM02): 140 mm wide × 125 mm tall — mounted on standard robots.
-// LARGE (AM12): 235 mm wide × 127 mm tall — mounted on hero robots.
+// SMALL (AM02): 140 mm wide × 125 mm tall — commonly used on standard robots.
+// LARGE (AM12): 235 mm wide × 127 mm tall — commonly used on hero robots.
 //
-// The PnP solver uses different 3D point models for each type (see pnp_solver.cpp),
-// so the correct type must be identified before solvePnP() is called.
-// Type is inferred from the YOLO bounding-box aspect ratio:
-//   width/height > 1.5  →  LARGE   (aspect ≈ 1.85)
-//   width/height ≤ 1.5  →  SMALL   (aspect ≈ 1.12)
+// IMPORTANT DESIGN NOTE:
+//   We no longer trust the raw YOLO bounding-box aspect ratio alone to decide
+//   the armor type.  An axis-aligned bounding box gets narrower when the plate
+//   is viewed obliquely, so a real LARGE armor can easily look "small" in 2D.
+//
+//   The current pipeline therefore does this instead:
+//     1. Build the same 2D corner approximation for the detection.
+//     2. Solve PnP with the SMALL 3D model.
+//     3. Solve PnP again with the LARGE 3D model.
+//     4. Reproject both solutions back into the image.
+//     5. Keep the model with the lower reprojection error.
+//
+//   Reprojection error means:
+//     "If this 3D hypothesis were correct, how close would its projected image
+//      points land to the image points we actually observed?"
+//
+//   Lower reprojection error = better geometric agreement.
 // ---------------------------------------------------------------------------
 enum class ArmorType { SMALL = 0, LARGE = 1 };
 
@@ -27,49 +39,52 @@ const std::string ARMOR_TYPE_STR[] = {"small", "large"};
 // ---------------------------------------------------------------------------
 // Light — one vertical light bar of an armor plate.
 //
-// Each armor plate has two light bars (left and right) that glow under the
-// LED illumination.  The PnP solver matches the four corners of these two
-// bars (top and bottom of each bar) against the known 3D plate geometry to
-// recover the 3D pose.
+// Each armor plate has two light bars (left and right).  The PnP solver uses
+// the top and bottom endpoints of both bars as its four 2D image points.
 //
-// All coordinates are in the image (pixel) frame:
-//   x → right,  y → down  (OpenCV convention)
+// Image coordinate convention (OpenCV):
+//   x → right
+//   y → down
 // ---------------------------------------------------------------------------
 struct Light
 {
-  cv::Point2f top;     // Top endpoint of the light bar (pixel coords)
-  cv::Point2f bottom;  // Bottom endpoint of the light bar (pixel coords)
-  cv::Point2f center;  // Midpoint of the light bar (for visualisation only)
+  cv::Point2f top;     // Top endpoint of the light bar in pixels
+  cv::Point2f bottom;  // Bottom endpoint of the light bar in pixels
+  cv::Point2f center;  // Midpoint of the light bar (debug / visualization)
 };
 
 // ---------------------------------------------------------------------------
-// Armor — a single detected armor plate, populated before PnP solving.
+// Armor — one detected armor plate before or after PnP.
 //
-// Flow:
-//   YOLO bounding box
-//     → inward-scaled rect (light_ratio parameter)
-//     → Armor.left_light / right_light corners set from rect edges
-//     → PnP solver → rvec + tvec → 3D pose in camera frame
+// Upstream detector:
+//   A YOLO detector gives an axis-aligned bounding box.
 //
-// The 'number' field carries the YOLO class ID string (e.g. "3" = red).
-// The class ID encodes the team color (0=blue, 2=purple, 3=red) but NOT
-// the robot type (hero, standard, etc.), which is not available from YOLO.
+// Tracker-side geometric approximation:
+//   We shrink that bounding box inward with light_ratio_ to approximate where
+//   the light bars most likely are.
+//
+// PnP stage:
+//   The four approximated bar endpoints are matched against the known 3D armor
+//   geometry to recover the 3D pose.
+//
+// The 'number' field currently carries the YOLO class string used for target
+// color / class filtering in the tracker.
 // ---------------------------------------------------------------------------
 struct Armor
 {
-  Light left_light;              // Left light-bar corners (pixel frame)
-  Light right_light;             // Right light-bar corners (pixel frame)
-  ArmorType type;                // SMALL or LARGE (from bbox aspect ratio)
-  cv::Point2f center;            // Bbox center (pixel frame, for distance-to-center)
-  std::string number;            // YOLO class ID string (team color code)
-  std::string classfication_result;  // Same as number; kept for debug display
-  float confidence;              // YOLO detection confidence score [0, 1]
+  Light left_light;                  // Left light-bar endpoints in image space
+  Light right_light;                 // Right light-bar endpoints in image space
+  ArmorType type = ArmorType::SMALL; // Physical type chosen by the PnP stage
+  cv::Point2f center;                // Detection center in image space
+  std::string number;                // YOLO class string (used for filtering)
+  std::string classfication_result;  // Legacy debug field kept for compatibility
+  float confidence = 0.0F;           // Detector confidence in [0, 1]
 };
 
 }  // namespace rm_auto_aim
 
-// Also expose in the armor_detector namespace so that pnp_solver.hpp
-// (which includes "armor_detector/armor.hpp") resolves the same types.
+// Also expose in the armor_detector namespace so that any legacy include path
+// expecting armor_detector::Armor resolves to the same concrete type.
 namespace armor_detector
 {
 using rm_auto_aim::ArmorType;

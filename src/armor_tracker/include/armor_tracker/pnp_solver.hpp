@@ -1,10 +1,8 @@
 #ifndef ARMOR_TRACKER__PNP_SOLVER_HPP_
 #define ARMOR_TRACKER__PNP_SOLVER_HPP_
 
-#include <geometry_msgs/msg/point.hpp>
 #include <opencv2/core.hpp>
 
-// STD
 #include <array>
 #include <vector>
 
@@ -14,81 +12,93 @@ namespace rm_auto_aim
 {
 
 // ---------------------------------------------------------------------------
-// PnPSolver — recovers 3D pose from a single armor plate detection.
+// PnPSolver — recover the 3D pose of an armor plate from four 2D image points.
 //
-// Background — Perspective-n-Point (PnP):
-//   PnP solves for the rotation R and translation t of an object in 3D given:
-//     (1) Known 3D model points   — the actual geometry of the object
-//     (2) Observed 2D image points — where those 3D points appear in the camera
-//     (3) Camera intrinsics        — focal length, principal point, distortion
+// Background: Perspective-n-Point (PnP)
+//   PnP solves for an object's 3D pose if we know:
+//     1. The 3D coordinates of some points on the object.
+//     2. The 2D image coordinates where those points appear.
+//     3. The camera intrinsics and distortion coefficients.
 //
-//   The result (rvec, tvec) gives us:
-//     tvec = [x, y, z]     position of the armor plate CENTER in camera frame [m]
-//     rvec = Rodrigues vec  rotation from object to camera frame
+//   The output is:
+//     rvec — a Rodrigues rotation vector describing the orientation.
+//     tvec — a translation vector giving the object position in camera frame.
 //
-//   From rvec we extract the yaw (rotation around the vertical axis), which
-//   tells us which direction the armor plate is facing.
+// Why this class exists in our project
+//   The detector does NOT give us perfect light-bar keypoints yet.  It gives an
+//   axis-aligned bounding box, and the tracker approximates the four light-bar
+//   endpoints from that box.  This approximation is imperfect, so we need a PnP
+//   stage that is both robust and honest about model mismatch.
 //
-// Algorithm — IPPE (Iterative Pose from Planar Correspondences, cv::SOLVEPNP_IPPE):
-//   IPPE is specialized for PLANAR objects (all 4 points co-planar).
-//   It computes two closed-form solutions analytically, then refines the best
-//   one.  Compared to the iterative general solver (SOLVEPNP_ITERATIVE):
-//     - Much faster (one linear pass vs iterative refinement)
-//     - Returns two candidate solutions (planar ambiguity)
-//     - More accurate for our problem since the armor IS planar
+// Planar solver choice: IPPE
+//   The armor is a planar target.  IPPE is specialized for planar objects and is
+//   therefore a very good fit here.
 //
-// Coordinate frame (armor body frame, OpenCV convention):
-//   X-axis: into the armor (depth direction)
-//   Y-axis: to the left of the armor face (horizontal)
-//   Z-axis: upward
-//   Origin: center of the armor plate
+// Important robustness improvement
+//   Because a slanted LARGE armor can look narrow in an axis-aligned 2D box, we
+//   do NOT rely only on the bbox aspect ratio anymore.
 //
-// The 4 model points follow a clockwise ordering starting from bottom-left:
-//   P0: bottom-left   P1: top-left   P2: top-right   P3: bottom-right
+//   Instead, solveBestArmorType():
+//     - solves PnP with the SMALL model,
+//     - solves PnP with the LARGE model,
+//     - computes reprojection error for both,
+//     - and keeps the hypothesis with the lower error.
 //
-// These are matched to the 4 image points:
-//   left_light.bottom → left_light.top → right_light.top → right_light.bottom
-//
-// After PnP, the resulting rvec/tvec is in camera_color_optical_frame.
-// The ArmorTrackerNode transforms this to the odom (world) frame via TF2.
+//   Reprojection error = average pixel disagreement between:
+//     - the 2D points we observed, and
+//     - the 2D points predicted by the recovered 3D pose.
 // ---------------------------------------------------------------------------
 class PnPSolver
 {
 public:
-  // Construct with camera intrinsics from the /camera_info ROS topic.
-  // camera_matrix: row-major 3×3 intrinsic matrix [fx 0 cx; 0 fy cy; 0 0 1]
-  // distortion_coefficients: lens distortion coefficients (k1,k2,p1,p2[,k3...])
   PnPSolver(
     const std::array<double, 9> & camera_matrix,
     const std::vector<double> & distortion_coefficients);
 
-  // Solve PnP for a detected armor plate.
-  // Input:  armor — 2D light-bar corner points + plate type
-  // Output: rvec  — rotation vector (Rodrigues) from armor body to camera frame
-  //         tvec  — translation vector: armor center position in camera frame [m]
-  // Returns true on success, false if OpenCV solvePnP fails.
-  bool solvePnP(const Armor & armor, cv::Mat & rvec, cv::Mat & tvec);
+  // Solve PnP using the armor.type already stored in the Armor object.
+  // This legacy method is kept for compatibility with old code paths.
+  bool solvePnP(const Armor & armor, cv::Mat & rvec, cv::Mat & tvec) const;
 
-  // Returns the Euclidean distance (pixels) from an image point to the
-  // camera principal point (cx, cy).  Used in tracker init to prefer
-  // detections near image center (better PnP accuracy, less lens distortion).
-  float calculateDistanceToCenter(const cv::Point2f & image_point);
+  // Solve both physical armor hypotheses and keep the one with the lower
+  // reprojection error.
+  //
+  // Outputs:
+  //   best_type          — selected physical armor size
+  //   rvec, tvec         — pose for the winning hypothesis
+  //   reprojection_error — optional average pixel error of the winning fit
+  bool solveBestArmorType(
+    const Armor & armor,
+    ArmorType & best_type,
+    cv::Mat & rvec,
+    cv::Mat & tvec,
+    double * reprojection_error = nullptr) const;
+
+  float calculateDistanceToCenter(const cv::Point2f & image_point) const;
 
 private:
-  cv::Mat camera_matrix_;  // 3×3 intrinsic matrix (double precision, CV_64F)
-  cv::Mat dist_coeffs_;    // Distortion coefficients (1×n, double precision)
+  std::vector<cv::Point2f> getImageArmorPoints(const Armor & armor) const;
+  const std::vector<cv::Point3f> & getObjectPoints(ArmorType type) const;
 
-  // Physical dimensions of RoboMaster armor plates.
-  // Unit: mm — converted to metres during construction (÷ 1000).
-  // SMALL = AM02 plate (standard/sentry robots)
-  // LARGE = AM12 plate (hero robot)
-  static constexpr float SMALL_ARMOR_WIDTH  = 140;   // horizontal span of light bars [mm]
-  static constexpr float SMALL_ARMOR_HEIGHT = 125;   // vertical span of light bars [mm]
-  static constexpr float LARGE_ARMOR_WIDTH  = 235;   // horizontal span of light bars [mm]
-  static constexpr float LARGE_ARMOR_HEIGHT = 127;   // vertical span of light bars [mm]
+  double computeReprojectionError(
+    const std::vector<cv::Point3f> & object_points,
+    const std::vector<cv::Point2f> & image_points,
+    const cv::Mat & rvec,
+    const cv::Mat & tvec) const;
 
-  // 3D model points for each armor type (in the armor body frame, metres).
-  // Four points, clockwise from bottom-left: BL, TL, TR, BR.
+  bool solveWithModel(
+    const std::vector<cv::Point3f> & object_points,
+    const std::vector<cv::Point2f> & image_points,
+    cv::Mat & rvec,
+    cv::Mat & tvec) const;
+
+  cv::Mat camera_matrix_;
+  cv::Mat dist_coeffs_;
+
+  static constexpr float SMALL_ARMOR_WIDTH = 140.0F;
+  static constexpr float SMALL_ARMOR_HEIGHT = 125.0F;
+  static constexpr float LARGE_ARMOR_WIDTH = 235.0F;
+  static constexpr float LARGE_ARMOR_HEIGHT = 127.0F;
+
   std::vector<cv::Point3f> small_armor_points_;
   std::vector<cv::Point3f> large_armor_points_;
 };

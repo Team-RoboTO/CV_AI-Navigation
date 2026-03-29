@@ -186,35 +186,48 @@ private:
   std::map<int, double> tracker_ax_ema_, tracker_ay_ema_, tracker_az_ema_;
   double accel_ema_alpha_;  // EMA weight for acceleration smoothing
 
-  // PnP light-bar ratio (bbox → light-bar scaling)
+  // PnP bbox-shrinking ratio used to approximate the two light bars from an
+  // axis-aligned detection box.
   double light_ratio_;
 
-  // Letterbox padding Y offset (pixels)
+  // Letterbox padding added by the DNN image encoder in the vertical direction.
+  // For a 640x480 image padded to 640x640, this is (640 - 480) / 2 = 80 px.
   double bbox_padding_y_;
 
-  // --- Dynamic TF & Pose Source ---
-  // pose_source_ detemina da dove prendiamo i dati dell'orientamento:
+  // Maximum acceptable average reprojection error from the PnP fit [pixels].
+  // Even if solvePnP returns success, a very high reprojection error means the
+  // 3D solution does not geometrically explain the observed 2D points well.
+  double pnp_max_reprojection_error_;
+
+  // Radius used to approximate the robot center from a single unmatched armor
+  // detection when deciding whether a new tracker should be spawned.
+  double new_tracker_assumed_radius_;
+
+  // --- Dynamic TF and pose source selection ---
+  // pose_source_ chooses where camera orientation comes from:
+  //   "micro_pose" -> lower computer / gimbal controller
+  //   "camera_imu" -> filtered camera IMU orientation
+  //   "none"       -> keep zero pose, useful only for software-only testing
   double yaw_sign_;
   double pitch_sign_;
-  // "micro_pose" (dal microcontrollore), "camera_imu" (dal filtro madgwick), o "none"
   std::string pose_source_;
-  double gimbal_height_;  // [m] altezza del gimbal da terra
-  
-  // Variabili per memorizzare l'angolo assoluto della telecamera nel mondo
+  double gimbal_height_;  // Camera/gimbal pivot height above the ground [m]
+
+  // Latest camera orientation used to broadcast odom -> camera TF.
   double current_pitch_ = 0.0;
   double current_yaw_ = 0.0;
   rclcpp::Time last_pose_time_{0, 0, RCL_ROS_TIME};
-  double tracker_pose_timeout_ = 0.2; // tempo [s] prima che il TF venga considerato vecchio
+  double tracker_pose_timeout_ = 0.2;  // Max acceptable pose age [s]
 
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf2_broadcaster_;
-  
-  // Callbacks per le due possibili fonti
+
+  // Subscriptions for the supported pose sources.
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr micro_pose_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   void microPoseCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg);
   void cameraImuCallback(const sensor_msgs::msg::Imu::ConstSharedPtr msg);
 
-  // Trasmettitore per la mappa finale
+  // Publish the current odom -> camera_color_optical_frame transform.
   void broadcastCameraTF(const rclcpp::Time & stamp);
 
   // Visualization marker publisher
