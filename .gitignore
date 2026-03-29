@@ -31,5 +31,9 @@ compile_commands.json
 *.a
 *.dylib
 
+# Isaac packages
+src/isaac_*
+
 # Others
 .github/
+ 
