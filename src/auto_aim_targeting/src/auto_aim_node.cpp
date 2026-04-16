@@ -18,6 +18,7 @@
 // ============================================================================
 #include "auto_aim_targeting/auto_aim_node.hpp"
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <utility>
@@ -64,47 +65,62 @@ void AutoAimNode::armorsCallback(
 
 void AutoAimNode::processFrame(const Observation & input)
 {
-  if ((input.armors == nullptr || input.armors->armors.empty()) && trackers_.empty()) {
-    return;
+  std::lock_guard<std::mutex> lock(this->tracker_mutex_);
+
+  this->have_seen_frame_ = true;
+  this->last_frame_steady_time_ = std::chrono::steady_clock::now();
+
+  Observation safe_input = input;
+  if (safe_input.armors == nullptr) {
+    auto empty_armors = std::make_shared<auto_aim_interfaces::msg::Armors>();
+    empty_armors->header.stamp = input.stamp;
+    empty_armors->header.frame_id = config_.measurement.target_frame;
+    safe_input.armors = empty_armors;
+  }
+  if (safe_input.detection_msg == nullptr) {
+    auto empty_detections = std::make_shared<vision_msgs::msg::Detection2DArray>();
+    empty_detections->header = safe_input.armors->header;
+    safe_input.detection_msg = empty_detections;
   }
 
-  updateTimestep(input.stamp);
+  updateTimestep(safe_input.stamp);
   Trackers::predictAll(trackers_, dt_, config_.tracking.lost_time_thres);
   const auto detection_owners = Trackers::assignDetections(
-    trackers_, input.armors, config_.tracking.tracker.mahalanobis_jump_gate);
-  Trackers::updateMatched(trackers_, input.armors, detection_owners);
+    trackers_, safe_input.armors, config_.tracking.tracker.mahalanobis_jump_gate);
+  Trackers::updateMatched(trackers_, safe_input.armors, detection_owners);
   Trackers::spawnFromUnmatched(
     trackers_,
     next_tracker_id_,
-    input.armors,
+    safe_input.armors,
     detection_owners,
     config_.tracking.max_trackers,
     config_.tracking.new_tracker_min_dist,
+    config_.tracking.new_tracker_assumed_radius,
     [this]() { return tracker_factory_->create(); },
-    input.stamp,
+    safe_input.stamp,
     get_logger());
   Trackers::pruneLost(trackers_, get_logger());
 
   const auto snapshots = Trackers::collectSnapshots(trackers_, dt_);
   std::optional<AimDecision> decision;
   if (!snapshots.empty()) {
-    latency_compensator_->updateFromFrameStamp(now(), input.stamp);
+    latency_compensator_->updateFromFrameStamp(now(), safe_input.stamp);
     const PlanningContext ctx = makePlanningContext(
       config_,
-      input.pose_state,
-      latency_compensator_->transportDelay(now(), input.stamp),
+      safe_input.pose_state,
+      latency_compensator_->transportDelay(now(), safe_input.stamp),
       previous_tracker_id_,
       indirect_mode_active_,
       latency_compensator_->currentBias());
-    decision = engagement_planner_->selectBestPlan(snapshots, ctx, input.stamp);
+    decision = engagement_planner_->selectBestPlan(snapshots, ctx, safe_input.stamp);
   }
 
   best_tracker_id_ = decision.has_value() ? decision->plan.tracker_id : -1;
   const FireGateResult fire_result = decision.has_value()
-    ? fire_gate_->evaluate(decision->plan, input.pose_state.fresh)
+    ? fire_gate_->evaluate(decision->plan, safe_input.pose_state.fresh)
     : FireGateResult{};
   AimResult output = output_publisher_->buildAimResult(
-    input, trackers_, best_tracker_id_, decision, fire_result, previous_tracker_id_);
+    safe_input, trackers_, best_tracker_id_, decision, fire_result, previous_tracker_id_);
   output_publisher_->publish(output);
 
   if (decision.has_value()) {
@@ -114,6 +130,47 @@ void AutoAimNode::processFrame(const Observation & input)
     previous_tracker_id_ = -1;
     indirect_mode_active_ = false;
   }
+}
+
+void AutoAimNode::detectorWatchdogCallback()
+{
+  if (!isPipelineReady()) {
+    return;
+  }
+
+  const rclcpp::Time stamp = now();
+  const auto steady_now = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lock(this->tracker_mutex_);
+  if (this->have_seen_frame_ &&
+      std::chrono::duration<double>(steady_now - this->last_frame_steady_time_).count() <=
+      this->config_.engagement.detector_stall_timeout)
+  {
+    return;
+  }
+
+  this->publishHoldOutput(stamp);
+}
+
+void AutoAimNode::publishHoldOutput(const rclcpp::Time & stamp)
+{
+  Observation input;
+  input.stamp = stamp;
+  input.pose_state = this->gimbal_pose_adapter_->currentPoseState(stamp);
+  input.armors = std::make_shared<auto_aim_interfaces::msg::Armors>();
+  input.armors->header.stamp = stamp;
+  input.armors->header.frame_id = this->config_.measurement.target_frame;
+  auto detections = std::make_shared<vision_msgs::msg::Detection2DArray>();
+  detections->header = input.armors->header;
+  input.detection_msg = detections;
+
+  this->best_tracker_id_ = -1;
+  const std::optional<AimDecision> no_decision;
+  AimResult output = this->output_publisher_->buildAimResult(
+    input, this->trackers_, this->best_tracker_id_, no_decision, FireGateResult{},
+    this->previous_tracker_id_);
+  this->output_publisher_->publish(output);
+  this->previous_tracker_id_ = -1;
+  this->indirect_mode_active_ = false;
 }
 
 void AutoAimNode::updateTimestep(const rclcpp::Time & stamp)
@@ -185,6 +242,8 @@ void AutoAimNode::loadMeasurementConfig()
   config_.measurement.target_classes.erase("1");
   config_.measurement.light_ratio = declare_parameter("light_ratio", 0.85);
   config_.measurement.bbox_padding_y = declare_parameter("bbox_padding_y", 80.0);
+  config_.measurement.pnp_max_reprojection_error =
+    declare_parameter("pnp.max_reprojection_error", 10.0);
   config_.measurement.target_frame = declare_parameter("target_frame", "odom");
 }
 
@@ -208,6 +267,8 @@ void AutoAimNode::loadTrackingConfig()
   tracker.mahalanobis_jump_gate = declare_parameter("tracker.maha_jump_threshold", 20.0);
   config_.tracking.max_trackers = declare_parameter("tracker.max_trackers", 5);
   config_.tracking.new_tracker_min_dist = declare_parameter("tracker.new_tracker_min_dist", 0.5);
+  config_.tracking.new_tracker_assumed_radius =
+    declare_parameter("tracker.new_tracker_assumed_radius", 0.26);
 
   tracker.position_decay_baseline = declare_parameter("ekf.xyz_damping_alpha", 0.95);
   tracker.yaw_decay_baseline = declare_parameter("ekf.yaw_damping_alpha", 0.95);
@@ -281,8 +342,11 @@ void AutoAimNode::loadEngagementConfig()
   config_.engagement.angular_window = declare_parameter("angular_window", 0.09);
   config_.engagement.angular_window_ref_dist = declare_parameter("angular_window_ref_dist", 3.0);
   config_.engagement.max_measurement_age = declare_parameter("max_measurement_age", 0.10);
+  config_.engagement.detector_stall_timeout = declare_parameter("detector_stall_timeout", 0.20);
   config_.engagement.max_gimbal_yaw_rate = declare_parameter("max_gimbal_yaw_rate", 6.0);
   config_.engagement.max_gimbal_pitch_rate = declare_parameter("max_gimbal_pitch_rate", 4.0);
+  config_.engagement.fire_yaw_tolerance = declare_parameter("fire_yaw_tolerance", 0.03);
+  config_.engagement.fire_pitch_tolerance = declare_parameter("fire_pitch_tolerance", 0.03);
   config_.engagement.indirect_vyaw_threshold = declare_parameter("indirect_vyaw_threshold", 3.0);
   config_.engagement.indirect_timing_tolerance =
     declare_parameter("indirect_timing_tolerance", 0.02);
@@ -290,6 +354,20 @@ void AutoAimNode::loadEngagementConfig()
   config_.engagement.oblique_exponent = declare_parameter("oblique_exponent", 2.0);
   config_.engagement.latency_gate_sigma = declare_parameter("latency_gate_sigma", 2.5);
   config_.engagement.latency_warmup_samples = declare_parameter("latency_warmup_samples", 5);
+  config_.engagement.pose_source_is_none = config_.pose.pose_source == "none";
+  config_.engagement.allow_fire_without_pose =
+    declare_parameter("debug.allow_fire_without_pose", false);
+
+  auto & cost = config_.engagement.cost_weights;
+  cost.range = declare_parameter("cost.range", cost.range);
+  cost.flight_time = declare_parameter("cost.flight_time", cost.flight_time);
+  cost.uncertainty = declare_parameter("cost.uncertainty", cost.uncertainty);
+  cost.slew = declare_parameter("cost.slew", cost.slew);
+  cost.switch_target = declare_parameter("cost.switch_target", cost.switch_target);
+  cost.staleness = declare_parameter("cost.staleness", cost.staleness);
+  cost.temp_lost = declare_parameter("cost.temp_lost", cost.temp_lost);
+  cost.low_visibility = declare_parameter("cost.low_visibility", cost.low_visibility);
+  cost.negative_margin = declare_parameter("cost.negative_margin", cost.negative_margin);
 }
 
 void AutoAimNode::loadVisualizationConfig()
@@ -309,6 +387,9 @@ void AutoAimNode::createRosInterfaces()
   createTfInfrastructure();
   createPublishers();
   createSubscriptions();
+  detector_watchdog_timer_ = create_wall_timer(
+    std::chrono::milliseconds(50),
+    std::bind(&AutoAimNode::detectorWatchdogCallback, this));
 }
 
 void AutoAimNode::createServices()
@@ -319,7 +400,9 @@ void AutoAimNode::createServices()
       const std_srvs::srv::Trigger::Request::SharedPtr,
       std_srvs::srv::Trigger::Response::SharedPtr response)
     {
+      std::lock_guard<std::mutex> lock(this->tracker_mutex_);
       trackers_.clear();
+      next_tracker_id_ = 0;
       best_tracker_id_ = -1;
       previous_tracker_id_ = -1;
       indirect_mode_active_ = false;

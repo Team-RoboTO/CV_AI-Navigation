@@ -9,6 +9,9 @@
 #include "auto_aim_targeting/measurement/pnp_solver.hpp"
 
 #include <opencv2/calib3d.hpp>
+
+#include <cmath>
+#include <limits>
 #include <vector>
 
 namespace rm_auto_aim
@@ -91,23 +94,126 @@ PnPSolver::PnPSolver(
 //
 // Returns false if OpenCV's solver fails (e.g. degenerate input geometry).
 // ---------------------------------------------------------------------------
-bool PnPSolver::solvePnP(const Armor & armor, cv::Mat & rvec, cv::Mat & tvec)
+std::vector<cv::Point2f> PnPSolver::getImageArmorPoints(const Armor & armor) const
 {
-  // Collect 2D image points in the same clockwise order as the 3D model
-  std::vector<cv::Point2f> image_armor_points;
-  image_armor_points.emplace_back(armor.left_light.bottom);   // BL
-  image_armor_points.emplace_back(armor.left_light.top);      // TL
-  image_armor_points.emplace_back(armor.right_light.top);     // TR
-  image_armor_points.emplace_back(armor.right_light.bottom);  // BR
+  return {
+    armor.left_light.bottom,
+    armor.left_light.top,
+    armor.right_light.top,
+    armor.right_light.bottom,
+  };
+}
 
-  // Select 3D model matching the detected armor size
-  auto object_points = (armor.type == ArmorType::SMALL) ? this->small_armor_points_ : this->large_armor_points_;
+const std::vector<cv::Point3f> & PnPSolver::getObjectPoints(ArmorType type) const
+{
+  return (type == ArmorType::SMALL) ? this->small_armor_points_ : this->large_armor_points_;
+}
 
-  // Run PnP with IPPE — well-suited for planar objects (no iterative seed needed)
+bool PnPSolver::solveWithModel(
+  const std::vector<cv::Point3f> & object_points,
+  const std::vector<cv::Point2f> & image_points,
+  cv::Mat & rvec,
+  cv::Mat & tvec) const
+{
   return cv::solvePnP(
-    object_points, image_armor_points, this->camera_matrix_, this->dist_coeffs_, rvec, tvec,
-    false,               // useExtrinsicGuess=false: start from scratch each frame
-    cv::SOLVEPNP_IPPE);  // IPPE: fast, accurate, handles planar degeneracy
+    object_points,
+    image_points,
+    this->camera_matrix_,
+    this->dist_coeffs_,
+    rvec,
+    tvec,
+    false,
+    cv::SOLVEPNP_IPPE);
+}
+
+bool PnPSolver::solvePnP(const Armor & armor, cv::Mat & rvec, cv::Mat & tvec) const
+{
+  const auto image_points = this->getImageArmorPoints(armor);
+  const auto & object_points = this->getObjectPoints(armor.type);
+  return this->solveWithModel(object_points, image_points, rvec, tvec);
+}
+
+double PnPSolver::computeReprojectionError(
+  const std::vector<cv::Point3f> & object_points,
+  const std::vector<cv::Point2f> & image_points,
+  const cv::Mat & rvec,
+  const cv::Mat & tvec) const
+{
+  std::vector<cv::Point2f> projected_points;
+  cv::projectPoints(
+    object_points, rvec, tvec, this->camera_matrix_, this->dist_coeffs_, projected_points);
+
+  if (projected_points.size() != image_points.size() || projected_points.empty()) {
+    return std::numeric_limits<double>::infinity();
+  }
+
+  double sum = 0.0;
+  for (size_t i = 0; i < image_points.size(); ++i) {
+    if (!std::isfinite(projected_points[i].x) || !std::isfinite(projected_points[i].y) ||
+        !std::isfinite(image_points[i].x) || !std::isfinite(image_points[i].y))
+    {
+      return std::numeric_limits<double>::infinity();
+    }
+    const double error = cv::norm(projected_points[i] - image_points[i]);
+    if (!std::isfinite(error)) {
+      return std::numeric_limits<double>::infinity();
+    }
+    sum += error;
+  }
+  return sum / static_cast<double>(image_points.size());
+}
+
+bool PnPSolver::solveBestArmorType(
+  const Armor & armor,
+  ArmorType & best_type,
+  cv::Mat & rvec,
+  cv::Mat & tvec,
+  double * reprojection_error) const
+{
+  const auto image_points = this->getImageArmorPoints(armor);
+
+  cv::Mat rvec_small;
+  cv::Mat tvec_small;
+  cv::Mat rvec_large;
+  cv::Mat tvec_large;
+
+  const bool small_ok =
+    this->solveWithModel(this->small_armor_points_, image_points, rvec_small, tvec_small);
+  const bool large_ok =
+    this->solveWithModel(this->large_armor_points_, image_points, rvec_large, tvec_large);
+
+  if (!small_ok && !large_ok) {
+    return false;
+  }
+
+  double small_error = std::numeric_limits<double>::infinity();
+  double large_error = std::numeric_limits<double>::infinity();
+  if (small_ok) {
+    small_error = this->computeReprojectionError(
+      this->small_armor_points_, image_points, rvec_small, tvec_small);
+  }
+  if (large_ok) {
+    large_error = this->computeReprojectionError(
+      this->large_armor_points_, image_points, rvec_large, tvec_large);
+  }
+
+  if (small_error <= large_error) {
+    best_type = ArmorType::SMALL;
+    rvec = rvec_small;
+    tvec = tvec_small;
+    if (reprojection_error != nullptr) {
+      *reprojection_error = small_error;
+    }
+  } else {
+    best_type = ArmorType::LARGE;
+    rvec = rvec_large;
+    tvec = tvec_large;
+    if (reprojection_error != nullptr) {
+      *reprojection_error = large_error;
+    }
+  }
+
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -119,7 +225,7 @@ bool PnPSolver::solvePnP(const Armor & armor, cv::Mat & rvec, cv::Mat & tvec)
 //   - Less lens distortion at center → more accurate PnP result
 //   - Center detections are more likely to be the intended target
 // ---------------------------------------------------------------------------
-float PnPSolver::calculateDistanceToCenter(const cv::Point2f & image_point)
+float PnPSolver::calculateDistanceToCenter(const cv::Point2f & image_point) const
 {
   float cx = this->camera_matrix_.at<double>(0, 2);  // principal point X [px]
   float cy = this->camera_matrix_.at<double>(1, 2);  // principal point Y [px]

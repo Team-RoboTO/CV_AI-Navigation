@@ -2,6 +2,7 @@
 #define AUTO_AIM_TARGETING__IO__GIMBAL_POSE_ADAPTER_HPP_
 
 #include <memory>
+#include <mutex>
 #include <utility>
 
 #include <geometry_msgs/msg/pose_stamped.hpp>
@@ -36,6 +37,7 @@ public:
   GimbalPoseState currentPoseState(const rclcpp::Time & now) const;
 
 private:
+  bool isFreshLocked(const rclcpp::Time & now) const;
   void broadcastCameraTF(const rclcpp::Time & stamp);
 
   PoseConfig config_;
@@ -45,6 +47,7 @@ private:
   rclcpp::Logger logger_;
   rclcpp::Clock::SharedPtr clock_;
 
+  mutable std::mutex pose_mutex_;
   tf2::Quaternion q_orientation_{tf2::Quaternion::getIdentity()};
   double current_pitch_ = 0.0;
   double current_yaw_ = 0.0;

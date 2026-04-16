@@ -54,6 +54,12 @@ std::optional<AimDecision> EngagementPlanner::selectBestPlan(
     const double base_age = (stamp - target.last_measurement_stamp).seconds();
     plan.measurement_age = std::max(0.0, base_age + ctx.transport_delay);
     plan.measurement_stale = plan.measurement_age > ctx.max_measurement_age;
+    if (!plan.ballistic_valid ||
+        plan.range < ctx.min_fire_dist ||
+        plan.range > ctx.max_fire_dist)
+    {
+      continue;
+    }
     this->computePlanScore(target, ctx, plan);
 
     if (!found || plan.score < best_decision.plan.score) {
@@ -103,9 +109,6 @@ double EngagementPlanner::computePlanScore(
   }
   if (plan.fire_window_margin < 0.0) {
     score += this->weights_.negative_margin * std::abs(plan.fire_window_margin);
-  }
-  if (!plan.ballistic_valid || plan.range < ctx.min_fire_dist || plan.range > ctx.max_fire_dist) {
-    score += 10.0;
   }
   if (!plan.reachable) {
     score += 2.0;

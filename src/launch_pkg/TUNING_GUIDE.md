@@ -1,6 +1,6 @@
 # Auto-Aim Stack Parameter & Tuning Guide
 
-This guide is aligned to the current `debug.launch.py` wiring and to the tracker / trajectory behavior visible in the uploaded source files.
+This guide is aligned to the current `debug.launch.py` / `debug_targeting.launch.py` wiring and to the targeting behavior visible in the source files.
 
 It focuses on two goals:
 1. **Understanding what each parameter really does in this stack**
@@ -39,7 +39,7 @@ Before changing any parameter, make sure you can observe the full pipeline.
 | Topic | Type | Why it matters |
 |---|---|---|
 | `/tracker/cmd_gimbal` | `GimbalCmd` | Main command output: `pitch`, `yaw`, `distance`, `fire_cmd`. |
-| `/cmd_vel` | `Twist` | Legacy compatibility output. Do not use this as the primary debug source unless your lower layer still consumes it. |
+| `/cmd_vel` | `Twist` | Deprecated compatibility output. It no longer carries fire state; use `/tracker/cmd_gimbal` for control. |
 | `/trajectory/marker` | `Marker` | Shows the predicted impact / aim point in RViz. |
 
 ### Useful terminal commands
@@ -61,7 +61,7 @@ ros2 topic echo /tracker/info
 ros2 topic echo /detections_output/optimal_target
 
 # Example runtime tuning
-ros2 param set /armor_tracker ekf.sigma2_q_xyz 2.0
+ros2 param set /auto_aim_targeting ekf.sigma2_q_xyz 2.0
 ```
 
 ---
@@ -608,6 +608,11 @@ Current launch value: **0.10 s**
 
 If a target measurement is too old, the solver marks it stale and suppresses firing.
 
+### `detector_stall_timeout`
+Current launch value: **0.20 s**
+
+If detector frames stop arriving, the targeting node watchdog publishes an explicit hold command instead of leaving the last command alive.
+
 ### `max_gimbal_yaw_rate`, `max_gimbal_pitch_rate`
 Current launch values:
 - `6.0 rad/s`
@@ -615,8 +620,15 @@ Current launch values:
 
 These limit whether the solver believes the gimbal can physically reach the required aim in time.
 
+### `fire_yaw_tolerance`, `fire_pitch_tolerance`
+Current launch values:
+- `0.03 rad`
+- `0.03 rad`
+
+These are the final present-alignment gates. They answer a different question from slew reachability: is the gimbal aligned closely enough **right now** to allow `fire_cmd=true`?
+
 ### `max_cmd_angle`
-Current launch value: **15.0 deg**
+Current launch value: **30.0 deg**
 
 Hard clamp on the command sent out in one solver cycle.
 
@@ -806,13 +818,7 @@ Practical meaning:
 ## 7. Important Notes / Mismatches
 
 ### 1. `tracker.new_tracker_assumed_radius`
-This parameter appears in the current `debug.launch.py`, but I could not map it to the tracker parameter declarations visible in the uploaded tracker source.
-
-That means one of two things is true:
-- either the tracker source loaded in this chat is older than the launch file,
-- or this launch parameter is currently dead / unused.
-
-So treat it as **verify before trusting**.
+This parameter is active in `auto_aim_targeting`. It is used only for the new-tracker spawn guard, where an unmatched armor pose is converted into a provisional robot-center estimate before comparing it to existing tracker centers.
 
 ### 2. Some comments inside the current `debug.launch.py`
 The launch wiring itself is understandable, but several inline comments in the current file are noisy or partially corrupted. The guide above reflects the **actual functional meaning** of the parameters, not those broken inline comments.

@@ -67,14 +67,34 @@ public:
   // Output: rvec  — rotation vector (Rodrigues) from armor body to camera frame
   //         tvec  — translation vector: armor center position in camera frame [m]
   // Returns true on success, false if OpenCV solvePnP fails.
-  bool solvePnP(const Armor & armor, cv::Mat & rvec, cv::Mat & tvec);
+  bool solvePnP(const Armor & armor, cv::Mat & rvec, cv::Mat & tvec) const;
+
+  bool solveBestArmorType(
+    const Armor & armor,
+    ArmorType & best_type,
+    cv::Mat & rvec,
+    cv::Mat & tvec,
+    double * reprojection_error = nullptr) const;
 
   // Returns the Euclidean distance (pixels) from an image point to the
   // camera principal point (cx, cy).  Used in tracker init to prefer
   // detections near image center (better PnP accuracy, less lens distortion).
-  float calculateDistanceToCenter(const cv::Point2f & image_point);
+  float calculateDistanceToCenter(const cv::Point2f & image_point) const;
 
 private:
+  std::vector<cv::Point2f> getImageArmorPoints(const Armor & armor) const;
+  const std::vector<cv::Point3f> & getObjectPoints(ArmorType type) const;
+  double computeReprojectionError(
+    const std::vector<cv::Point3f> & object_points,
+    const std::vector<cv::Point2f> & image_points,
+    const cv::Mat & rvec,
+    const cv::Mat & tvec) const;
+  bool solveWithModel(
+    const std::vector<cv::Point3f> & object_points,
+    const std::vector<cv::Point2f> & image_points,
+    cv::Mat & rvec,
+    cv::Mat & tvec) const;
+
   cv::Mat camera_matrix_;  // 3×3 intrinsic matrix (double precision, CV_64F)
   cv::Mat dist_coeffs_;    // Distortion coefficients (1×n, double precision)
 

@@ -1,7 +1,9 @@
 #ifndef AUTO_AIM_TARGETING__AUTO_AIM_NODE_HPP_
 #define AUTO_AIM_TARGETING__AUTO_AIM_NODE_HPP_
 
+#include <chrono>
 #include <memory>
+#include <mutex>
 #include <optional>
 
 #include <geometry_msgs/msg/pose_stamped.hpp>
@@ -40,6 +42,8 @@ private:
   // --- Runtime path (stepdown: caller before callee) ---
   void armorsCallback(const vision_msgs::msg::Detection2DArray::ConstSharedPtr detection_msg);
   void processFrame(const Observation & input);
+  void detectorWatchdogCallback();
+  void publishHoldOutput(const rclcpp::Time & stamp);
   void updateTimestep(const rclcpp::Time & stamp);
   bool isPipelineReady() const;
 
@@ -70,11 +74,14 @@ private:
   rclcpp::Time last_time_{0, 0, RCL_ROS_TIME};
   double dt_ = 1.0 / 30.0;
 
+  std::mutex tracker_mutex_;
   Trackers::TrackerStore trackers_{};
   int next_tracker_id_ = 0;
   int best_tracker_id_ = -1;
   int previous_tracker_id_ = -1;
   bool indirect_mode_active_ = false;
+  std::chrono::steady_clock::time_point last_frame_steady_time_{};
+  bool have_seen_frame_ = false;
 
   std::shared_ptr<tf2_ros::Buffer> tf2_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf2_listener_;
@@ -85,6 +92,7 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr micro_pose_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_tracker_srv_;
+  rclcpp::TimerBase::SharedPtr detector_watchdog_timer_;
 
   std::unique_ptr<DetectionConverter> detection_converter_;
   std::unique_ptr<GimbalPoseAdapter> gimbal_pose_adapter_;

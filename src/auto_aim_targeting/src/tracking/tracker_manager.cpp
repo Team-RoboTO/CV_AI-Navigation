@@ -17,9 +17,34 @@
 #include <cmath>
 
 #include <rclcpp/logging.hpp>
+#include <tf2/LinearMath/Matrix3x3.h>
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 namespace rm_auto_aim
 {
+
+namespace
+{
+
+geometry_msgs::msg::Point estimateCenterFromArmor(
+  const auto_aim_interfaces::msg::Armor & armor,
+  double assumed_radius)
+{
+  tf2::Quaternion q;
+  tf2::fromMsg(armor.pose.orientation, q);
+  double roll = 0.0;
+  double pitch = 0.0;
+  double yaw = 0.0;
+  tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
+
+  geometry_msgs::msg::Point center = armor.pose.position;
+  center.x += assumed_radius * std::cos(yaw);
+  center.y += assumed_radius * std::sin(yaw);
+  return center;
+}
+
+}  // namespace
 
 void Trackers::predictAll(
   TrackerStore & trackers,
@@ -100,6 +125,7 @@ void Trackers::spawnFromUnmatched(
   const std::vector<int> & detection_owners,
   int max_trackers,
   double new_tracker_min_dist,
+  double new_tracker_assumed_radius,
   const std::function<std::unique_ptr<Tracker>()> & create_tracker,
   const rclcpp::Time & stamp,
   const rclcpp::Logger & logger)
@@ -110,15 +136,17 @@ void Trackers::spawnFromUnmatched(
     }
 
     const auto & armor = armors->armors[i];
+    const auto provisional_center =
+      estimateCenterFromArmor(armor, new_tracker_assumed_radius);
     bool too_close = false;
     for (const auto & kv : trackers) {
       const auto & tracker = *kv.second;
       if (tracker.tracker_state == Tracker::LOST) {
         continue;
       }
-      const double dx = armor.pose.position.x - tracker.target_state(0);
-      const double dy = armor.pose.position.y - tracker.target_state(2);
-      const double dz = armor.pose.position.z - tracker.target_state(4);
+      const double dx = provisional_center.x - tracker.target_state(0);
+      const double dy = provisional_center.y - tracker.target_state(2);
+      const double dz = provisional_center.z - tracker.target_state(4);
       if (std::sqrt(dx * dx + dy * dy + dz * dz) < new_tracker_min_dist) {
         too_close = true;
         break;

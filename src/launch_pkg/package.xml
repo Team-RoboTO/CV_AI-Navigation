@@ -19,9 +19,15 @@
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>visualization_msgs</depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
   <depend>isaac_ros_nitros</depend>
   <depend>isaac_ros_visual_slam_interfaces</depend>
   <depend>isaac_ros_image_pipeline</depend>
+  <exec_depend>isaac_ros_dnn_image_encoder</exec_depend>
+  <exec_depend>isaac_ros_tensor_rt</exec_depend>
+  <exec_depend>isaac_ros_yolov8</exec_depend>
   <exec_depend>armor_tracker</exec_depend>
   <exec_depend>rm_trajectory</exec_depend>
   <exec_depend>auto_aim_targeting</exec_depend>

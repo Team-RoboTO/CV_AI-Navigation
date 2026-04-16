@@ -17,6 +17,10 @@ namespace rm_auto_aim
 FireGateResult FireGate::evaluate(const ShotPlan & plan, bool pose_fresh) const
 {
   FireGateResult result;
+  if (this->config_.pose_source_is_none && !this->config_.allow_fire_without_pose) {
+    result.blocker = "no_pose_source";
+    return result;
+  }
   if (!pose_fresh) {
     result.blocker = "stale_pose";
     return result;
@@ -43,6 +47,12 @@ FireGateResult FireGate::evaluate(const ShotPlan & plan, bool pose_fresh) const
   }
   if (plan.fire_window_margin < 0.0) {
     result.blocker = "negative_window";
+    return result;
+  }
+  if (std::abs(plan.relative_yaw) > this->config_.fire_yaw_tolerance ||
+      std::abs(plan.relative_pitch) > this->config_.fire_pitch_tolerance)
+  {
+    result.blocker = "not_aligned";
     return result;
   }
 

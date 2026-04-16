@@ -352,8 +352,12 @@ ShotPlan ShotPlanner::buildPlan(
     angles::shortest_angular_distance(ctx.current_yaw, out.absolute_yaw);
   out.relative_pitch = out.absolute_pitch - ctx.current_pitch;
 
-  const double sigma_vyaw = std::sqrt(std::max(target.v_yaw_variance, 1e-8));
-  const double sigma_spin = sigma_vyaw * std::max(predict_time, 0.0);
+  const double yaw_variance = std::max(target.yaw_variance, 0.0);
+  const double vyaw_variance = std::max(target.v_yaw_variance, 0.0);
+  const double sigma_yaw =
+    std::sqrt(std::max(yaw_variance + vyaw_variance * predict_time * predict_time, 1e-8));
+  const double sigma_spin =
+    face.radius * sigma_yaw / std::max(face.range, 0.5);
   const double sigma_cross = crossRangeSigma(target, face.bearing);
   const double sigma_pos = sigma_cross / std::max(face.range, 0.5);
   out.sigma_angular = std::sqrt(sigma_spin * sigma_spin + sigma_pos * sigma_pos);
@@ -361,9 +365,11 @@ ShotPlan ShotPlanner::buildPlan(
   const double dist_scale =
     std::min(ctx.angular_window_ref_dist / std::max(face.range, 0.5), 2.0);
   const double effective_window =
-    std::min(
-      ctx.angular_window * dist_scale + out.sigma_angular,
-      M_PI / std::max(1, target.armors_num));
+    std::max(
+      0.0,
+      std::min(
+        ctx.angular_window * dist_scale,
+        M_PI / std::max(1, target.armors_num)) - out.sigma_angular);
   const double face_error = std::abs(
     angles::shortest_angular_distance(out.absolute_yaw, face.face_yaw));
   out.fire_window_margin = effective_window - face_error;

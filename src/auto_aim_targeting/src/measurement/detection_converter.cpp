@@ -55,6 +55,9 @@ Observation DetectionConverter::buildObservation(
   input.pose_state = pose_state;
   input.armors = this->detectArmors(detection_msg, input.detection_indices);
   this->transformToTrackingFrame(input.armors);
+  if (input.armors->armors.empty()) {
+    input.detection_indices.clear();
+  }
   this->filterImplausibleDetections(input.armors, input.detection_indices);
   return input;
 }
@@ -102,7 +105,11 @@ std::optional<Armor> DetectionConverter::buildArmorFromDetection(
   const auto center_y = detection.bbox.center.position.y - this->config_.bbox_padding_y;
   const auto width = detection.bbox.size_x;
   const auto height = detection.bbox.size_y;
-  if (height < 1.0 || width < 1.0) {
+  if (!std::isfinite(center_x) || !std::isfinite(center_y) ||
+      !std::isfinite(width) || !std::isfinite(height) ||
+      !std::isfinite(this->config_.light_ratio) ||
+      height < 1.0 || width < 1.0 || this->config_.light_ratio <= 0.0)
+  {
     return std::nullopt;
   }
 
@@ -115,7 +122,7 @@ std::optional<Armor> DetectionConverter::buildArmorFromDetection(
 
   Armor armor_obj;
   armor_obj.center = cv::Point2f(center_x, center_y);
-  armor_obj.type = ((width / height) > 1.5) ? ArmorType::LARGE : ArmorType::SMALL;
+  armor_obj.type = ArmorType::SMALL;
   armor_obj.number = detection.results.empty() ? "unknown" : detection.results[0].hypothesis.class_id;
   armor_obj.confidence = detection.results.empty() ? 0.0 : detection.results[0].hypothesis.score;
   const float lr = static_cast<float>(this->config_.light_ratio);
@@ -138,13 +145,26 @@ std::optional<auto_aim_interfaces::msg::Armor> DetectionConverter::solveArmorPos
   const Armor & armor) const
 {
   cv::Mat rvec, tvec;
-  const bool success = this->pnp_solver_->solvePnP(armor, rvec, tvec);
+  ArmorType selected_type = ArmorType::SMALL;
+  double reprojection_error = 0.0;
+  const bool success = this->pnp_solver_->solveBestArmorType(
+    armor, selected_type, rvec, tvec, &reprojection_error);
   if (!success) {
+    return std::nullopt;
+  }
+  if (!std::isfinite(reprojection_error) ||
+      reprojection_error > this->config_.pnp_max_reprojection_error)
+  {
+    RCLCPP_DEBUG(
+      this->logger_,
+      "Rejecting PnP solution: reprojection error %.2f px exceeds threshold %.2f px",
+      reprojection_error,
+      this->config_.pnp_max_reprojection_error);
     return std::nullopt;
   }
 
   auto_aim_interfaces::msg::Armor armor_msg;
-  armor_msg.type = ARMOR_TYPE_STR[static_cast<int>(armor.type)];
+  armor_msg.type = ARMOR_TYPE_STR[static_cast<int>(selected_type)];
   armor_msg.number = armor.number;
   armor_msg.pose.position.x = tvec.at<double>(0);
   armor_msg.pose.position.y = tvec.at<double>(1);
@@ -184,9 +204,9 @@ void DetectionConverter::transformToTrackingFrame(
       this->config_.target_frame,
       armors->header.frame_id,
       armors->header.stamp,
-      rclcpp::Duration::from_seconds(0.01));
+      rclcpp::Duration::from_seconds(0.0));
   } catch (const tf2::TransformException & ex) {
-    RCLCPP_ERROR(this->logger_, "TF2 error: %s", ex.what());
+    RCLCPP_DEBUG(this->logger_, "Dropping armors because TF is unavailable: %s", ex.what());
     armors->armors.clear();
     return;
   }

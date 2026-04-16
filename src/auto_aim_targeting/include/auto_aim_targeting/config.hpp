@@ -17,6 +17,7 @@ struct MeasurementConfig
   std::set<std::string> target_classes{};
   double light_ratio = 0.85;
   double bbox_padding_y = 80.0;
+  double pnp_max_reprojection_error = 10.0;
   std::string target_frame = "odom";
 };
 
@@ -26,6 +27,7 @@ struct TrackingRuntimeConfig
   double lost_time_thres = 0.3;
   int max_trackers = 5;
   double new_tracker_min_dist = 0.5;
+  double new_tracker_assumed_radius = 0.26;
   double process_noise_position = 5.0;
   double process_noise_yaw = 10.0;
   double process_noise_radius = 1e-6;
@@ -65,14 +67,19 @@ struct EngagementConfig
   double angular_window = 0.09;
   double angular_window_ref_dist = 3.0;
   double max_measurement_age = 0.10;
+  double detector_stall_timeout = 0.20;
   double max_gimbal_yaw_rate = 6.0;
   double max_gimbal_pitch_rate = 4.0;
+  double fire_yaw_tolerance = 0.03;
+  double fire_pitch_tolerance = 0.03;
   double indirect_vyaw_threshold = 3.0;
   double indirect_timing_tolerance = 0.02;
   int indirect_max_candidates = 8;
   double oblique_exponent = 2.0;
   double latency_gate_sigma = 2.5;
   int latency_warmup_samples = 5;
+  bool pose_source_is_none = true;
+  bool allow_fire_without_pose = false;
   CostWeights cost_weights{};
 };
 

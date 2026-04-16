@@ -68,9 +68,9 @@ CommandOutput GimbalCommandController::makeShotOutput(
   output.cmd.distance = plan.range;
   output.cmd.fire_cmd = fire;
 
-  output.twist.angular.x = fire ? 1.0 : 0.0;
-  output.twist.angular.y = output.cmd.pitch;
-  output.twist.angular.z = output.cmd.yaw;
+  output.twist.angular.x = 0.0;
+  output.twist.angular.y = this->smoothed_rel_pitch_;
+  output.twist.angular.z = this->smoothed_rel_yaw_;
 
   output.marker.header = header;
   output.marker.ns = "impact_point";

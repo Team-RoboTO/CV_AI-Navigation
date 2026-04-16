@@ -52,6 +52,7 @@ struct TrackSnapshot
   double radius_1 = 0.0;
   double radius_2 = 0.0;
   double dz = 0.0;
+  double yaw_variance = 0.0;
   double v_yaw_variance = 0.0;
   double position_variance_x = 0.0;
   double position_variance_y = 0.0;
@@ -448,57 +449,6 @@ private:
   // divergence detection + hard reset, covariance inflation.
   // Called when position is close but yaw differs by > max_match_yaw_diff_.
   void handleArmorJump(const Armor & a);
-
-  // --- Decomposed helpers for update() ---
-
-  // Among same-ID armors, pick the best match via Mahalanobis distance.
-  // Also detects whether a second face from the alternate pair is visible.
-  // Returns the selected armor.  Sets has_other_pair_armor and other_pair_*
-  // output parameters when a second face from the other pair is found.
-  Armor selectBestArmor(
-    const std::vector<Armor> & same_id_armors,
-    const Eigen::VectorXd & ekf_prediction,
-    bool & has_other_pair_armor,
-    double & other_pair_x, double & other_pair_y, double & other_pair_z,
-    double & other_pair_yaw);
-
-  // After a Mahalanobis-gated match: run EKF update, adapt the active radius
-  // via the scalar KF, adapt the other-pair radius/dz if a secondary face was
-  // detected, optionally fuse the secondary face, sync state, and update face
-  // context / stationary state.
-  void fuseMatchedMeasurement(
-    const Armor & selected_armor,
-    double max_yaw_oblique_rad,
-    bool has_other_pair_armor,
-    double other_pair_x, double other_pair_y, double other_pair_z,
-    double other_pair_yaw,
-    const rclcpp::Time & stamp);
-
-  // Fuse the secondary (other-pair) face measurement into the EKF as a
-  // sequential update.  Called after the primary EKF update when both faces
-  // are simultaneously visible and use_secondary_face_fusion is enabled.
-  void fuseSecondaryFace(
-    double other_pair_x, double other_pair_y, double other_pair_z,
-    double other_pair_yaw);
-
-  // Clamp radius to physical bounds, clamp v_yaw to max rate, and normalize
-  // yaw to [-pi, pi].
-  void applyStateSafetyClamps();
-
-  // Advance the DETECTING/TRACKING/TEMP_LOST/LOST state machine based on
-  // whether a measurement was matched this frame.
-  void advanceStateMachine(bool matched);
-
-  // --- Decomposed helpers for handleArmorJump() ---
-
-  // Check if the EKF center has diverged after a yaw snap (inferred armor
-  // position too far from the actual detection).  If so, hard-reset the
-  // entire state from the current detection.
-  void detectAndResetDivergence(const Armor & current_armor, double yaw);
-
-  // Inflate covariance on the states that were snapped during the jump
-  // (yaw, v_yaw, and optionally za, v_za for 4-armor pair switches).
-  void inflatePostJumpCovariance();
 
   // Convert quaternion orientation → continuous yaw angle.
   // Uses shortest_angular_distance to unwrap relative to last_yaw_,

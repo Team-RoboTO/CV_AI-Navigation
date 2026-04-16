@@ -35,6 +35,7 @@ public:
     const std::vector<int> & detection_owners,
     int max_trackers,
     double new_tracker_min_dist,
+    double new_tracker_assumed_radius,
     const std::function<std::unique_ptr<Tracker>()> & create_tracker,
     const rclcpp::Time & stamp,
     const rclcpp::Logger & logger);

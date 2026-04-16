@@ -1256,14 +1256,13 @@ void Tracker::updateSmoothedAcceleration(double dt)
   double raw_accel_y = (this->target_state(3) - this->prior_vy) / dt;
   double raw_accel_z = (this->target_state(5) - this->prior_vz) / dt;
 
-  double xyz_decay = std::pow(
-    this->position_velocity_decay, dt * this->config_.refresh_frequency);
-  if (xyz_decay > 1e-6) {
-    double damping_correction = (1.0 / xyz_decay - 1.0) / dt;
-    raw_accel_x -= this->prior_vx * damping_correction;
-    raw_accel_y -= this->prior_vy * damping_correction;
-    raw_accel_z -= this->prior_vz * damping_correction;
-  }
+  double xyz_decay = std::max(
+    std::pow(this->position_velocity_decay, dt * this->config_.refresh_frequency),
+    1e-6);
+  double damping_correction = (1.0 / xyz_decay - 1.0) / dt;
+  raw_accel_x -= this->prior_vx * damping_correction;
+  raw_accel_y -= this->prior_vy * damping_correction;
+  raw_accel_z -= this->prior_vz * damping_correction;
 
   double time_adjusted_alpha = 1.0 - std::pow(
     1.0 - this->config_.acceleration_smoothing_factor,
@@ -1310,6 +1309,7 @@ TrackSnapshot Tracker::snapshot() const
   snapshot.radius_1 = this->target_state(8);
   snapshot.radius_2 = this->another_r;
   snapshot.dz = this->dz;
+  snapshot.yaw_variance = this->ekf.getVariance(6);
   snapshot.v_yaw_variance = this->ekf.getVariance(7);
   snapshot.position_variance_x = this->ekf.getVariance(0);
   snapshot.position_variance_y = this->ekf.getVariance(2);
