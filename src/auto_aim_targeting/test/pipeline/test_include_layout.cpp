@@ -42,7 +42,7 @@ TEST(IncludeLayoutTest, FlatIncludesAreOnlyAllowedRootHeaders)
 {
   const auto package_root = sourceRoot();
   // Match any flat include: auto_aim_targeting/<file>.hpp (no subdirectory)
-  const std::regex flat_include_pattern(R"(#include\s+"auto_aim_targeting/([^/"]+\.hpp)")");
+  const std::regex flat_include_pattern(R"delim(#include\s+"auto_aim_targeting/([^/"]+\.hpp)")delim");
   // These root-level headers are explicitly allowed as flat includes
   const std::set<std::string> allowed_flat{
     "config.hpp", "planning_types.hpp", "auto_aim_node.hpp", "types.hpp"};
@@ -59,9 +59,9 @@ TEST(IncludeLayoutTest, FlatIncludesAreOnlyAllowedRootHeaders)
 
     std::ifstream input(entry.path());
     ASSERT_TRUE(input.is_open()) << "Failed to open " << entry.path().string();
-    const std::string content(
-      std::istreambuf_iterator<char>(input),
-      std::istreambuf_iterator<char>());
+    const std::string content{
+      std::istreambuf_iterator<char>{input},
+      std::istreambuf_iterator<char>{}};
 
     std::sregex_iterator it(content.begin(), content.end(), flat_include_pattern);
     std::sregex_iterator end;

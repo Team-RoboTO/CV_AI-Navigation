@@ -24,7 +24,7 @@ def generate_launch_description():
         plugin='realsense2_camera::RealSenseNodeFactory',
         parameters=[
             realsense_config_file_path,
-            {'json_file_path': realsense_json_file_path, 'publish_tf': False},
+            {'json_file_path': realsense_json_file_path, 'publish_tf': True},
         ],
     )
 

@@ -51,13 +51,13 @@
 namespace rm_auto_aim
 {
 Tracker::Tracker(const TrackerConfig & config)
-: config_(config),
-  tracker_state(LOST),
+: tracker_state(LOST),
   tracked_id(std::string("")),
   position_error_norm(0.0),
   yaw_error_abs(0.0),
   measurement(Eigen::VectorXd::Zero(4)),
   target_state(Eigen::VectorXd::Zero(9)),
+  config_(config),
   // WHY π/3 (60°): 4-armor robots have faces 90° apart.  The yaw gate must be
   // wide enough to accept noisy PnP measurements (±15° at 3m) but narrow enough
   // to detect a 90° jump (face switch).  60° is the midpoint: a measurement

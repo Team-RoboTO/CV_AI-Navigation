@@ -10,7 +10,7 @@ add_definitions(-Wall -Werror)
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
-find_package(eigen REQUIRED)
+find_package(Eigen3 REQUIRED)
 find_package(angles REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(geometry_msgs REQUIRED)
@@ -53,7 +53,6 @@ target_include_directories(${PROJECT_NAME} PUBLIC
 ament_target_dependencies(${PROJECT_NAME}
   rclcpp
   rclcpp_components
-  eigen
   angles
   std_srvs
   geometry_msgs
@@ -70,6 +69,7 @@ ament_target_dependencies(${PROJECT_NAME}
 
 target_link_libraries(${PROJECT_NAME}
   ${OpenCV_LIBS}
+  Eigen3::Eigen
 )
 
 rclcpp_components_register_node(${PROJECT_NAME}
