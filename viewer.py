@@ -34,10 +34,10 @@ class VisualizerNode(Node):
         self.create_subscription(Detection2D, '/detections_output/optimal_target', self.optimal_cb, qos_profile_sensor_data)
         self.create_subscription(Marker, '/trajectory/marker', self.marker_cb, qos_profile_sensor_data)
 
-        # Try subscribing to tracker target and gimbal commands
+        # Try subscribing to tracker targets and gimbal commands
         try:
-            from auto_aim_interfaces.msg import Target, GimbalCmd
-            self.create_subscription(Target, '/tracker/target', self.target_cb, qos_profile_sensor_data)
+            from auto_aim_interfaces.msg import Targets, GimbalCmd
+            self.create_subscription(Targets, '/tracker/targets', self.targets_cb, qos_profile_sensor_data)
             self.create_subscription(GimbalCmd, '/tracker/cmd_gimbal', self.gimbal_cmd_cb, qos_profile_sensor_data)
         except ImportError:
             self.get_logger().warn("auto_aim_interfaces not found — run: source install/setup.bash")
@@ -59,8 +59,12 @@ class VisualizerNode(Node):
             else:
                 self.latest_marker = msg
 
-    def target_cb(self, msg):
-        self.tracking_info = msg
+    def targets_cb(self, msg):
+        idx = msg.best_target_idx
+        if 0 <= idx < len(msg.targets):
+            self.tracking_info = msg.targets[idx]
+        else:
+            self.tracking_info = None
 
     def gimbal_cmd_cb(self, msg):
         self.gimbal_cmd = msg

@@ -14,7 +14,13 @@ class FireGate
 public:
   explicit FireGate(EngagementConfig config) : config_(std::move(config)) {}
 
-  FireGateResult evaluate(const ShotPlan & plan, bool pose_fresh) const;
+  // Deterministic fire permission check.
+  // pose_fresh: whether gimbal feedback is available and recent.
+  // has_pose_source: whether a pose source is configured at all.
+  FireGateResult evaluate(
+    const ShotPlan & plan,
+    bool pose_fresh,
+    bool has_pose_source) const;
 
 private:
   EngagementConfig config_;

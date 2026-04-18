@@ -1,12 +1,13 @@
 // ============================================================================
-// gimbal_command_controller.cpp — Smooths and formats gimbal commands.
+// gimbal_command_controller.cpp — Formats gimbal commands from shot plans.
 //
-// ENTRYPOINTS:
-//   makeHoldOutput → build zero-command when no target is tracked
-//   makeShotOutput → build GimbalCmd + Twist + impact marker from a ShotPlan
+// NO EMA smoothing. The gimbal PID controller downstream handles convergence.
+// Commands are ABSOLUTE angles (yaw/pitch in odom frame), not relative.
+// The downstream controller (lower computer) knows its current angles and
+// computes the delta internally.
 //
-// HELPER (stepdown):
-//   reset → clear EMA smoothing state (called by both entrypoints)
+// This avoids the fundamental problem where relative angles require accurate
+// gimbal feedback (pose_source), which may be unavailable or stale.
 // ============================================================================
 #include "auto_aim_targeting/io/gimbal_command_controller.hpp"
 
@@ -18,8 +19,6 @@ namespace rm_auto_aim
 
 CommandOutput GimbalCommandController::makeHoldOutput(const std_msgs::msg::Header & header)
 {
-  this->reset();
-
   CommandOutput output;
   output.cmd.header = header;
   output.cmd.pitch = 0.0;
@@ -36,41 +35,20 @@ CommandOutput GimbalCommandController::makeHoldOutput(const std_msgs::msg::Heade
 CommandOutput GimbalCommandController::makeShotOutput(
   const std_msgs::msg::Header & header,
   const ShotPlan & plan,
-  bool fire,
-  bool reset_smoothing)
+  bool fire)
 {
-  if (reset_smoothing) {
-    this->reset();
-  }
-
-  const double rel_yaw =
-    std::max(-this->max_cmd_yaw_angle_rad_, std::min(plan.relative_yaw, this->max_cmd_yaw_angle_rad_));
-  const double rel_pitch =
-    std::max(-this->max_cmd_pitch_angle_rad_, std::min(plan.relative_pitch, this->max_cmd_pitch_angle_rad_));
-
-  if (!this->initialized_) {
-    this->smoothed_rel_yaw_ = rel_yaw;
-    this->smoothed_rel_pitch_ = rel_pitch;
-    this->initialized_ = true;
-  } else {
-    this->smoothed_rel_yaw_ =
-      this->cmd_smooth_alpha_ * rel_yaw +
-      (1.0 - this->cmd_smooth_alpha_) * this->smoothed_rel_yaw_;
-    this->smoothed_rel_pitch_ =
-      this->cmd_smooth_alpha_ * rel_pitch +
-      (1.0 - this->cmd_smooth_alpha_) * this->smoothed_rel_pitch_;
-  }
+  double cmd_yaw = std::clamp(plan.absolute_yaw, -this->max_cmd_yaw_angle_rad_, this->max_cmd_yaw_angle_rad_);
+  double cmd_pitch = std::clamp(plan.absolute_pitch, -this->max_cmd_pitch_angle_rad_, this->max_cmd_pitch_angle_rad_);
 
   CommandOutput output;
   output.cmd.header = header;
-  output.cmd.pitch = this->smoothed_rel_pitch_ * 180.0 / M_PI;
-  output.cmd.yaw = this->smoothed_rel_yaw_ * 180.0 / M_PI;
+  output.cmd.yaw = cmd_yaw * 180.0 / M_PI;
+  output.cmd.pitch = cmd_pitch * 180.0 / M_PI;
   output.cmd.distance = plan.range;
   output.cmd.fire_cmd = fire;
 
-  output.twist.angular.x = 0.0;
-  output.twist.angular.y = this->smoothed_rel_pitch_;
-  output.twist.angular.z = this->smoothed_rel_yaw_;
+  output.twist.angular.y = cmd_pitch;
+  output.twist.angular.z = cmd_yaw;
 
   output.marker.header = header;
   output.marker.ns = "impact_point";
@@ -86,13 +64,6 @@ CommandOutput GimbalCommandController::makeShotOutput(
   output.marker.color.r = fire ? 0.2 : 1.0;
 
   return output;
-}
-
-void GimbalCommandController::reset()
-{
-  this->initialized_ = false;
-  this->smoothed_rel_yaw_ = 0.0;
-  this->smoothed_rel_pitch_ = 0.0;
 }
 
 }  // namespace rm_auto_aim

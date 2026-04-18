@@ -79,6 +79,7 @@ private:
   int next_tracker_id_ = 0;
   int best_tracker_id_ = -1;
   int previous_tracker_id_ = -1;
+  int previous_face_index_ = -1;
   bool indirect_mode_active_ = false;
   std::chrono::steady_clock::time_point last_frame_steady_time_{};
   bool have_seen_frame_ = false;

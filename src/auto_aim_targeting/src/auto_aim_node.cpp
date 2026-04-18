@@ -110,24 +110,28 @@ void AutoAimNode::processFrame(const Observation & input)
       safe_input.pose_state,
       latency_compensator_->transportDelay(now(), safe_input.stamp),
       previous_tracker_id_,
+      previous_face_index_,
       indirect_mode_active_,
       latency_compensator_->currentBias());
     decision = engagement_planner_->selectBestPlan(snapshots, ctx, safe_input.stamp);
   }
 
   best_tracker_id_ = decision.has_value() ? decision->plan.tracker_id : -1;
+  const bool has_pose_source = config_.pose.pose_source != "none";
   const FireGateResult fire_result = decision.has_value()
-    ? fire_gate_->evaluate(decision->plan, safe_input.pose_state.fresh)
+    ? fire_gate_->evaluate(decision->plan, safe_input.pose_state.fresh, has_pose_source)
     : FireGateResult{};
   AimResult output = output_publisher_->buildAimResult(
-    safe_input, trackers_, best_tracker_id_, decision, fire_result, previous_tracker_id_);
+    safe_input, trackers_, best_tracker_id_, decision, fire_result);
   output_publisher_->publish(output);
 
   if (decision.has_value()) {
     previous_tracker_id_ = decision->plan.tracker_id;
+    previous_face_index_ = decision->plan.face_index;
     indirect_mode_active_ = decision->plan.indirect;
   } else {
     previous_tracker_id_ = -1;
+    previous_face_index_ = -1;
     indirect_mode_active_ = false;
   }
 }
@@ -166,10 +170,10 @@ void AutoAimNode::publishHoldOutput(const rclcpp::Time & stamp)
   this->best_tracker_id_ = -1;
   const std::optional<AimDecision> no_decision;
   AimResult output = this->output_publisher_->buildAimResult(
-    input, this->trackers_, this->best_tracker_id_, no_decision, FireGateResult{},
-    this->previous_tracker_id_);
+    input, this->trackers_, this->best_tracker_id_, no_decision, FireGateResult{});
   this->output_publisher_->publish(output);
   this->previous_tracker_id_ = -1;
+  this->previous_face_index_ = -1;
   this->indirect_mode_active_ = false;
 }
 
@@ -364,6 +368,7 @@ void AutoAimNode::loadEngagementConfig()
   cost.uncertainty = declare_parameter("cost.uncertainty", cost.uncertainty);
   cost.slew = declare_parameter("cost.slew", cost.slew);
   cost.switch_target = declare_parameter("cost.switch_target", cost.switch_target);
+  cost.switch_face = declare_parameter("cost.switch_face", cost.switch_face);
   cost.staleness = declare_parameter("cost.staleness", cost.staleness);
   cost.temp_lost = declare_parameter("cost.temp_lost", cost.temp_lost);
   cost.low_visibility = declare_parameter("cost.low_visibility", cost.low_visibility);
@@ -372,7 +377,6 @@ void AutoAimNode::loadEngagementConfig()
 
 void AutoAimNode::loadVisualizationConfig()
 {
-  config_.visualization.cmd_smooth_alpha = declare_parameter("cmd_smooth_alpha", 0.4);
   config_.visualization.max_cmd_pitch_angle_deg = declare_parameter("max_cmd_angle", 30.0);
   config_.visualization.max_cmd_yaw_angle_deg = declare_parameter("max_cmd_yaw_angle", 180.0);
 }
@@ -405,6 +409,7 @@ void AutoAimNode::createServices()
       next_tracker_id_ = 0;
       best_tracker_id_ = -1;
       previous_tracker_id_ = -1;
+      previous_face_index_ = -1;
       indirect_mode_active_ = false;
       response->success = true;
     });
@@ -425,7 +430,6 @@ void AutoAimNode::createPublishers()
 {
   auto target_qos = rclcpp::SensorDataQoS().reliability(rclcpp::ReliabilityPolicy::Reliable);
   auto info_pub = create_publisher<auto_aim_interfaces::msg::TrackerInfo>("/tracker/info", 10);
-  auto target_pub = create_publisher<auto_aim_interfaces::msg::Target>("/tracker/target", target_qos);
   auto targets_pub = create_publisher<auto_aim_interfaces::msg::Targets>("/tracker/targets", target_qos);
   auto optimal_bbox_pub = create_publisher<vision_msgs::msg::Detection2D>(
     "/detections_output/optimal_target", rclcpp::SensorDataQoS());
@@ -439,7 +443,6 @@ void AutoAimNode::createPublishers()
   output_publisher_ = std::make_unique<TargetingOutputPublisher>(
     config_,
     std::move(info_pub),
-    std::move(target_pub),
     std::move(targets_pub),
     std::move(optimal_bbox_pub),
     std::move(cmd_pub),

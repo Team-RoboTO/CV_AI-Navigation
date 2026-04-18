@@ -34,7 +34,6 @@
    - choose the best `AimDecision`
 8. `FireGate` evaluates whether the selected plan is allowed to fire.
 9. `TargetingOutputPublisher` publishes:
-   - `/tracker/target`
    - `/tracker/targets`
    - `/detections_output/optimal_target`
    - `/tracker/cmd_gimbal`

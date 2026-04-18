@@ -38,3 +38,7 @@ src/isaac_*
 .github/
 docs/superpowers/
 .devcontainer/
+.claude/
+compile_commands.json
+__pycache__/
+*.pyc

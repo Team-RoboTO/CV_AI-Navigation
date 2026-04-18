@@ -85,7 +85,6 @@ struct EngagementConfig
 
 struct VisualizationConfig
 {
-  double cmd_smooth_alpha = 0.4;
   double max_cmd_pitch_angle_deg = 30.0;
   double max_cmd_yaw_angle_deg = 180.0;
 };

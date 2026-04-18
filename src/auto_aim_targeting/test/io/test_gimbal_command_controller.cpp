@@ -11,7 +11,7 @@ namespace
 
 TEST(CommandControllerTest, HoldOutputResetsCommandAndDeletesMarker)
 {
-  GimbalCommandController controller(0.5, 30.0, 180.0);
+  GimbalCommandController controller(30.0, 180.0);
   std_msgs::msg::Header header;
   header.frame_id = "odom";
 
@@ -24,39 +24,46 @@ TEST(CommandControllerTest, HoldOutputResetsCommandAndDeletesMarker)
   EXPECT_EQ(output.marker.action, visualization_msgs::msg::Marker::DELETE);
 }
 
-TEST(CommandControllerTest, ShotOutputClampsAndSmoothsRelativeAngles)
+TEST(CommandControllerTest, ShotOutputUsesAbsoluteAngles)
 {
-  GimbalCommandController controller(0.5, 30.0, 180.0);
+  GimbalCommandController controller(30.0, 180.0);
   std_msgs::msg::Header header;
   header.frame_id = "odom";
 
-  ShotPlan first_plan;
-  first_plan.relative_yaw = 45.0 * M_PI / 180.0;
-  first_plan.relative_pitch = -30.0 * M_PI / 180.0;
-  first_plan.range = 4.2;
-  first_plan.x = 1.0;
-  first_plan.y = 2.0;
-  first_plan.z = 3.0;
+  ShotPlan plan;
+  plan.absolute_yaw = 45.0 * M_PI / 180.0;
+  plan.absolute_pitch = -20.0 * M_PI / 180.0;
+  plan.range = 4.2;
+  plan.x = 1.0;
+  plan.y = 2.0;
+  plan.z = 3.0;
 
-  const auto first = controller.makeShotOutput(header, first_plan, true, true);
-  EXPECT_NEAR(first.cmd.yaw, 45.0, 1e-6);
-  EXPECT_NEAR(first.cmd.pitch, -30.0, 1e-6);
-  EXPECT_TRUE(first.cmd.fire_cmd);
-  EXPECT_DOUBLE_EQ(first.cmd.distance, 4.2);
-  EXPECT_EQ(first.marker.action, visualization_msgs::msg::Marker::ADD);
-  EXPECT_DOUBLE_EQ(first.marker.pose.position.x, 1.0);
-  EXPECT_DOUBLE_EQ(first.marker.pose.position.y, 2.0);
-  EXPECT_DOUBLE_EQ(first.marker.pose.position.z, 3.0);
+  const auto output = controller.makeShotOutput(header, plan, true);
+  EXPECT_NEAR(output.cmd.yaw, 45.0, 1e-4);
+  EXPECT_NEAR(output.cmd.pitch, -20.0, 1e-4);
+  EXPECT_TRUE(output.cmd.fire_cmd);
+  EXPECT_DOUBLE_EQ(output.cmd.distance, 4.2);
+  EXPECT_EQ(output.marker.action, visualization_msgs::msg::Marker::ADD);
+  EXPECT_DOUBLE_EQ(output.marker.pose.position.x, 1.0);
+  EXPECT_DOUBLE_EQ(output.marker.pose.position.y, 2.0);
+  EXPECT_DOUBLE_EQ(output.marker.pose.position.z, 3.0);
+}
 
-  ShotPlan second_plan;
-  second_plan.relative_yaw = 0.0;
-  second_plan.relative_pitch = 0.0;
-  second_plan.range = 4.2;
-  const auto second = controller.makeShotOutput(header, second_plan, false, false);
+TEST(CommandControllerTest, ShotOutputClampsAngles)
+{
+  GimbalCommandController controller(30.0, 90.0);
+  std_msgs::msg::Header header;
+  header.frame_id = "odom";
 
-  EXPECT_NEAR(second.cmd.yaw, 22.5, 1e-6);
-  EXPECT_NEAR(second.cmd.pitch, -15.0, 1e-6);
-  EXPECT_FALSE(second.cmd.fire_cmd);
+  ShotPlan plan;
+  plan.absolute_yaw = 120.0 * M_PI / 180.0;
+  plan.absolute_pitch = -45.0 * M_PI / 180.0;
+  plan.range = 3.0;
+
+  const auto output = controller.makeShotOutput(header, plan, false);
+  EXPECT_NEAR(output.cmd.yaw, 90.0, 1e-4);
+  EXPECT_NEAR(output.cmd.pitch, -30.0, 1e-4);
+  EXPECT_FALSE(output.cmd.fire_cmd);
 }
 
 }  // namespace

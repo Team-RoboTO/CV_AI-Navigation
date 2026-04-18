@@ -15,7 +15,6 @@ namespace rm_auto_aim
 TargetingOutputPublisher::TargetingOutputPublisher(
   const TargetingConfig & config,
   rclcpp::Publisher<auto_aim_interfaces::msg::TrackerInfo>::SharedPtr info_pub,
-  rclcpp::Publisher<auto_aim_interfaces::msg::Target>::SharedPtr target_pub,
   rclcpp::Publisher<auto_aim_interfaces::msg::Targets>::SharedPtr targets_pub,
   rclcpp::Publisher<vision_msgs::msg::Detection2D>::SharedPtr optimal_bbox_pub,
   rclcpp::Publisher<auto_aim_interfaces::msg::GimbalCmd>::SharedPtr cmd_pub,
@@ -24,11 +23,9 @@ TargetingOutputPublisher::TargetingOutputPublisher(
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub)
 : targeting_debug_publisher_(config.measurement.target_frame),
   gimbal_command_controller_(
-    config.visualization.cmd_smooth_alpha,
     config.visualization.max_cmd_pitch_angle_deg,
     config.visualization.max_cmd_yaw_angle_deg),
   info_pub_(std::move(info_pub)),
-  target_pub_(std::move(target_pub)),
   targets_pub_(std::move(targets_pub)),
   optimal_bbox_pub_(std::move(optimal_bbox_pub)),
   cmd_pub_(std::move(cmd_pub)),
@@ -74,11 +71,9 @@ AimResult TargetingOutputPublisher::buildAimResult(
   const std::map<int, std::unique_ptr<Tracker>> & trackers,
   int best_tracker_id,
   const std::optional<AimDecision> & decision,
-  const FireGateResult & fire_result,
-  int previous_tracker_id)
+  const FireGateResult & fire_result)
 {
   AimResult output;
-  output.best_tracker_id = best_tracker_id;
   output.targets_msg.header.stamp = input.stamp;
   output.targets_msg.header.frame_id = this->target_frame_;
   output.targets_msg.best_target_idx = -1;
@@ -97,15 +92,16 @@ AimResult TargetingOutputPublisher::buildAimResult(
     output.targets_msg.targets.push_back(target_msg);
   }
 
-  output.target_msg.header.stamp = input.stamp;
-  output.target_msg.header.frame_id = this->target_frame_;
-  output.target_msg.tracking = false;
-  output.target_msg.id = "";
-  output.target_msg.armors_num = 0;
+  auto_aim_interfaces::msg::Target best_target_msg;
+  best_target_msg.header.stamp = input.stamp;
+  best_target_msg.header.frame_id = this->target_frame_;
+  best_target_msg.tracking = false;
+  best_target_msg.id = "";
+  best_target_msg.armors_num = 0;
 
   const Tracker * best_tracker = this->findTracker(trackers, best_tracker_id);
   if (best_tracker != nullptr) {
-    this->targeting_debug_publisher_.fillTargetMsg(output.target_msg, *best_tracker, input.stamp);
+    this->targeting_debug_publisher_.fillTargetMsg(best_target_msg, *best_tracker, input.stamp);
     output.tracker_info = this->targeting_debug_publisher_.makeTrackerInfo(*best_tracker);
     output.has_tracker_info = true;
   }
@@ -116,7 +112,7 @@ AimResult TargetingOutputPublisher::buildAimResult(
     input.detection_indices,
     best_tracker);
   output.marker_array = this->targeting_debug_publisher_.buildMarkers(
-    output.target_msg,
+    best_target_msg,
     best_tracker,
     this->position_marker_,
     this->linear_v_marker_,
@@ -126,12 +122,10 @@ AimResult TargetingOutputPublisher::buildAimResult(
   if (!decision.has_value()) {
     output.command_output = this->gimbal_command_controller_.makeHoldOutput(output.targets_msg.header);
   } else {
-    const bool reset_smoothing = decision->plan.tracker_id != previous_tracker_id;
     output.command_output = this->gimbal_command_controller_.makeShotOutput(
       output.targets_msg.header,
       decision->plan,
-      fire_result.fire,
-      reset_smoothing);
+      fire_result.fire);
   }
 
   return output;
@@ -151,7 +145,6 @@ const Tracker * TargetingOutputPublisher::findTracker(
 void TargetingOutputPublisher::publish(const AimResult & output)
 {
   this->targets_pub_->publish(output.targets_msg);
-  this->target_pub_->publish(output.target_msg);
   if (output.has_tracker_info) {
     this->info_pub_->publish(output.tracker_info);
   }

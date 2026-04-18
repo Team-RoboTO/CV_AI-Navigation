@@ -76,28 +76,30 @@ ExtendedKalmanFilter makeDummyEkf()
 
 TEST(TrackManagerTest, ResolveMatchedFaceKeepsMeasuredFaceIdentity)
 {
+  // Robot center at (3.0, 0, 0) with yaw=0, r=0.22.
+  // Face 0 (yaw=0) sits at (3.0 - 0.22, 0, 0) = (2.78, 0, 0), facing camera.
   Eigen::VectorXd state(9);
-  state << 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.22;
+  state << 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.22;
 
   auto_aim_interfaces::msg::Armor armor;
-  armor.pose.position.x = 0.0;
-  armor.pose.position.y = -0.30;
-  armor.pose.position.z = 0.10;
+  armor.pose.position.x = 2.78;
+  armor.pose.position.y = 0.0;
+  armor.pose.position.z = 0.0;
 
   tf2::Quaternion q;
-  q.setRPY(0.0, 0.0, M_PI / 2.0);
+  q.setRPY(0.0, 0.0, 0.0);
   armor.pose.orientation = tf2::toMsg(q);
 
   const auto binding = resolveMatchedFace(
-    state, ArmorsNum::NORMAL_4, 0.30, 0.10, armor, 60.0);
+    state, ArmorsNum::NORMAL_4, 0.30, 0.0, armor, 60.0);
 
   ASSERT_TRUE(binding.valid);
-  EXPECT_EQ(binding.face_index, 1);
-  EXPECT_TRUE(binding.alternate_pair);
+  EXPECT_EQ(binding.face_index, 0);
+  EXPECT_FALSE(binding.alternate_pair);
   EXPECT_NEAR(binding.position.x, armor.pose.position.x, 1e-9);
   EXPECT_NEAR(binding.position.y, armor.pose.position.y, 1e-9);
   EXPECT_NEAR(binding.position.z, armor.pose.position.z, 1e-9);
-  EXPECT_NEAR(binding.yaw, M_PI / 2.0, 1e-6);
+  EXPECT_NEAR(binding.yaw, 0.0, 1e-6);
   EXPECT_TRUE(binding.observable);
   EXPECT_TRUE(binding.fresh);
 }

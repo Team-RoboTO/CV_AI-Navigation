@@ -15,7 +15,6 @@
 
 #include "auto_aim_interfaces/msg/armors.hpp"
 #include "auto_aim_interfaces/msg/gimbal_cmd.hpp"
-#include "auto_aim_interfaces/msg/target.hpp"
 #include "auto_aim_interfaces/msg/targets.hpp"
 #include "auto_aim_interfaces/msg/tracker_info.hpp"
 #include "auto_aim_targeting/config.hpp"
@@ -58,13 +57,11 @@ struct CommandOutput
 struct AimResult
 {
   auto_aim_interfaces::msg::Targets targets_msg{};
-  auto_aim_interfaces::msg::Target target_msg{};
   auto_aim_interfaces::msg::TrackerInfo tracker_info{};
   bool has_tracker_info = false;
   vision_msgs::msg::Detection2D optimal_bbox{};
   visualization_msgs::msg::MarkerArray marker_array{};
   CommandOutput command_output{};
-  int best_tracker_id = -1;
 };
 
 inline PlanningContext makePlanningContext(
@@ -72,6 +69,7 @@ inline PlanningContext makePlanningContext(
   const GimbalPoseState & pose_state,
   double transport_delay,
   int previous_tracker_id,
+  int previous_face_index,
   bool previous_indirect_mode,
   double time_bias)
 {
@@ -94,6 +92,7 @@ inline PlanningContext makePlanningContext(
   ctx.indirect_max_candidates = config.engagement.indirect_max_candidates;
   ctx.visibility_exponent = config.engagement.oblique_exponent;
   ctx.previous_tracker_id = previous_tracker_id;
+  ctx.previous_face_index = previous_face_index;
   ctx.previous_indirect_mode = previous_indirect_mode;
   ctx.transport_delay = transport_delay;
   return ctx;

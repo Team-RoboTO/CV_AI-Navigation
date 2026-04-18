@@ -1,12 +1,14 @@
 // ============================================================================
 // engagement_planner.cpp — Selects the best shot plan across all tracked targets.
 //
-// ENTRYPOINT: selectBestPlan()
-//   Iterates all tracker snapshots, solves a ShotPlan for each, scores via
-//   multi-objective cost function, returns the lowest-cost plan.
+// Strategy selection:
+//   1. If matched face is visible+fresh+observable AND not spinning fast → visibleDirect
+//   2. If spinning fast (above indirect threshold) → indirect
+//   3. Otherwise → predictedDirect (best face by state prediction)
 //
-// HELPER (stepdown):
-//   computePlanScore → weighted cost from range, slew, uncertainty, visibility
+// Face continuity: when switching from the same tracker's previous plan, a
+// switch_target penalty in the cost function adds hysteresis to prevent
+// frame-to-frame jitter between faces.
 // ============================================================================
 #include "auto_aim_targeting/planning/engagement_planner.hpp"
 
@@ -31,6 +33,8 @@ std::optional<AimDecision> EngagementPlanner::selectBestPlan(
 
     const double abs_vyaw = std::abs(target.v_yaw);
     const bool same_as_previous = (target.tracker_id == ctx.previous_tracker_id);
+
+    // Hysteresis on indirect mode: once active, stay until speed drops to 70% of threshold
     const bool use_indirect =
       target.armors_num > 1 &&
       ((same_as_previous && ctx.previous_indirect_mode)
@@ -38,6 +42,7 @@ std::optional<AimDecision> EngagementPlanner::selectBestPlan(
         : (abs_vyaw > ctx.indirect_vyaw_threshold));
 
     std::optional<ShotPlan> plan_opt;
+
     if (!use_indirect && target.matched_face.valid &&
         target.matched_face.fresh && target.matched_face.observable) {
       plan_opt = this->shot_planner_.solveVisibleDirect(target, ctx);
@@ -106,6 +111,10 @@ double EngagementPlanner::computePlanScore(
   }
   if (ctx.previous_tracker_id >= 0 && ctx.previous_tracker_id != target.tracker_id) {
     score += this->weights_.switch_target;
+  }
+  if (ctx.previous_tracker_id == target.tracker_id &&
+      ctx.previous_face_index >= 0 && ctx.previous_face_index != plan.face_index) {
+    score += this->weights_.switch_face;
   }
   if (plan.fire_window_margin < 0.0) {
     score += this->weights_.negative_margin * std::abs(plan.fire_window_margin);

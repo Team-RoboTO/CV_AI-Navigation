@@ -28,8 +28,7 @@ Before changing any parameter, make sure you can observe the full pipeline.
 | Topic | Type | Why it matters |
 |---|---|---|
 | `/tracker/info` | `TrackerInfo` | Best quick EKF debug topic. Contains `position_diff`, `yaw_diff`, `face_angle`, and the effective adaptive damping values. |
-| `/tracker/target` | `Target` | Legacy single-target output. Good for quickly checking the currently selected best target. |
-| `/tracker/targets` | `Targets` | The real multi-target output used by the trajectory solver. Use this when debugging target selection and anti-spin logic. |
+| `/tracker/targets` | `Targets` | Multi-target output with `targets[]` and `best_target_idx`. Use this when debugging target selection and anti-spin logic. |
 | `/tracker/marker` | `MarkerArray` | RViz visualization of tracked center, velocities, and armor geometry. |
 | `/detections_output` | `Detection2DArray` | Raw YOLO detections after decoder. Useful to separate detector issues from tracker issues. |
 | `/detections_output/optimal_target` | `Detection2D` | The bbox corresponding to the currently selected best target. Useful when checking whether target selection matches what you expect visually. |
@@ -45,10 +44,7 @@ Before changing any parameter, make sure you can observe the full pipeline.
 ### Useful terminal commands
 
 ```bash
-# Best quick look at the final selected target
-ros2 topic echo /tracker/target
-
-# Full list of tracked targets
+# Full list of tracked targets plus best_target_idx
 ros2 topic echo /tracker/targets
 
 # Final gimbal command actually published by the solver
@@ -697,7 +693,7 @@ Practical meaning:
 ## Phase 1 — Static camera / PnP sanity check
 
 1. Put a static armor at a known distance (for example 3 m).
-2. Check `/tracker/target` and `/tracker/marker`.
+2. Check `/tracker/targets` and `/tracker/marker`.
 3. Verify:
    - range is reasonable
    - yaw is not obviously biased

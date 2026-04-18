@@ -40,11 +40,8 @@ std::optional<ShotPlan> ShotPlanner::solveVisibleDirect(
 
   for (int iter = 0; iter < 3; ++iter) {
     const PredictedCenter center = predictCenter(target, local_t);
-    const double predicted_body_yaw =
-      target.matched_face.yaw + target.v_yaw * local_t
-      - target.matched_face.face_index * (2.0 * M_PI / std::max(target.armors_num, 1));
     const FaceGeometry face = this->buildFaceGeometry(
-      target, center, predicted_body_yaw, target.matched_face.face_index);
+      target, center, target.yaw + target.v_yaw * local_t, target.matched_face.face_index);
 
     ShotPlan candidate = this->buildPlan(target, ctx, face, local_t, false, 0.0);
     candidate.mode = AimMode::VISIBLE_DIRECT;

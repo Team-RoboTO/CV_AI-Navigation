@@ -101,6 +101,7 @@ struct CostWeights
   double uncertainty = 0.35;
   double slew = 0.25;
   double switch_target = 0.35;
+  double switch_face = 0.20;
   double staleness = 0.25;
   double temp_lost = 0.70;
   double low_visibility = 0.35;
@@ -133,6 +134,7 @@ struct PlanningContext
   int indirect_max_candidates = 8;
   double visibility_exponent = 2.0;
   int previous_tracker_id = -1;
+  int previous_face_index = -1;
   bool previous_indirect_mode = false;
   double transport_delay = 0.0;
 };

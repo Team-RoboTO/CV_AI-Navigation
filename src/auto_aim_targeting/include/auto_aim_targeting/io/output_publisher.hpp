@@ -25,7 +25,6 @@ public:
   TargetingOutputPublisher(
     const TargetingConfig & config,
     rclcpp::Publisher<auto_aim_interfaces::msg::TrackerInfo>::SharedPtr info_pub,
-    rclcpp::Publisher<auto_aim_interfaces::msg::Target>::SharedPtr target_pub,
     rclcpp::Publisher<auto_aim_interfaces::msg::Targets>::SharedPtr targets_pub,
     rclcpp::Publisher<vision_msgs::msg::Detection2D>::SharedPtr optimal_bbox_pub,
     rclcpp::Publisher<auto_aim_interfaces::msg::GimbalCmd>::SharedPtr cmd_pub,
@@ -38,8 +37,7 @@ public:
     const std::map<int, std::unique_ptr<Tracker>> & trackers,
     int best_tracker_id,
     const std::optional<AimDecision> & decision,
-    const FireGateResult & fire_result,
-    int previous_tracker_id);
+    const FireGateResult & fire_result);
 
   void publish(const AimResult & output);
 
@@ -51,7 +49,6 @@ private:
   TargetingDebugPublisher targeting_debug_publisher_;
   GimbalCommandController gimbal_command_controller_;
   rclcpp::Publisher<auto_aim_interfaces::msg::TrackerInfo>::SharedPtr info_pub_;
-  rclcpp::Publisher<auto_aim_interfaces::msg::Target>::SharedPtr target_pub_;
   rclcpp::Publisher<auto_aim_interfaces::msg::Targets>::SharedPtr targets_pub_;
   rclcpp::Publisher<vision_msgs::msg::Detection2D>::SharedPtr optimal_bbox_pub_;
   rclcpp::Publisher<auto_aim_interfaces::msg::GimbalCmd>::SharedPtr cmd_pub_;
