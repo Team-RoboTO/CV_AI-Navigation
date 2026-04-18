@@ -679,19 +679,24 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
   //                                                        TRACKING     LOST
   if (this->tracker_state == DETECTING) {
     if (matched) {
-      // Accumulate consecutive matches; promote only after tracking_thres frames
-      // to avoid locking onto a single false-positive detection.
       this->detect_count_++;
+      this->lost_count_ = 0;
       if (this->detect_count_ > this->tracking_thres) {
         this->detect_count_ = 0;
         this->tracker_state = TRACKING;
       }
     } else {
-      // Any miss in DETECTING resets the counter — the candidate was unreliable.
-      this->detect_count_ = 0;
-      this->tracker_state = LOST;
-      this->matched_face_ = FaceBinding{};
-      this->resetStationaryState();
+      // Allow up to 1 grace miss before dropping. PnP noise on freshly-spawned
+      // trackers often causes a single-frame position gate failure that would
+      // otherwise kill the tracker before it can confirm.
+      this->lost_count_++;
+      if (this->lost_count_ > 1) {
+        this->detect_count_ = 0;
+        this->lost_count_ = 0;
+        this->tracker_state = LOST;
+        this->matched_face_ = FaceBinding{};
+        this->resetStationaryState();
+      }
     }
   } else if (this->tracker_state == TRACKING) {
     if (!matched) {

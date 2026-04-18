@@ -73,6 +73,7 @@ std::vector<int> Trackers::assignDetections(
     const auto & armor = armors->armors[i];
     double best_maha = max_assignment_cost;
     int best_tid = -1;
+    bool best_is_detecting = true;
 
     for (auto & kv : trackers) {
       auto & tracker = *kv.second;
@@ -81,12 +82,16 @@ std::vector<int> Trackers::assignDetections(
       }
 
       double maha = tracker.computeAssignmentCost(armor);
-      if (tracker.tracker_state == Tracker::DETECTING) {
-        maha *= 4.0;
-      }
-      if (maha < best_maha) {
+      bool is_detecting = tracker.tracker_state == Tracker::DETECTING;
+      // Prefer established (non-DETECTING) trackers on ties, but do not inflate
+      // their cost — a DETECTING tracker with a clearly better match still wins.
+      const bool take = maha < best_maha ||
+        (best_is_detecting && !is_detecting && maha < max_assignment_cost &&
+         maha <= best_maha * 1.5);
+      if (take) {
         best_maha = maha;
         best_tid = kv.first;
+        best_is_detecting = is_detecting;
       }
     }
 

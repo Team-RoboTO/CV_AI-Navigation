@@ -121,6 +121,11 @@ void AutoAimNode::processFrame(const Observation & input)
   const FireGateResult fire_result = decision.has_value()
     ? fire_gate_->evaluate(decision->plan, safe_input.pose_state.fresh, has_pose_source)
     : FireGateResult{};
+  if (decision.has_value() && !fire_result.fire && !fire_result.blocker.empty()) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "Fire blocked: %s", fire_result.blocker.c_str());
+  }
   AimResult output = output_publisher_->buildAimResult(
     safe_input, trackers_, best_tracker_id_, decision, fire_result);
   output_publisher_->publish(output);

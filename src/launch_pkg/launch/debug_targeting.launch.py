@@ -2,8 +2,7 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, TimerAction
-from launch.substitutions import LaunchConfiguration
+from launch.actions import TimerAction
 from launch_ros.actions import ComposableNodeContainer
 from launch_ros.descriptions import ComposableNode
 
@@ -18,12 +17,7 @@ def generate_launch_description():
         launch_pkg_dir, 'config', 'sensors', 'realsense.json'
     )
 
-    pose_source_arg = DeclareLaunchArgument(
-        'pose_source',
-        default_value='camera_imu',
-        description="Orientation source for auto_aim_targeting: 'micro_pose', 'camera_imu', or 'none'."
-    )
-    pose_source = LaunchConfiguration('pose_source')
+    pose_source = 'none'
     filtered_imu_topic = '/camera/filtered_imu'
 
     realsense_node = ComposableNode(
@@ -118,14 +112,14 @@ def generate_launch_description():
         ],
         parameters=[
             {'target_frame': 'odom'},
-            {'target_classes': ['3']},
+            {'target_classes': ['0', '3']}, # blue, red
             {'max_armor_distance': 10.0},
             {'light_ratio': 0.85},
             {'bbox_padding_y': 80.0},
             {'pnp.max_reprojection_error': 10.0},
-            {'tracker.max_match_distance': 0.30},
+            {'tracker.max_match_distance': 0.40},
             {'tracker.max_track_range': 6.0},
-            {'tracker.tracking_thres': 4},
+            {'tracker.tracking_thres': 2},
             {'tracker.lost_time_thres': 0.5},
             {'tracker.max_trackers': 5},
             {'tracker.new_tracker_min_dist': 0.5},
@@ -138,13 +132,13 @@ def generate_launch_description():
             {'tracker.r_adapt_max_dist': 4.0},
             {'tracker.dz_adapt_alpha': 0.05},
             {'tracker.r_yaw_uncertainty_scale': 50.0},
-            {'tracker.maha_match_threshold': 13.3},
-            {'tracker.maha_jump_threshold': 20.0},
-            {'ekf.sigma2_q_xyz': 5.0},
-            {'ekf.sigma2_q_yaw': 10.0},
+            {'tracker.maha_match_threshold': 20.0},
+            {'tracker.maha_jump_threshold': 30.0},
+            {'ekf.sigma2_q_xyz': 10.0},
+            {'ekf.sigma2_q_yaw': 20.0},
             {'ekf.sigma2_q_r': 1.0e-6},
-            {'ekf.xyz_damping_alpha': 0.95},
-            {'ekf.yaw_damping_alpha': 0.95},
+            {'ekf.xyz_damping_alpha': 0.88},
+            {'ekf.yaw_damping_alpha': 0.88},
             {'ekf.coast_damping_factor': 0.85},
             {'ekf.damping_innov_threshold': 0.05},
             {'ekf.yaw_innov_threshold': 0.15},
@@ -159,7 +153,7 @@ def generate_launch_description():
             {'ekf.secondary_face_fusion': True},
             {'ekf.secondary_r_inflation': 2.0},
             {'ekf.secondary_maha_threshold': 13.3},
-            {'tracker.v_yaw_max': 15.0},
+            {'tracker.v_yaw_max': 25.0},
             {'tracker.stationary_measurement_threshold': 0.03},
             {'tracker.stationary_innovation_threshold': 0.05},
             {'tracker.stationary_speed_threshold': 0.35},
@@ -236,6 +230,5 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        pose_source_arg,
         TimerAction(period=2.0, actions=[container]),
     ])
