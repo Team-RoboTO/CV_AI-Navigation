@@ -42,3 +42,6 @@ docs/superpowers/
 compile_commands.json
 __pycache__/
 *.pyc
+
+AUTO_AIM_REVIEW.md
+auto_aim_complete_refactor/

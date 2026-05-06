@@ -681,7 +681,7 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
     if (matched) {
       this->detect_count_++;
       this->lost_count_ = 0;
-      if (this->detect_count_ > this->tracking_thres) {
+      if (this->detect_count_ >= this->tracking_thres) {
         this->detect_count_ = 0;
         this->tracker_state = TRACKING;
       }

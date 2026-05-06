@@ -12,6 +12,7 @@
   <depend>rclcpp</depend>
   <depend>rclcpp_components</depend>
   <depend>eigen</depend>
+  <depend>opencv</depend>
   <depend>angles</depend>
   <depend>std_srvs</depend>
   <depend>geometry_msgs</depend>

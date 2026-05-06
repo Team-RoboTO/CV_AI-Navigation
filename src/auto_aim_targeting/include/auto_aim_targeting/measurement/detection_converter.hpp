@@ -28,7 +28,7 @@ public:
     std::shared_ptr<tf2_ros::Buffer> tf2_buffer,
     rclcpp::Logger logger);
 
-  void setCameraInfo(const sensor_msgs::msg::CameraInfo::ConstSharedPtr & camera_info);
+  bool setCameraInfo(const sensor_msgs::msg::CameraInfo::ConstSharedPtr & camera_info);
   bool ready() const { return this->pnp_solver_ != nullptr; }
   Observation buildObservation(
     const vision_msgs::msg::Detection2DArray::ConstSharedPtr & detection_msg,

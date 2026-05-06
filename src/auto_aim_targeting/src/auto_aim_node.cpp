@@ -19,8 +19,10 @@
 #include "auto_aim_targeting/auto_aim_node.hpp"
 
 #include <chrono>
+#include <array>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -42,6 +44,7 @@ AutoAimNode::AutoAimNode(const rclcpp::NodeOptions & options)
 {
   RCLCPP_INFO(get_logger(), "Starting AutoAimNode");
   loadConfig();
+  validateConfig();
   createRosInterfaces();
   buildPipeline();
 }
@@ -207,10 +210,9 @@ bool AutoAimNode::isPipelineReady() const
 
 void AutoAimNode::cameraInfoCallback(const sensor_msgs::msg::CameraInfo::ConstSharedPtr camera_info)
 {
-  if (detection_converter_ != nullptr) {
-    detection_converter_->setCameraInfo(camera_info);
+  if (detection_converter_ != nullptr && detection_converter_->setCameraInfo(camera_info)) {
+    cam_info_sub_.reset();
   }
-  cam_info_sub_.reset();
 }
 
 void AutoAimNode::microPoseCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg)
@@ -248,7 +250,6 @@ void AutoAimNode::loadMeasurementConfig()
     "target_classes", std::vector<std::string>{"3"});
   config_.measurement.target_classes =
     std::set<std::string>(target_classes_vec.begin(), target_classes_vec.end());
-  config_.measurement.target_classes.erase("1");
   config_.measurement.light_ratio = declare_parameter("light_ratio", 0.85);
   config_.measurement.bbox_padding_y = declare_parameter("bbox_padding_y", 80.0);
   config_.measurement.pnp_max_reprojection_error =
@@ -384,6 +385,34 @@ void AutoAimNode::loadVisualizationConfig()
 {
   config_.visualization.max_cmd_pitch_angle_deg = declare_parameter("max_cmd_angle", 30.0);
   config_.visualization.max_cmd_yaw_angle_deg = declare_parameter("max_cmd_yaw_angle", 180.0);
+}
+
+void AutoAimNode::validateConfig() const
+{
+  if (config_.measurement.target_classes.empty()) {
+    throw std::invalid_argument("target_classes must contain at least one allowed class");
+  }
+
+  constexpr std::array<const char *, 3> kPoseSources = {"none", "micro_pose", "camera_imu"};
+  const bool pose_source_valid = std::any_of(
+    kPoseSources.begin(),
+    kPoseSources.end(),
+    [this](const char * pose_source) {
+      return config_.pose.pose_source == pose_source;
+    });
+  if (!pose_source_valid) {
+    throw std::invalid_argument("pose_source must be one of: none, micro_pose, camera_imu");
+  }
+
+  if (config_.ballistics.bullet_speed <= 0.0) {
+    throw std::invalid_argument("bullet_speed must be > 0");
+  }
+
+  if (config_.engagement.min_fire_dist < 0.0 ||
+      config_.engagement.max_fire_dist < config_.engagement.min_fire_dist)
+  {
+    throw std::invalid_argument("fire distance bounds are invalid");
+  }
 }
 
 // ============================================================================

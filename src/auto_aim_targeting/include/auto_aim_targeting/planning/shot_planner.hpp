@@ -29,6 +29,10 @@ public:
     const PlanningContext & ctx) const;
 
 private:
+  FaceGeometry buildMeasuredFaceGeometry(
+    const TrackSnapshot & target,
+    double predict_time) const;
+
   FaceGeometry buildFaceGeometry(
     const TrackSnapshot & target,
     const PredictedCenter & center,

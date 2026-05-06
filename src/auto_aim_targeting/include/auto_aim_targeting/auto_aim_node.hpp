@@ -60,6 +60,7 @@ private:
   void loadBallisticsConfig();
   void loadEngagementConfig();
   void loadVisualizationConfig();
+  void validateConfig() const;
 
   void createRosInterfaces();
   void createServices();

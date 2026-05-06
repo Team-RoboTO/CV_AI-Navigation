@@ -112,7 +112,7 @@ def generate_launch_description():
         ],
         parameters=[
             {'target_frame': 'odom'},
-            {'target_classes': ['0', '3']}, # blue, red
+            {'target_classes': ['0', '3']},  # blue, red
             {'max_armor_distance': 10.0},
             {'light_ratio': 0.85},
             {'bbox_padding_y': 80.0},
@@ -191,7 +191,7 @@ def generate_launch_description():
             {'max_cmd_angle': 30.0},
             {'max_cmd_yaw_angle': 180.0},
             # cmd_smooth_alpha removed — no EMA smoothing on gimbal commands
-            {'debug.allow_fire_without_pose': True},
+            {'debug.allow_fire_without_pose': False},
             {'latency_gate_sigma': 2.5},
             {'latency_warmup_samples': 5},
             {'indirect_vyaw_threshold': 3.0},

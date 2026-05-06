@@ -39,9 +39,7 @@ std::optional<ShotPlan> ShotPlanner::solveVisibleDirect(
     std::max(0.0, ctx.time_bias + ctx.gimbal_response_delay + 1.5 / std::max(ctx.bullet_speed, 1.0));
 
   for (int iter = 0; iter < 3; ++iter) {
-    const PredictedCenter center = predictCenter(target, local_t);
-    const FaceGeometry face = this->buildFaceGeometry(
-      target, center, target.yaw + target.v_yaw * local_t, target.matched_face.face_index);
+    const FaceGeometry face = this->buildMeasuredFaceGeometry(target, local_t);
 
     ShotPlan candidate = this->buildPlan(target, ctx, face, local_t, false, 0.0);
     candidate.mode = AimMode::VISIBLE_DIRECT;
@@ -64,6 +62,37 @@ std::optional<ShotPlan> ShotPlanner::solveVisibleDirect(
     return std::nullopt;
   }
   return best;
+}
+
+FaceGeometry ShotPlanner::buildMeasuredFaceGeometry(
+  const TrackSnapshot & target,
+  double predict_time) const
+{
+  FaceGeometry out;
+  out.face_index = target.matched_face.face_index;
+  out.alternate_pair = target.matched_face.alternate_pair;
+  out.radius = target.matched_face.radius;
+  out.dz_offset = target.matched_face.dz_offset;
+  out.face_yaw = target.matched_face.yaw;
+
+  const PredictedCenter predicted_center = predictCenter(target, predict_time);
+  const double dx = predicted_center.x - target.position.x;
+  const double dy = predicted_center.y - target.position.y;
+  const double dz = predicted_center.z - target.position.z;
+
+  out.x = target.matched_face.position.x + dx;
+  out.y = target.matched_face.position.y + dy;
+  out.z = target.matched_face.position.z + dz;
+  out.ground_dist = std::hypot(out.x, out.y);
+  out.range = std::sqrt(out.x * out.x + out.y * out.y + out.z * out.z);
+  out.bearing = std::atan2(out.y, out.x);
+
+  const double face_to_camera = std::atan2(-out.y, -out.x);
+  const double face_normal = out.face_yaw + M_PI;
+  const double oblique =
+    std::abs(angles::shortest_angular_distance(face_normal, face_to_camera));
+  out.visibility = std::clamp(std::cos(oblique), 0.0, 1.0);
+  return out;
 }
 
 std::optional<ShotPlan> ShotPlanner::solvePredictedDirect(

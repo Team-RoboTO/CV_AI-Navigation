@@ -9,6 +9,7 @@
 
 #include "auto_aim_targeting/tracking/ekf.hpp"
 #include "auto_aim_targeting/tracking/tracker_manager.hpp"
+#include "auto_aim_targeting/tracking/tracker_runtime_factory.hpp"
 
 namespace rm_auto_aim
 {
@@ -56,6 +57,17 @@ TrackerConfig makeConfig()
   config.stationary_velocity_collapse_factor = 0.25;
   config.stationary_zero_velocity_threshold = 0.05;
   config.visible_direct_obliquity_threshold_deg = 60.0;
+  return config;
+}
+
+TrackingRuntimeConfig makeRuntimeConfig()
+{
+  TrackingRuntimeConfig config;
+  config.tracker = makeConfig();
+  config.process_noise_position = 5.0;
+  config.process_noise_yaw = 10.0;
+  config.process_noise_radius = 1e-6;
+  config.refresh_frequency = 30.0;
   return config;
 }
 
@@ -157,6 +169,39 @@ TEST(TrackManagerTest, CollectSnapshotsSkipsLostTrackers)
   ASSERT_EQ(snapshots.size(), 1u);
   EXPECT_EQ(snapshots.front().tracker_id, 11);
   EXPECT_TRUE(snapshots.front().measurement_fresh);
+}
+
+TEST(TrackManagerTest, TrackingThresholdPromotesOnNthMatch)
+{
+  TrackerFactory factory(makeRuntimeConfig(), []() { return 1.0 / 30.0; });
+  auto tracker = factory.create();
+  tracker->tracking_thres = 2;
+
+  auto_aim_interfaces::msg::Armor armor;
+  armor.number = "3";
+  armor.type = "small";
+  armor.pose.position.x = 2.78;
+  armor.pose.position.y = 0.0;
+  armor.pose.position.z = 0.0;
+  armor.distance_to_image_center = 0.0;
+
+  tf2::Quaternion q;
+  q.setRPY(0.0, 0.0, 0.0);
+  armor.pose.orientation = tf2::toMsg(q);
+
+  tracker->initFromArmor(armor);
+  ASSERT_EQ(tracker->tracker_state, Tracker::DETECTING);
+
+  auto armors = std::make_shared<auto_aim_interfaces::msg::Armors>();
+  armors->header.stamp = rclcpp::Time(1, 0, RCL_ROS_TIME);
+  armors->armors.push_back(armor);
+
+  tracker->update(armors);
+  EXPECT_EQ(tracker->tracker_state, Tracker::DETECTING);
+
+  armors->header.stamp = rclcpp::Time(2, 0, RCL_ROS_TIME);
+  tracker->update(armors);
+  EXPECT_EQ(tracker->tracker_state, Tracker::TRACKING);
 }
 
 }  // namespace

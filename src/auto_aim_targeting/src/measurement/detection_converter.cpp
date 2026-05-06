@@ -39,10 +39,25 @@ DetectionConverter::DetectionConverter(
 {
 }
 
-void DetectionConverter::setCameraInfo(
+bool DetectionConverter::setCameraInfo(
   const sensor_msgs::msg::CameraInfo::ConstSharedPtr & camera_info)
 {
+  const double fx = camera_info->k[0];
+  const double fy = camera_info->k[4];
+  const double cx = camera_info->k[2];
+  const double cy = camera_info->k[5];
+  if (!std::isfinite(fx) || !std::isfinite(fy) ||
+      !std::isfinite(cx) || !std::isfinite(cy) ||
+      fx <= 0.0 || fy <= 0.0)
+  {
+    RCLCPP_WARN(
+      this->logger_,
+      "Ignoring invalid CameraInfo for PnP: fx=%.3f fy=%.3f cx=%.3f cy=%.3f",
+      fx, fy, cx, cy);
+    return false;
+  }
   this->pnp_solver_ = std::make_unique<PnPSolver>(camera_info->k, camera_info->d);
+  return true;
 }
 
 Observation DetectionConverter::buildObservation(
@@ -113,18 +128,27 @@ std::optional<Armor> DetectionConverter::buildArmorFromDetection(
     return std::nullopt;
   }
 
-  if (!detection.results.empty()) {
-    const auto & class_id = detection.results[0].hypothesis.class_id;
-    if (this->config_.target_classes.find(class_id) == this->config_.target_classes.end()) {
-      return std::nullopt;
-    }
+  if (detection.results.empty()) {
+    return std::nullopt;
+  }
+
+  const auto best_result_it = std::max_element(
+    detection.results.begin(),
+    detection.results.end(),
+    [](const auto & lhs, const auto & rhs) {
+      return lhs.hypothesis.score < rhs.hypothesis.score;
+    });
+  const auto & best_result = *best_result_it;
+  const auto & class_id = best_result.hypothesis.class_id;
+  if (this->config_.target_classes.find(class_id) == this->config_.target_classes.end()) {
+    return std::nullopt;
   }
 
   Armor armor_obj;
   armor_obj.center = cv::Point2f(center_x, center_y);
   armor_obj.type = ArmorType::SMALL;
-  armor_obj.number = detection.results.empty() ? "unknown" : detection.results[0].hypothesis.class_id;
-  armor_obj.confidence = detection.results.empty() ? 0.0 : detection.results[0].hypothesis.score;
+  armor_obj.number = class_id;
+  armor_obj.confidence = best_result.hypothesis.score;
   const float lr = static_cast<float>(this->config_.light_ratio);
   const float lx = center_x - lr * width / 2;
   const float rx = center_x + lr * width / 2;
@@ -152,6 +176,9 @@ std::optional<auto_aim_interfaces::msg::Armor> DetectionConverter::solveArmorPos
   if (!success) {
     return std::nullopt;
   }
+  if (!cv::checkRange(rvec) || !cv::checkRange(tvec)) {
+    return std::nullopt;
+  }
   if (!std::isfinite(reprojection_error) ||
       reprojection_error > this->config_.pnp_max_reprojection_error)
   {
@@ -169,6 +196,13 @@ std::optional<auto_aim_interfaces::msg::Armor> DetectionConverter::solveArmorPos
   armor_msg.pose.position.x = tvec.at<double>(0);
   armor_msg.pose.position.y = tvec.at<double>(1);
   armor_msg.pose.position.z = tvec.at<double>(2);
+  if (!std::isfinite(armor_msg.pose.position.x) ||
+      !std::isfinite(armor_msg.pose.position.y) ||
+      !std::isfinite(armor_msg.pose.position.z) ||
+      armor_msg.pose.position.z <= 1e-4)
+  {
+    return std::nullopt;
+  }
 
   cv::Mat rotation_matrix;
   cv::Rodrigues(rvec, rotation_matrix);

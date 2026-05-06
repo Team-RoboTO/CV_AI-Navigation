@@ -114,6 +114,29 @@ TEST(EngagementPlannerTest, FallsBackToPredictedDirectWhenMatchedFaceIsStale)
   EXPECT_EQ(plan->plan.mode, AimMode::PREDICTED_DIRECT);
 }
 
+TEST(EngagementPlannerTest, VisibleDirectUsesMeasuredMatchedFaceGeometry)
+{
+  BallisticsSolver solver(BallisticsParams{});
+  ShotPlanner predictor(solver);
+  EngagementPlanner planner(predictor, CostWeights{});
+
+  auto snapshot = makeBaseSnapshot();
+  snapshot.position.x = 4.5;
+  snapshot.position.y = 0.0;
+  snapshot.yaw = 0.0;
+  snapshot.radius_1 = 0.7;
+  snapshot.matched_face.position.x = 3.0;
+  snapshot.matched_face.position.y = 0.6;
+  snapshot.matched_face.position.z = 0.10;
+  snapshot.matched_face.yaw = std::atan2(0.6, 3.0);
+
+  const auto plan = planner.selectBestPlan({snapshot}, makeContext(), rclcpp::Time(1, 0, RCL_ROS_TIME));
+
+  ASSERT_TRUE(plan.has_value());
+  EXPECT_EQ(plan->plan.mode, AimMode::VISIBLE_DIRECT);
+  EXPECT_NEAR(plan->plan.absolute_yaw, std::atan2(0.6, 3.0), 1e-3);
+}
+
 TEST(EngagementPlannerTest, UsesIndirectModeForFastSpinningTarget)
 {
   BallisticsSolver solver(BallisticsParams{});
