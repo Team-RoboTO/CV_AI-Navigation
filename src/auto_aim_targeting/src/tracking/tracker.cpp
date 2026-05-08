@@ -373,6 +373,14 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
       // look like a "match" (position is close), and we'd feed a yaw measurement
       // that's 90° off into the EKF.  The yaw gate catches the moment the visible
       // face switches, so we can handle it correctly (handleArmorJump).
+      //
+      // POSITION PRE-GATE: kept as a coarse outlier reject only.  PnP yaw noise
+      // on near-planar targets (e.g. visible-light test on a phone screen) makes
+      // the EKF-derived face position wobble well past tens of cm, while the
+      // measurement itself is still statistically consistent.  The Mahalanobis
+      // gate at maha < mahalanobis_match_gate (≈ χ²₄ 99% quantile) inside the
+      // MATCH branch is the real statistical rejection — the position gate just
+      // keeps wildly far detections from reaching Mahalanobis at all.
       if (position_diff < this->config_.max_match_distance &&
           (yaw_diff < this->max_match_yaw_diff_ || yaw_oblique)) {
         // Matched armor found — verify with Mahalanobis before fusing.
@@ -686,11 +694,13 @@ void Tracker::update(const Armors::SharedPtr & armors_msg)
         this->tracker_state = TRACKING;
       }
     } else {
-      // Allow up to 1 grace miss before dropping. PnP noise on freshly-spawned
-      // trackers often causes a single-frame position gate failure that would
-      // otherwise kill the tracker before it can confirm.
+      // Allow several grace misses before dropping. PnP yaw noise on rotating
+      // targets routinely causes 2-3 consecutive position/yaw gate failures
+      // before the EKF center estimate converges. Killing too early forces a
+      // respawn loop where v_yaw never gets estimated (each new tracker
+      // initialises with v_yaw=0), which in turn keeps the EKF center wobbling.
       this->lost_count_++;
-      if (this->lost_count_ > 1) {
+      if (this->lost_count_ > 3) {
         this->detect_count_ = 0;
         this->lost_count_ = 0;
         this->tracker_state = LOST;
@@ -1173,6 +1183,7 @@ void Tracker::handleArmorJump(const Armor & current_armor)
   // ---------------------------------------------------------------------------
   this->measurement = Eigen::Vector4d(p.x, p.y, p.z, yaw);
   this->target_state = this->ekf.update(this->measurement);
+
   // Yaw-projected radius measurement for the newly visible pair.
   // Skip when face is nearly edge-on (oblique > threshold).
   {

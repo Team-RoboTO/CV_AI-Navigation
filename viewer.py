@@ -16,7 +16,7 @@ class VisualizerNode(Node):
     def __init__(self):
         super().__init__('visualizer_node')
         self.bridge = CvBridge()
-        
+
         self.latest_image = None
         self.latest_detections = None
         self.optimal_target = None
@@ -24,6 +24,11 @@ class VisualizerNode(Node):
         self.camera_info = None
         self.tracking_info = None
         self.gimbal_cmd = None
+
+        self.target_frame = self.declare_parameter('target_frame', 'odom').value
+        self.gimbal_height = self.declare_parameter('gimbal.height', 0.325).value
+        self.barrel_offset_z = self.declare_parameter('barrel_offset_z', -0.10).value
+        self.barrel_z = self.gimbal_height + self.barrel_offset_z
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -161,41 +166,50 @@ class VisualizerNode(Node):
             except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException):
                 pass
 
-        # 4. Commanded aim (cyan diamond) — where the clamped command points
+        # 4. Commanded aim (cyan diamond) — where the clamped command points.
+        # cmd.yaw/pitch are ABSOLUTE angles in target_frame (odom), not
+        # camera-relative. Build a point in target_frame at the commanded
+        # range from the gimbal pivot, then transform via TF and project —
+        # same approach as the IMPACT marker.
         if self.gimbal_cmd is not None and self.gimbal_cmd.distance > 0.1:
             import math
             cmd = self.gimbal_cmd
             pitch_deg = cmd.pitch
             yaw_deg = cmd.yaw
             dist = cmd.distance
-            
+
             pitch = math.radians(pitch_deg)
             yaw = math.radians(yaw_deg)
 
-            # Option 2: Direct Projection in Camera Optical Frame
-            # Z is forward, X is right, Y is down
-            # Relative yaw moves barrel left -> negative X
-            # Relative pitch moves barrel up -> negative Y
-            z = dist * math.cos(pitch) * math.cos(yaw)
-            x = -dist * math.cos(pitch) * math.sin(yaw)
-            y = -dist * math.sin(pitch)
-            
-            if z > 0.05:
-                K = self.camera_info.k
-                fx, cx_cam = K[0], K[2]
-                fy, cy_cam = K[4], K[5]
-                # Project onto image plane
-                au = int((x / z) * fx + cx_cam)
-                av = int((y / z) * fy + cy_cam)
-                
-                if 0 <= au < w_img and 0 <= av < h_img:
-                    # Cyan diamond crosshair for aim
-                    sz = 15
-                    pts = [(au, av-sz), (au+sz, av), (au, av+sz), (au-sz, av)]
-                    for i in range(4):
-                        cv2.line(cv_img, pts[i], pts[(i+1)%4], (255, 255, 0), 2)
-                    cv2.putText(cv_img, "AIM", (au + 10, av - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+            try:
+                aim_pt = PointStamped()
+                aim_pt.header.frame_id = self.target_frame
+                aim_pt.header.stamp = rclpy.time.Time().to_msg()
+                aim_pt.point.x = dist * math.cos(pitch) * math.cos(yaw)
+                aim_pt.point.y = dist * math.cos(pitch) * math.sin(yaw)
+                aim_pt.point.z = self.barrel_z + dist * math.sin(pitch)
+
+                camera_frame = self.camera_info.header.frame_id
+                aim_cam = self.tf_buffer.transform(
+                    aim_pt, camera_frame, timeout=Duration(seconds=0.1))
+                ax = aim_cam.point.x
+                ay = aim_cam.point.y
+                az = aim_cam.point.z
+                if az > 0.05:
+                    K = self.camera_info.k
+                    fx, cx_cam = K[0], K[2]
+                    fy, cy_cam = K[4], K[5]
+                    au = int((ax / az) * fx + cx_cam)
+                    av = int((ay / az) * fy + cy_cam)
+                    if 0 <= au < w_img and 0 <= av < h_img:
+                        sz = 15
+                        pts = [(au, av-sz), (au+sz, av), (au, av+sz), (au-sz, av)]
+                        for i in range(4):
+                            cv2.line(cv_img, pts[i], pts[(i+1)%4], (255, 255, 0), 2)
+                        cv2.putText(cv_img, "AIM", (au + 10, av - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+            except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException):
+                pass
 
 
             # Angle text overlay (top-left)

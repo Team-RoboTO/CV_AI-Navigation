@@ -63,8 +63,27 @@ TEST(TrackerFactoryTest, CreatesTrackerWithConfiguredEkf)
   tracker->ekf.setState(Eigen::VectorXd::Zero(9));
 
   EXPECT_EQ(tracker->tracking_thres, 5);
+  
+  // Verify initial covariance (P0) was injected correctly
   EXPECT_NEAR(tracker->ekf.getVariance(0), 0.1, 1e-9);
   EXPECT_NEAR(tracker->ekf.getVariance(7), 3.0, 1e-9);
+
+  // Verify the EKF lambdas (f, h, Q, R, jacobians) don't crash and generate sensible states
+  // by actually performing a full prediction and update cycle.
+  Eigen::VectorXd x_pri = tracker->ekf.predict();
+  
+  // State should still be zero after predicting from zero with no velocity
+  EXPECT_NEAR(x_pri.norm(), 0.0, 1e-9);
+
+  // Form a dummy measurement: z = [xa, ya, za, yaw]
+  Eigen::VectorXd z(4);
+  z << 1.0, 2.0, 0.0, 0.0;
+  
+  Eigen::VectorXd x_post = tracker->ekf.update(z);
+  
+  // After pulling the target towards (1, 2) from (0, 0), the new state position should be shifted
+  EXPECT_GT(x_post(0), 0.0); // xc should move towards 1.0
+  EXPECT_GT(x_post(2), 0.0); // yc should move towards 2.0
 }
 
 }  // namespace

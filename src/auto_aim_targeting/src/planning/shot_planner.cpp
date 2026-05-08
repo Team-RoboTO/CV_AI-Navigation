@@ -68,6 +68,7 @@ FaceGeometry ShotPlanner::buildMeasuredFaceGeometry(
   const TrackSnapshot & target,
   double predict_time) const
 {
+  (void)predict_time;
   FaceGeometry out;
   out.face_index = target.matched_face.face_index;
   out.alternate_pair = target.matched_face.alternate_pair;
@@ -75,14 +76,15 @@ FaceGeometry ShotPlanner::buildMeasuredFaceGeometry(
   out.dz_offset = target.matched_face.dz_offset;
   out.face_yaw = target.matched_face.yaw;
 
-  const PredictedCenter predicted_center = predictCenter(target, predict_time);
-  const double dx = predicted_center.x - target.position.x;
-  const double dy = predicted_center.y - target.position.y;
-  const double dz = predicted_center.z - target.position.z;
-
-  out.x = target.matched_face.position.x + dx;
-  out.y = target.matched_face.position.y + dy;
-  out.z = target.matched_face.position.z + dz;
+  // Visible-direct aims at the just-measured armor position. We do NOT
+  // velocity-extrapolate here because matched_face.position is the raw PnP
+  // measurement from the current frame. Adding v·t leaks PnP-driven velocity
+  // noise (~0.5 m/s typical) into the aim point — at 0.7 m range and t≈0.1 s
+  // that's ~4° offset, dominating any real-motion gain over the ~60 ms bullet
+  // flight at 25 m/s. Fast-spinning targets are handled by solveIndirect.
+  out.x = target.matched_face.position.x;
+  out.y = target.matched_face.position.y;
+  out.z = target.matched_face.position.z;
   out.ground_dist = std::hypot(out.x, out.y);
   out.range = std::sqrt(out.x * out.x + out.y * out.y + out.z * out.z);
   out.bearing = std::atan2(out.y, out.x);
