@@ -85,6 +85,9 @@ inline PlanningContext makePlanningContext(
   ctx.max_measurement_age = config.engagement.max_measurement_age;
   ctx.current_yaw = pose_state.yaw;
   ctx.current_pitch = pose_state.pitch;
+  ctx.barrel_offset_x = config.ballistics.barrel_offset_x;
+  ctx.barrel_offset_y = config.ballistics.barrel_offset_y;
+  ctx.barrel_offset_z = config.ballistics.barrel_offset_z;
   ctx.max_gimbal_yaw_rate = config.engagement.max_gimbal_yaw_rate;
   ctx.max_gimbal_pitch_rate = config.engagement.max_gimbal_pitch_rate;
   ctx.indirect_vyaw_threshold = config.engagement.indirect_vyaw_threshold;

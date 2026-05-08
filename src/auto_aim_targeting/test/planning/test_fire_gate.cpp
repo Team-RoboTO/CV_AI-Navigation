@@ -113,5 +113,16 @@ TEST(FireGateTest, BlocksOnStalePoseWhenPoseSourceExists)
   EXPECT_EQ(result.blocker, "stale_pose");
 }
 
+TEST(FireGateTest, BlocksWhenCurrentAimErrorIsTooLarge)
+{
+  FireGate gate(makeConfig());
+  ShotPlan plan = makeGoodPlan();
+  plan.relative_yaw = 0.20;
+
+  const auto result = gate.evaluate(plan, true, true);
+  EXPECT_FALSE(result.fire);
+  EXPECT_EQ(result.blocker, "aim_error");
+}
+
 }  // namespace
 }  // namespace rm_auto_aim

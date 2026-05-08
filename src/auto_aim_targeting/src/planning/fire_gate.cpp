@@ -5,9 +5,9 @@
 // Each check returns a specific blocker string for diagnostics.
 //
 // Key design decisions:
-//   - No relative_yaw/pitch check: the gimbal controller downstream handles
-//     aim convergence. The fire gate only checks world-frame conditions that
-//     are independent of gimbal feedback quality.
+//   - Relative yaw/pitch is checked only after pose-source freshness is known.
+//     This keeps live fire tied to the final measured gimbal reference without
+//     allowing an unstamped or stale pose path to approve shots.
 //   - Pose freshness is a soft gate: without pose, we still allow fire if
 //     allow_fire_without_pose is set (for testing without IMU/micro_pose).
 //   - fire_window_margin is THE primary angular gate: it already accounts for
@@ -80,6 +80,14 @@ FireGateResult FireGate::evaluate(
   }
   if (!has_pose_source && !this->config_.allow_fire_without_pose) {
     result.blocker = "no_pose_source";
+    return result;
+  }
+
+  if (has_pose_source &&
+      (std::abs(plan.relative_yaw) > this->config_.fire_yaw_tolerance ||
+      std::abs(plan.relative_pitch) > this->config_.fire_pitch_tolerance))
+  {
+    result.blocker = "aim_error";
     return result;
   }
 

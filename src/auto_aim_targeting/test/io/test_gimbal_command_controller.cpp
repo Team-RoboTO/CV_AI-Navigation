@@ -66,5 +66,66 @@ TEST(CommandControllerTest, ShotOutputClampsAngles)
   EXPECT_FALSE(output.cmd.fire_cmd);
 }
 
+TEST(CommandControllerTest, ClampedShotSuppressesFire)
+{
+  GimbalCommandController controller(30.0, 90.0);
+  std_msgs::msg::Header header;
+  header.frame_id = "odom";
+
+  ShotPlan plan;
+  plan.absolute_yaw = 120.0 * M_PI / 180.0;
+  plan.absolute_pitch = 0.0;
+  plan.range = 3.0;
+
+  const auto output = controller.makeShotOutput(header, plan, true);
+  EXPECT_NEAR(output.cmd.yaw, 90.0, 1e-4);
+  EXPECT_FALSE(output.cmd.fire_cmd);
+  EXPECT_DOUBLE_EQ(output.twist.angular.x, 0.0);
+}
+
+TEST(CommandControllerTest, SmoothingSuppressesFireUntilCommandCatchesUp)
+{
+  GimbalCommandController controller(30.0, 180.0, 0.4, 0.03, 0.03);
+  std_msgs::msg::Header header;
+  header.frame_id = "odom";
+
+  ShotPlan first;
+  first.tracker_id = 1;
+  first.absolute_yaw = 0.0;
+  first.absolute_pitch = 0.0;
+  first.range = 3.0;
+  auto output = controller.makeShotOutput(header, first, true);
+  EXPECT_TRUE(output.cmd.fire_cmd);
+
+  ShotPlan moved = first;
+  moved.absolute_yaw = 20.0 * M_PI / 180.0;
+  output = controller.makeShotOutput(header, moved, true);
+  EXPECT_FALSE(output.cmd.fire_cmd);
+  EXPECT_LT(output.cmd.yaw, 20.0);
+}
+
+TEST(CommandControllerTest, SmoothingResetsWhenTrackerChanges)
+{
+  GimbalCommandController controller(30.0, 180.0, 0.4, 0.03, 0.03);
+  std_msgs::msg::Header header;
+  header.frame_id = "odom";
+
+  ShotPlan first;
+  first.tracker_id = 1;
+  first.absolute_yaw = 0.0;
+  first.absolute_pitch = 0.0;
+  first.range = 3.0;
+  auto output = controller.makeShotOutput(header, first, true);
+  EXPECT_TRUE(output.cmd.fire_cmd);
+
+  ShotPlan second = first;
+  second.tracker_id = 2;
+  second.absolute_yaw = 20.0 * M_PI / 180.0;
+  output = controller.makeShotOutput(header, second, true);
+
+  EXPECT_NEAR(output.cmd.yaw, 20.0, 1e-4);
+  EXPECT_TRUE(output.cmd.fire_cmd);
+}
+
 }  // namespace
 }  // namespace rm_auto_aim

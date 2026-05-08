@@ -24,7 +24,10 @@ TargetingOutputPublisher::TargetingOutputPublisher(
 : targeting_debug_publisher_(config.measurement.target_frame),
   gimbal_command_controller_(
     config.visualization.max_cmd_pitch_angle_deg,
-    config.visualization.max_cmd_yaw_angle_deg),
+    config.visualization.max_cmd_yaw_angle_deg,
+    config.engagement.cmd_smooth_alpha,
+    config.engagement.fire_yaw_tolerance,
+    config.engagement.fire_pitch_tolerance),
   info_pub_(std::move(info_pub)),
   targets_pub_(std::move(targets_pub)),
   optimal_bbox_pub_(std::move(optimal_bbox_pub)),

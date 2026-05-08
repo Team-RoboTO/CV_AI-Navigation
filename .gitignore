@@ -45,3 +45,5 @@ __pycache__/
 
 AUTO_AIM_REVIEW.md
 auto_aim_complete_refactor/
+src/launch_pkg/resources/yolov8_op_1080ti.plan
+yolo_ros_detector.py

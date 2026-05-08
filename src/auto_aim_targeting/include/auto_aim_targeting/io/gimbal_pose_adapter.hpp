@@ -9,10 +9,12 @@
 #include <rclcpp/clock.hpp>
 #include <rclcpp/logger.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <std_msgs/msg/float32_multi_array.hpp>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_broadcaster.h>
 
+#include "auto_aim_interfaces/msg/gimbal_state.hpp"
 #include "auto_aim_targeting/types.hpp"
 #include "auto_aim_targeting/config.hpp"
 
@@ -31,6 +33,8 @@ public:
     rclcpp::Clock::SharedPtr clock);
 
   void onMicroPose(const geometry_msgs::msg::PoseStamped::ConstSharedPtr & msg);
+  void onMicroImu(const std_msgs::msg::Float32MultiArray::ConstSharedPtr & msg);
+  void onGimbalState(const auto_aim_interfaces::msg::GimbalState::ConstSharedPtr & msg);
   void onCameraImu(const sensor_msgs::msg::Imu::ConstSharedPtr & msg);
   void updateForFrame(const rclcpp::Time & stamp);
   bool isFresh(const rclcpp::Time & now) const;
@@ -38,6 +42,7 @@ public:
 
 private:
   bool isFreshLocked(const rclcpp::Time & now) const;
+  bool updateStoredPose(double pitch, double yaw, const rclcpp::Time & stamp);
   void broadcastCameraTF(const rclcpp::Time & stamp);
 
   PoseConfig config_;

@@ -135,6 +135,16 @@ if(BUILD_TESTING)
   target_link_libraries(test_fire_gate ${PROJECT_NAME})
   ament_target_dependencies(test_fire_gate auto_aim_interfaces)
 
+  ament_add_gtest(test_detection_converter
+    test/measurement/test_detection_converter.cpp)
+  target_link_libraries(test_detection_converter ${PROJECT_NAME})
+  ament_target_dependencies(
+    test_detection_converter
+    auto_aim_interfaces
+    tf2
+    tf2_geometry_msgs
+  )
+
   ament_add_gtest(test_tracker_runtime_factory
     test/tracking/test_runtime_factory.cpp)
   target_link_libraries(test_tracker_runtime_factory ${PROJECT_NAME})

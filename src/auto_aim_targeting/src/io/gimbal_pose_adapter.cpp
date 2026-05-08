@@ -54,23 +54,48 @@ void GimbalPoseAdapter::onMicroPose(const geometry_msgs::msg::PoseStamped::Const
   const double pitch = this->config_.pitch_sign * msg->pose.position.x;
   const double yaw = this->config_.yaw_sign * msg->pose.position.y;
 
-  if (std::abs(pitch) >= 1.6 || std::abs(yaw) >= 1.6 ||
-      !std::isfinite(pitch) || !std::isfinite(yaw))
-  {
-    RCLCPP_DEBUG(
-      this->logger_, "Rejecting invalid micro pose sample: pitch=%.3f yaw=%.3f",
-      pitch, yaw);
+  const rclcpp::Time stamp =
+    msg->header.stamp.nanosec == 0 && msg->header.stamp.sec == 0 ?
+    this->clock_->now() : rclcpp::Time(msg->header.stamp);
+  if (!this->updateStoredPose(pitch, yaw, stamp)) {
+    return;
+  }
+  this->broadcastCameraTF(stamp);
+}
+
+void GimbalPoseAdapter::onMicroImu(const std_msgs::msg::Float32MultiArray::ConstSharedPtr & msg)
+{
+  if (msg->data.size() < 2) {
+    RCLCPP_DEBUG(this->logger_, "Rejecting /micro_imu sample with fewer than 2 values");
     return;
   }
 
-  {
-    std::lock_guard<std::mutex> lock(this->pose_mutex_);
-    this->current_yaw_ = yaw;
-    this->current_pitch_ = pitch;
-    this->q_orientation_.setRPY(0.0, pitch, yaw);
-    this->last_self_orientation_time_ = this->clock_->now();
+  const double yaw = this->config_.yaw_sign * static_cast<double>(msg->data[0]);
+  const double pitch = this->config_.pitch_sign * static_cast<double>(msg->data[1]);
+  const rclcpp::Time stamp = this->clock_->now();
+  if (!this->updateStoredPose(pitch, yaw, stamp)) {
+    return;
   }
-  this->broadcastCameraTF(msg->header.stamp);
+  this->broadcastCameraTF(stamp);
+}
+
+void GimbalPoseAdapter::onGimbalState(
+  const auto_aim_interfaces::msg::GimbalState::ConstSharedPtr & msg)
+{
+  if (!msg->valid) {
+    RCLCPP_DEBUG(this->logger_, "Ignoring invalid GimbalState sample");
+    return;
+  }
+
+  const double yaw = this->config_.yaw_sign * msg->yaw;
+  const double pitch = this->config_.pitch_sign * msg->pitch;
+  const rclcpp::Time stamp =
+    msg->header.stamp.nanosec == 0 && msg->header.stamp.sec == 0 ?
+    this->clock_->now() : rclcpp::Time(msg->header.stamp);
+  if (!this->updateStoredPose(pitch, yaw, stamp)) {
+    return;
+  }
+  this->broadcastCameraTF(stamp);
 }
 
 void GimbalPoseAdapter::onCameraImu(const sensor_msgs::msg::Imu::ConstSharedPtr & msg)
@@ -158,6 +183,26 @@ bool GimbalPoseAdapter::isFreshLocked(const rclcpp::Time & now) const
     return false;
   }
   return (now - this->last_self_orientation_time_).seconds() <= this->config_.pose_timeout;
+}
+
+bool GimbalPoseAdapter::updateStoredPose(double pitch, double yaw, const rclcpp::Time & stamp)
+{
+  constexpr double kPitchSanityLimit = M_PI / 2.0 + 0.2;
+  if (std::abs(pitch) >= kPitchSanityLimit || !std::isfinite(pitch) || !std::isfinite(yaw)) {
+    RCLCPP_DEBUG(
+      this->logger_, "Rejecting invalid gimbal pose sample: pitch=%.3f yaw=%.3f",
+      pitch, yaw);
+    return false;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(this->pose_mutex_);
+    this->current_yaw_ = yaw;
+    this->current_pitch_ = pitch;
+    this->q_orientation_.setRPY(0.0, pitch, yaw);
+    this->last_self_orientation_time_ = stamp;
+  }
+  return true;
 }
 
 void GimbalPoseAdapter::broadcastCameraTF(const rclcpp::Time & stamp)

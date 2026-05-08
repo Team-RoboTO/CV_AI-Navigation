@@ -111,5 +111,34 @@ TEST_F(GimbalPoseAdapterTest, BroadcastRotatesCameraOffsetWithYaw)
   EXPECT_NEAR(transform.transform.translation.z, 0.325 + 0.136, 1e-9);
 }
 
+TEST_F(GimbalPoseAdapterTest, AcceptsPitchSlightlyBeyondNinetyDegrees)
+{
+  auto node = std::make_shared<rclcpp::Node>("pose_source_adapter_pitch_limit_test");
+  auto buffer = std::make_shared<tf2_ros::Buffer>(node->get_clock());
+  auto broadcaster = std::make_shared<tf2_ros::TransformBroadcaster>(node);
+
+  PoseConfig config;
+  config.pose_source = "micro_pose";
+  config.gimbal_height = 0.325;
+
+  GimbalPoseAdapter adapter(
+    config,
+    "odom",
+    buffer,
+    broadcaster,
+    node->get_logger(),
+    node->get_clock());
+
+  geometry_msgs::msg::PoseStamped msg;
+  msg.header.stamp = node->now();
+  msg.pose.position.x = M_PI / 2.0 + 0.05;
+  msg.pose.position.y = 0.0;
+
+  adapter.onMicroPose(std::make_shared<const geometry_msgs::msg::PoseStamped>(msg));
+
+  const auto state = adapter.currentPoseState(node->now());
+  EXPECT_NEAR(state.pitch, M_PI / 2.0 + 0.05, 1e-9);
+}
+
 }  // namespace
 }  // namespace rm_auto_aim

@@ -127,6 +127,9 @@ struct PlanningContext
   double max_measurement_age = 0.10;
   double current_yaw = 0.0;
   double current_pitch = 0.0;
+  double barrel_offset_x = 0.0;
+  double barrel_offset_y = 0.0;
+  double barrel_offset_z = 0.0;
   double max_gimbal_yaw_rate = 6.0;
   double max_gimbal_pitch_rate = 4.0;
   double indirect_vyaw_threshold = 3.0;

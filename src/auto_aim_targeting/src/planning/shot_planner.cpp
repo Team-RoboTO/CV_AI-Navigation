@@ -356,9 +356,7 @@ ShotPlan ShotPlanner::buildPlan(
   out.face_index = face.face_index;
   out.mode = indirect ? AimMode::INDIRECT : AimMode::PREDICTED_DIRECT;
   out.indirect = indirect;
-  out.range = face.range;
   out.predict_time = predict_time;
-  out.absolute_yaw = face.bearing;
   out.visibility = face.visibility;
   out.measurement_age = 0.0;
   out.timing_residual = timing_residual;
@@ -368,8 +366,23 @@ ShotPlan ShotPlanner::buildPlan(
   out.y = face.y;
   out.z = face.z;
 
+  const double cos_yaw = std::cos(ctx.current_yaw);
+  const double sin_yaw = std::sin(ctx.current_yaw);
+  const double barrel_x =
+    ctx.barrel_offset_x * cos_yaw - ctx.barrel_offset_y * sin_yaw;
+  const double barrel_y =
+    ctx.barrel_offset_x * sin_yaw + ctx.barrel_offset_y * cos_yaw;
+  const double barrel_z = ctx.gimbal_height + ctx.barrel_offset_z;
+
+  const double dx = face.x - barrel_x;
+  const double dy = face.y - barrel_y;
+  const double dz = face.z - barrel_z;
+  const double ground_dist = std::hypot(dx, dy);
+  out.range = std::sqrt(dx * dx + dy * dy + dz * dz);
+  out.absolute_yaw = std::atan2(dy, dx);
+
   const BallisticSolution ballistic = this->ballistics_.solve(
-    face.ground_dist, face.z - ctx.gimbal_height, ctx.bullet_speed);
+    ground_dist, dz, ctx.bullet_speed);
   out.absolute_pitch = ballistic.pitch;
   out.flight_time = ballistic.flight_time;
   out.ballistic_valid = ballistic.valid;

@@ -17,6 +17,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Armors.msg"
   "msg/Target.msg"
   "msg/Targets.msg"
+  "msg/GimbalState.msg"
   "msg/GimbalCmd.msg"
 
   "msg/DebugLight.msg"

@@ -20,6 +20,10 @@
 namespace rm_auto_aim
 {
 
+bool correctArmorYawAgainstBearing(
+  auto_aim_interfaces::msg::Armor & armor,
+  double max_oblique_rad);
+
 class DetectionConverter
 {
 public:
@@ -43,6 +47,7 @@ private:
   std::optional<auto_aim_interfaces::msg::Armor> solveArmorPose(
     const Armor & armor) const;
   void transformToTrackingFrame(auto_aim_interfaces::msg::Armors::SharedPtr & armors) const;
+  void correctYawConventions(auto_aim_interfaces::msg::Armors::SharedPtr & armors) const;
   void filterImplausibleDetections(
     auto_aim_interfaces::msg::Armors::SharedPtr & armors,
     std::vector<size_t> & detection_indices) const;

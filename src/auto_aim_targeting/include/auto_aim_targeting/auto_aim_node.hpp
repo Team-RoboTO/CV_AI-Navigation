@@ -10,6 +10,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <std_msgs/msg/float32_multi_array.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/create_timer_ros.h>
@@ -17,6 +18,7 @@
 #include <tf2_ros/transform_listener.h>
 #include <vision_msgs/msg/detection2_d_array.hpp>
 
+#include "auto_aim_interfaces/msg/gimbal_state.hpp"
 #include "auto_aim_targeting/planning/shot_planner.hpp"
 #include "auto_aim_targeting/planning/ballistics_solver.hpp"
 #include "auto_aim_targeting/planning/engagement_planner.hpp"
@@ -50,6 +52,8 @@ private:
   // --- Leaf callbacks ---
   void cameraInfoCallback(const sensor_msgs::msg::CameraInfo::ConstSharedPtr camera_info);
   void microPoseCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg);
+  void microImuCallback(const std_msgs::msg::Float32MultiArray::ConstSharedPtr msg);
+  void gimbalStateCallback(const auto_aim_interfaces::msg::GimbalState::ConstSharedPtr msg);
   void cameraImuCallback(const sensor_msgs::msg::Imu::ConstSharedPtr msg);
 
   // --- Initialization (called once from constructor) ---
@@ -92,6 +96,8 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr cam_info_sub_;
   rclcpp::Subscription<vision_msgs::msg::Detection2DArray>::SharedPtr armors_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr micro_pose_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr micro_imu_sub_;
+  rclcpp::Subscription<auto_aim_interfaces::msg::GimbalState>::SharedPtr gimbal_state_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_tracker_srv_;
   rclcpp::TimerBase::SharedPtr detector_watchdog_timer_;

@@ -22,12 +22,57 @@
 #include <opencv2/calib3d.hpp>
 #include <rclcpp/logging.hpp>
 #include <tf2/LinearMath/Matrix3x3.h>
+#include <angles/angles.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 #include "auto_aim_targeting/measurement/armor_model.hpp"
 
 namespace rm_auto_aim
 {
+
+bool correctArmorYawAgainstBearing(
+  auto_aim_interfaces::msg::Armor & armor,
+  double max_oblique_rad)
+{
+  const auto & pos = armor.pose.position;
+  if (!std::isfinite(pos.x) || !std::isfinite(pos.y) ||
+      pos.x * pos.x + pos.y * pos.y < 1e-6)
+  {
+    return false;
+  }
+
+  tf2::Quaternion q;
+  tf2::fromMsg(armor.pose.orientation, q);
+  if (!std::isfinite(q.length()) || q.length() < 1e-6) {
+    return false;
+  }
+  q.normalize();
+
+  double roll = 0.0;
+  double pitch = 0.0;
+  double yaw = 0.0;
+  tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
+
+  const double bearing_inward = std::atan2(pos.y, pos.x);
+  double yaw_inward = yaw;
+  bool changed = false;
+
+  if (std::abs(angles::shortest_angular_distance(bearing_inward, yaw_inward)) > M_PI / 2.0) {
+    yaw_inward = angles::normalize_angle(yaw_inward + M_PI);
+    changed = true;
+  }
+  if (std::abs(angles::shortest_angular_distance(bearing_inward, yaw_inward)) > max_oblique_rad) {
+    yaw_inward = bearing_inward;
+    changed = true;
+  }
+
+  if (changed) {
+    tf2::Quaternion corrected;
+    corrected.setRPY(roll, pitch, yaw_inward);
+    armor.pose.orientation = tf2::toMsg(corrected);
+  }
+  return changed;
+}
 
 DetectionConverter::DetectionConverter(
   MeasurementConfig config,
@@ -70,6 +115,7 @@ Observation DetectionConverter::buildObservation(
   input.pose_state = pose_state;
   input.armors = this->detectArmors(detection_msg, input.detection_indices);
   this->transformToTrackingFrame(input.armors);
+  this->correctYawConventions(input.armors);
   if (input.armors->armors.empty()) {
     input.detection_indices.clear();
   }
@@ -253,6 +299,24 @@ void DetectionConverter::transformToTrackingFrame(
     armor.pose = ps_out.pose;
   }
   armors->header.frame_id = this->config_.target_frame;
+}
+
+void DetectionConverter::correctYawConventions(
+  auto_aim_interfaces::msg::Armors::SharedPtr & armors) const
+{
+  if (!this->config_.correct_pnp_yaw || armors->armors.empty()) {
+    return;
+  }
+
+  const double max_oblique_rad = this->config_.yaw_correction_max_oblique_deg * M_PI / 180.0;
+  for (auto & armor : armors->armors) {
+    if (correctArmorYawAgainstBearing(armor, max_oblique_rad)) {
+      RCLCPP_DEBUG(
+        this->logger_,
+        "Corrected PnP yaw for armor %s using target bearing",
+        armor.number.c_str());
+    }
+  }
 }
 
 void DetectionConverter::filterImplausibleDetections(

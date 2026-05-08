@@ -18,6 +18,8 @@ struct MeasurementConfig
   double light_ratio = 0.85;
   double bbox_padding_y = 80.0;
   double pnp_max_reprojection_error = 10.0;
+  bool correct_pnp_yaw = true;
+  double yaw_correction_max_oblique_deg = 65.0;
   std::string target_frame = "odom";
 };
 
@@ -55,6 +57,9 @@ struct BallisticsConfig
   bool use_quadratic_drag = false;
   double gimbal_pitch_max = 0.524;
   double gimbal_pitch_min = -0.524;
+  double barrel_offset_x = 0.0;
+  double barrel_offset_y = 0.0;
+  double barrel_offset_z = 0.0;
 };
 
 struct EngagementConfig
@@ -72,6 +77,7 @@ struct EngagementConfig
   double max_gimbal_pitch_rate = 4.0;
   double fire_yaw_tolerance = 0.03;
   double fire_pitch_tolerance = 0.03;
+  double cmd_smooth_alpha = 1.0;
   double indirect_vyaw_threshold = 3.0;
   double indirect_timing_tolerance = 0.02;
   int indirect_max_candidates = 8;

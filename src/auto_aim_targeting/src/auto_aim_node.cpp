@@ -222,6 +222,21 @@ void AutoAimNode::microPoseCallback(const geometry_msgs::msg::PoseStamped::Const
   }
 }
 
+void AutoAimNode::microImuCallback(const std_msgs::msg::Float32MultiArray::ConstSharedPtr msg)
+{
+  if (gimbal_pose_adapter_ != nullptr) {
+    gimbal_pose_adapter_->onMicroImu(msg);
+  }
+}
+
+void AutoAimNode::gimbalStateCallback(
+  const auto_aim_interfaces::msg::GimbalState::ConstSharedPtr msg)
+{
+  if (gimbal_pose_adapter_ != nullptr) {
+    gimbal_pose_adapter_->onGimbalState(msg);
+  }
+}
+
 void AutoAimNode::cameraImuCallback(const sensor_msgs::msg::Imu::ConstSharedPtr msg)
 {
   if (gimbal_pose_adapter_ != nullptr) {
@@ -254,6 +269,9 @@ void AutoAimNode::loadMeasurementConfig()
   config_.measurement.bbox_padding_y = declare_parameter("bbox_padding_y", 80.0);
   config_.measurement.pnp_max_reprojection_error =
     declare_parameter("pnp.max_reprojection_error", 10.0);
+  config_.measurement.correct_pnp_yaw = declare_parameter("pnp.correct_yaw", true);
+  config_.measurement.yaw_correction_max_oblique_deg =
+    declare_parameter("pnp.yaw_correction_max_oblique_deg", 65.0);
   config_.measurement.target_frame = declare_parameter("target_frame", "odom");
 }
 
@@ -340,6 +358,9 @@ void AutoAimNode::loadBallisticsConfig()
   config_.ballistics.use_quadratic_drag = declare_parameter("use_quadratic_drag", false);
   config_.ballistics.gimbal_pitch_max = declare_parameter("gimbal_pitch_max", 0.524);
   config_.ballistics.gimbal_pitch_min = declare_parameter("gimbal_pitch_min", -0.524);
+  config_.ballistics.barrel_offset_x = declare_parameter("barrel_offset_x", 0.0);
+  config_.ballistics.barrel_offset_y = declare_parameter("barrel_offset_y", 0.0);
+  config_.ballistics.barrel_offset_z = declare_parameter("barrel_offset_z", 0.0);
 }
 
 void AutoAimNode::loadEngagementConfig()
@@ -357,6 +378,7 @@ void AutoAimNode::loadEngagementConfig()
   config_.engagement.max_gimbal_pitch_rate = declare_parameter("max_gimbal_pitch_rate", 4.0);
   config_.engagement.fire_yaw_tolerance = declare_parameter("fire_yaw_tolerance", 0.03);
   config_.engagement.fire_pitch_tolerance = declare_parameter("fire_pitch_tolerance", 0.03);
+  config_.engagement.cmd_smooth_alpha = declare_parameter("cmd_smooth_alpha", 1.0);
   config_.engagement.indirect_vyaw_threshold = declare_parameter("indirect_vyaw_threshold", 3.0);
   config_.engagement.indirect_timing_tolerance =
     declare_parameter("indirect_timing_tolerance", 0.02);
@@ -393,7 +415,8 @@ void AutoAimNode::validateConfig() const
     throw std::invalid_argument("target_classes must contain at least one allowed class");
   }
 
-  constexpr std::array<const char *, 3> kPoseSources = {"none", "micro_pose", "camera_imu"};
+  constexpr std::array<const char *, 5> kPoseSources = {
+    "none", "micro_pose", "micro_imu", "gimbal_state", "camera_imu"};
   const bool pose_source_valid = std::any_of(
     kPoseSources.begin(),
     kPoseSources.end(),
@@ -401,11 +424,18 @@ void AutoAimNode::validateConfig() const
       return config_.pose.pose_source == pose_source;
     });
   if (!pose_source_valid) {
-    throw std::invalid_argument("pose_source must be one of: none, micro_pose, camera_imu");
+    throw std::invalid_argument(
+      "pose_source must be one of: none, micro_pose, micro_imu, gimbal_state, camera_imu");
   }
 
   if (config_.ballistics.bullet_speed <= 0.0) {
     throw std::invalid_argument("bullet_speed must be > 0");
+  }
+  if (config_.ballistics.bullet_speed < 10.0) {
+    RCLCPP_WARN(
+      get_logger(),
+      "bullet_speed is %.2f m/s; this is unusually low for live RoboMaster firing",
+      config_.ballistics.bullet_speed);
   }
 
   if (config_.engagement.min_fire_dist < 0.0 ||
@@ -445,6 +475,8 @@ void AutoAimNode::createServices()
       previous_tracker_id_ = -1;
       previous_face_index_ = -1;
       indirect_mode_active_ = false;
+      have_seen_frame_ = false;
+      this->publishHoldOutput(now());
       response->success = true;
     });
 }
@@ -502,6 +534,16 @@ void AutoAimNode::createSubscriptions()
       "/micro_pose",
       rclcpp::SensorDataQoS(),
       std::bind(&AutoAimNode::microPoseCallback, this, std::placeholders::_1));
+  } else if (config_.pose.pose_source == "micro_imu") {
+    micro_imu_sub_ = create_subscription<std_msgs::msg::Float32MultiArray>(
+      "/micro_imu",
+      rclcpp::SensorDataQoS(),
+      std::bind(&AutoAimNode::microImuCallback, this, std::placeholders::_1));
+  } else if (config_.pose.pose_source == "gimbal_state") {
+    gimbal_state_sub_ = create_subscription<auto_aim_interfaces::msg::GimbalState>(
+      "/gimbal/state",
+      rclcpp::SensorDataQoS(),
+      std::bind(&AutoAimNode::gimbalStateCallback, this, std::placeholders::_1));
   } else if (config_.pose.pose_source == "camera_imu") {
     imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
       "/imu/data",
