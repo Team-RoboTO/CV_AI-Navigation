@@ -107,6 +107,10 @@ public:
     cfg.maha_threshold   = declare_parameter("maha_threshold", 13.3);
     cfg.switch_range_ratio = declare_parameter("switch_range_ratio", 0.85);
     cfg.switch_cooldown  = declare_parameter("switch_cooldown", 10);
+    cfg.enable_tracking_switch =
+      declare_parameter("enable_tracking_switch", false);
+    cfg.tracking_switch_range_ratio =
+      declare_parameter("tracking_switch_range_ratio", 0.80);
 
     // P8 adaptive Q + P9 anti-gyro tunables. The on/off flags are declared
     // here so Tracker can read them from cfg at construction time.
@@ -205,6 +209,7 @@ public:
     gimbal_response_delay_  = declare_parameter("gimbal_response_delay_s", 0.030);
     latency_ema_alpha_      = declare_parameter("latency_ema_alpha", 0.10);
     publish_markers_enabled_ = declare_parameter("debug.publish_markers", true);
+    clamp_aim_pixels_ = declare_parameter("debug.clamp_aim_pixels", true);
 
     // EMA delay compensation. When the published yaw/pitch is EMA-smoothed
     // with cmd_smooth_alpha < 1.0, the steady-state lag against a moving
@@ -270,6 +275,7 @@ public:
         pnp_.init(K, msg->d);
         // keep intrinsics for the aim pixel overlay.
         cam_fx_ = K[0]; cam_fy_ = K[4]; cam_cx_ = K[2]; cam_cy_ = K[5];
+        cam_width_ = msg->width; cam_height_ = msg->height;
         RCLCPP_INFO(get_logger(), "Camera intrinsics received (%dx%d) fx=%.1f",
           msg->width, msg->height, cam_fx_);
       });
@@ -824,15 +830,49 @@ private:
     // publish aim and impact as 2d pixels for the viewer.
     // aim is the commanded ballistic ray, impact is the selected armor center.
     if (aim.tracking && aim.target_valid && pnp_.ready()) {
-      // convert the absolute command back into the current camera optical frame.
-      last_aim_yaw_   = -angles::shortest_angular_distance(imu_yaw_, yaw_target);
-      last_aim_pitch_ =  pitch_target - imu_pitch_;
+      // Convert the absolute commanded ray back into the current camera
+      // optical frame. Keep this on the same TF path as impact projection;
+      // scalar yaw/pitch subtraction is wrong once pitch is nonzero.
+      tf2::Vector3 aim_dir_odom(
+        std::cos(pitch_target) * std::cos(yaw_target),
+        std::cos(pitch_target) * std::sin(yaw_target),
+        std::sin(pitch_target));
+      tf2::Vector3 aim_dir_cam =
+        tf2::quatRotate(imu_rotation_.inverse(), aim_dir_odom);
+      if (aim_dir_cam.z() > 1e-6 &&
+          std::isfinite(aim_dir_cam.x()) &&
+          std::isfinite(aim_dir_cam.y()) &&
+          std::isfinite(aim_dir_cam.z())) {
+        last_aim_yaw_ = std::atan2(aim_dir_cam.x(), aim_dir_cam.z());
+        last_aim_pitch_ = std::atan2(-aim_dir_cam.y(), aim_dir_cam.z());
+      } else {
+        last_aim_yaw_ = last_imp_yaw_;
+        last_aim_pitch_ = last_imp_pitch_;
+      }
 
       double aim_px_x = cam_cx_ + cam_fx_ * std::tan(last_aim_yaw_);
       double aim_px_y = cam_cy_ - cam_fy_ * std::tan(last_aim_pitch_);
 
       double imp_px_x = cam_cx_ + cam_fx_ * std::tan(last_imp_yaw_);
       double imp_px_y = cam_cy_ - cam_fy_ * std::tan(last_imp_pitch_);
+
+      if (clamp_aim_pixels_ && cam_width_ > 0 && cam_height_ > 0 &&
+          std::isfinite(aim_px_x) && std::isfinite(aim_px_y)) {
+        const double raw_x = aim_px_x;
+        const double raw_y = aim_px_y;
+        const double margin = 4.0;
+        aim_px_x = std::clamp(aim_px_x, margin, static_cast<double>(cam_width_) - margin);
+        aim_px_y = std::clamp(aim_px_y, margin, static_cast<double>(cam_height_) - margin);
+        if (std::abs(raw_x - aim_px_x) > 1e-3 || std::abs(raw_y - aim_px_y) > 1e-3) {
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+            "Aim pixel off-screen raw=(%.1f, %.1f) clamped=(%.1f, %.1f)",
+            raw_x, raw_y, aim_px_x, aim_px_y);
+        }
+      }
+      if (!std::isfinite(aim_px_x) || !std::isfinite(aim_px_y)) {
+        aim_px_x = imp_px_x;
+        aim_px_y = imp_px_y;
+      }
 
       geometry_msgs::msg::Twist aim_px;
       aim_px.linear.x = aim_px_x;
@@ -971,6 +1011,7 @@ private:
   double latency_estimate_s_     = 0.0;
   bool   latency_estimate_initialized_ = false;
   bool   publish_markers_enabled_ = true;
+  bool   clamp_aim_pixels_ = true;
 
   // P3 EMA delay compensation
   bool   enable_ema_delay_compensation_ = false;
@@ -1006,6 +1047,7 @@ private:
 
   // camera intrinsics for aim pixel projection.
   double cam_fx_ = 700, cam_fy_ = 700, cam_cx_ = 480, cam_cy_ = 300;
+  uint32_t cam_width_ = 0, cam_height_ = 0;
 };
 
 }  // namespace auto_aim

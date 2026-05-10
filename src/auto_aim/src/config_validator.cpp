@@ -155,6 +155,8 @@ ValidationResult ConfigValidator::validate(
 
   // Target switching ratio in (0, 1].
   checkRange("switch_range_ratio", cfg.switch_range_ratio, 0.5, 1.0, 0.0, 1.0, r.errors, r.warnings);
+  checkRange("tracking_switch_range_ratio", cfg.tracking_switch_range_ratio,
+             0.5, 1.0, 0.0, 1.0, r.errors, r.warnings);
   if (cfg.switch_cooldown < 0) {
     r.errors.push_back("switch_cooldown must be >= 0");
   }

@@ -2,7 +2,7 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, TimerAction
+from launch.actions import DeclareLaunchArgument, TimerAction
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import ComposableNodeContainer, Node
@@ -23,6 +23,16 @@ def generate_launch_description():
     image_topic = LaunchConfiguration("image_topic")
     camera_info_topic = LaunchConfiguration("camera_info_topic")
     use_fake_micro_imu = LaunchConfiguration("use_fake_micro_imu")
+    fake_imu_mode = LaunchConfiguration("fake_imu_mode")
+    fake_imu_yaw_rad = LaunchConfiguration("fake_imu_yaw_rad")
+    fake_imu_pitch_rad = LaunchConfiguration("fake_imu_pitch_rad")
+    fake_imu_rate_hz = LaunchConfiguration("fake_imu_rate_hz")
+    fake_imu_video_hfov_deg = LaunchConfiguration("fake_imu_video_hfov_deg")
+    fake_imu_video_vfov_deg = LaunchConfiguration("fake_imu_video_vfov_deg")
+    fake_imu_video_smoothing_alpha = LaunchConfiguration("fake_imu_video_smoothing_alpha")
+    fake_imu_video_process_every_n = LaunchConfiguration("fake_imu_video_process_every_n")
+    angular_window = LaunchConfiguration("angular_window")
+    max_armor_z = LaunchConfiguration("max_armor_z")
     detector_threshold = LaunchConfiguration("detector_threshold")
     publish_debug_every = LaunchConfiguration("publish_debug_every")
     detector_debug_scores = LaunchConfiguration("detector_debug_scores")
@@ -89,6 +99,16 @@ def generate_launch_description():
                 # Debug/calibration keeps both common YOLOv26 color ids live.
                 # Tighten this to the enemy color before a match.
                 "target_classes": ["0", "2", "3"],
+                # Video/bench mode needs fast lock and willingness to jump to
+                # the front robot. Tighten these for live match behavior after
+                # bag/video validation.
+                "confirm_frames": 1,
+                "switch_cooldown": 2,
+                "enable_tracking_switch": True,
+                "tracking_switch_range_ratio": 0.88,
+                "cmd_smooth_alpha": 0.75,
+                "angular_window": ParameterValue(angular_window, value_type=float),
+                "max_armor_z": ParameterValue(max_armor_z, value_type=float),
             },
         ],
         remappings=[
@@ -98,17 +118,23 @@ def generate_launch_description():
         emulate_tty=True,
     )
 
-    fake_micro_imu = ExecuteProcess(
-        cmd=[
-            "ros2", "topic", "pub",
-            "/micro_imu",
-            "std_msgs/msg/Float32MultiArray",
-            "{data: [0.0, 0.0]}",
-            "-r", "60",
-            "--print", "120",
-        ],
+    fake_micro_imu = Node(
+        package="auto_aim",
+        executable="fake_micro_imu_node.py",
         name="fake_micro_imu",
+        parameters=[{
+            "mode": fake_imu_mode,
+            "yaw_rad": ParameterValue(fake_imu_yaw_rad, value_type=float),
+            "pitch_rad": ParameterValue(fake_imu_pitch_rad, value_type=float),
+            "rate_hz": ParameterValue(fake_imu_rate_hz, value_type=float),
+            "image_topic": image_topic,
+            "video_hfov_deg": ParameterValue(fake_imu_video_hfov_deg, value_type=float),
+            "video_vfov_deg": ParameterValue(fake_imu_video_vfov_deg, value_type=float),
+            "video_smoothing_alpha": ParameterValue(fake_imu_video_smoothing_alpha, value_type=float),
+            "video_process_every_n": ParameterValue(fake_imu_video_process_every_n, value_type=int),
+        }],
         output="screen",
+        emulate_tty=True,
         condition=IfCondition(use_fake_micro_imu),
     )
 
@@ -136,7 +162,57 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "use_fake_micro_imu",
             default_value="true",
-            description="Publish /micro_imu=[0,0] for bench Jetsons without the gimbal microcontroller. Set false on the robot.",
+            description="Run fake /micro_imu for bench/video tests. Set false on the robot with a real microcontroller.",
+        ),
+        DeclareLaunchArgument(
+            "fake_imu_mode",
+            default_value="video_motion",
+            description="'static' holds yaw/pitch; 'video_motion' estimates camera motion from image frames.",
+        ),
+        DeclareLaunchArgument(
+            "fake_imu_yaw_rad",
+            default_value="0.0",
+            description="Initial/static fake yaw in microcontroller radians.",
+        ),
+        DeclareLaunchArgument(
+            "fake_imu_pitch_rad",
+            default_value="0.0",
+            description="Initial/static fake pitch in microcontroller radians. Use camera mount pitch for no-IMU bench rigs.",
+        ),
+        DeclareLaunchArgument(
+            "fake_imu_rate_hz",
+            default_value="120.0",
+            description="Fake IMU publish rate.",
+        ),
+        DeclareLaunchArgument(
+            "fake_imu_video_hfov_deg",
+            default_value="90.0",
+            description="Horizontal FOV used by video_motion fake IMU [deg]. Tune for output2.mp4/camera source.",
+        ),
+        DeclareLaunchArgument(
+            "fake_imu_video_vfov_deg",
+            default_value="58.0",
+            description="Vertical FOV used by video_motion fake IMU [deg].",
+        ),
+        DeclareLaunchArgument(
+            "fake_imu_video_smoothing_alpha",
+            default_value="0.85",
+            description="EMA on per-frame video-motion yaw/pitch increments.",
+        ),
+        DeclareLaunchArgument(
+            "fake_imu_video_process_every_n",
+            default_value="2",
+            description="Run video-motion fake IMU optical flow every N image frames.",
+        ),
+        DeclareLaunchArgument(
+            "angular_window",
+            default_value="0.09",
+            description="Fire/off-axis angular window [rad]. For unwarped video debug only, try 0.25-0.40.",
+        ),
+        DeclareLaunchArgument(
+            "max_armor_z",
+            default_value="1.2",
+            description="Max absolute armor z [m] after fake/real IMU transform. Raise only to diagnose mount-pitch errors.",
         ),
         DeclareLaunchArgument(
             "detector_threshold",

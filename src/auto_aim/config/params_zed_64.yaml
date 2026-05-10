@@ -82,6 +82,8 @@ auto_aim:
     # ------------------- Target switching -------------------
     switch_range_ratio: 0.85
     switch_cooldown: 10
+    enable_tracking_switch: false
+    tracking_switch_range_ratio: 0.80
 
     # ------------------- Command shaping -------------------
     cmd_smooth_alpha: 0.4

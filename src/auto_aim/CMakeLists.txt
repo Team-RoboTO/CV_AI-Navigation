@@ -99,6 +99,7 @@ install(DIRECTORY config/
 
 install(PROGRAMS
   scripts/yolo26_pose_realsense_node.py
+  scripts/fake_micro_imu_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

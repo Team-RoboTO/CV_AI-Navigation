@@ -126,6 +126,11 @@ struct TrackerConfig
   double switch_range_ratio = 0.85;
   // short cooldown so two similar targets do not make the tracker bounce.
   int    switch_cooldown    = 10;  // ~0.33s at 30Hz
+  // Optional competition/video mode: allow a clearly closer target to steal
+  // lock even while TRACKING. Keep the ratio below 1 to avoid two similar
+  // targets stealing the tracker back and forth.
+  bool   enable_tracking_switch = false;
+  double tracking_switch_range_ratio = 0.80;
 
   // P8 adaptive Q. When enable_adaptive_q is true, the EKF reduces Q in the
   // stationary regime (small innovation, low velocity, low yaw rate) and

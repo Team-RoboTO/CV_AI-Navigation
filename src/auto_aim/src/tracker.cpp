@@ -281,12 +281,15 @@ void Tracker::initFromDetection(const ArmorDetection & det)
 bool Tracker::shouldSwitch(const ArmorDetection & candidate) const
 {
   if (state_ == LOST) return true;
-  // do not switch while the tracker is still stabilizing or already locked.
-  if (state_ == DETECTING || state_ == TRACKING) return false;
-  // during TEMP_LOST, only switch to something clearly closer.
+  if (state_ == DETECTING) return false;
   if (switch_cooldown_counter_ > 0) return false;
   double cur_range = targetRange();
   double new_range = candidate.range();
+  if (state_ == TRACKING) {
+    return cfg_.enable_tracking_switch &&
+      new_range < cur_range * cfg_.tracking_switch_range_ratio;
+  }
+  // during TEMP_LOST, only switch to something clearly closer.
   return new_range < cur_range * cfg_.switch_range_ratio;
 }
 
@@ -369,7 +372,12 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
     }
     if (closest && shouldSwitch(*closest)) {
       initFromDetection(*closest);
-      state_ = DETECTING;
+      if (cfg_.confirm_frames <= 1) {
+        state_ = TRACKING;
+        switch_cooldown_counter_ = cfg_.switch_cooldown;
+      } else {
+        state_ = DETECTING;
+      }
       last_assigned_count_ = 1;
       last_match_reject_reason_ = "accepted_switch";
       return;
@@ -385,7 +393,12 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
     auto best = std::min_element(detections.begin(), detections.end(),
       [](const auto& a, const auto& b) { return a.range() < b.range(); });
     initFromDetection(*best);
-    state_ = DETECTING;
+    if (cfg_.confirm_frames <= 1) {
+      state_ = TRACKING;
+      switch_cooldown_counter_ = cfg_.switch_cooldown;
+    } else {
+      state_ = DETECTING;
+    }
     last_assigned_count_ = 1;
     return;
   }
