@@ -223,6 +223,13 @@ public:
   double lastInnovationYawAbs() const { return last_innovation_yaw_abs_; }
   /// last Mahalanobis distance of the matched detection, P1+.
   double lastMahalanobis() const { return last_mahalanobis_; }
+  double lastBestMatchMahalanobis() const { return last_best_match_mahalanobis_; }
+  double lastBestMatchPositionDiff() const { return last_best_match_position_diff_; }
+  double lastBestMatchYawDiff() const { return last_best_match_yaw_diff_; }
+  const std::string & lastMatchRejectReason() const { return last_match_reject_reason_; }
+  const std::string & lastTrackerMissReason() const { return last_tracker_miss_reason_; }
+  uint32_t lastAssignedCount() const { return last_assigned_count_; }
+  uint32_t lastAssociationRejectCount() const { return last_association_reject_count_; }
   /// last effective Q values used by ekfPredict (P8 logging).
   double lastQPosEff() const { return last_q_pos_eff_; }
   double lastQYawEff() const { return last_q_yaw_eff_; }
@@ -276,6 +283,13 @@ private:
   mutable double last_innovation_pos_norm_ = 0.0;  // [m]
   mutable double last_innovation_yaw_abs_  = 0.0;  // [rad]
   mutable double last_mahalanobis_         = 0.0;
+  mutable double last_best_match_mahalanobis_ = 0.0;
+  mutable double last_best_match_position_diff_ = 0.0;
+  mutable double last_best_match_yaw_diff_ = 0.0;
+  std::string last_match_reject_reason_;
+  std::string last_tracker_miss_reason_;
+  uint32_t last_assigned_count_ = 0;
+  uint32_t last_association_reject_count_ = 0;
   // Snapshots of the effective Q/R values from the most recent predict/update
   // step. Used by /auto_aim/debug; not used by the runtime decision path.
   mutable double last_q_pos_eff_ = 0.0;

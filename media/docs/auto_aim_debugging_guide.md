@@ -100,36 +100,72 @@ in order — do not jump to the EKF if PnP is already noisy.
 
 ### 1. Detection
 
-Current `debug_targeting.launch.py` uses the YOLOv26-pose detector in
-`auto_aim/scripts/yolo26_pose_realsense_node.py`.
+`debug_targeting.launch.py` uses the YOLO-pose detector in
+`auto_aim/scripts/yolo26_pose_realsense_node.py`. **The measurement chain
+in `auto_aim_node` consumes only the keypoint topic** — there is no longer
+a bbox fallback.
 
-* Primary topic: `/detector/armors_keypoints`
-  (`auto_aim/ArmorKeypointArray`).
-* Compatibility topic: `/detector/armors`
-  (`vision_msgs/Detection2DArray`).
-* Debug image: `/yolo/debug_image` when `publish_debug_every > 0`.
-* Field: `Detection: cx=... cy=... w=... h=...` console line, plus
-  `/auto_aim/debug` fields `bbox_*`, `detect_confidence`, and `class_id`.
+* Required input: `/detector/armors_keypoints` (`auto_aim/ArmorKeypointArray`).
+* Legacy debug topic: `/detector/armors` (`vision_msgs/Detection2DArray`)
+  is still published by the detector for viewer/filter compatibility but
+  is NOT subscribed by `auto_aim`.
+* Debug image: `/yolo/debug_image` when `publish_debug_every > 0`
+  (default `0`; enable only when you need image overlays/bag evidence).
+* `/auto_aim/debug` exposes:
+  - `bbox_*`, `detect_confidence`, `class_id` (the YOLO-pose bbox metadata).
+  - Per-frame counters: `raw_kp_detection_count`, `class_reject_count`,
+    `kp_low_score_reject_count`, `kp_geometry_reject_count`,
+    `pnp_failed_count`, `pose_z_reject_count`, `pose_range_reject_count`,
+    and `armors_passed_to_tracker_count`.
+  - `meas_source` — must be `MEAS_SOURCE_KEYPOINT (1)` whenever a detection
+    was used. `MEAS_SOURCE_NONE (0)` for an entire frame means no detection
+    survived the keypoint gate.
+  - `kp_image_points` — the four keypoints exactly as the model output
+    them, in TL,TR,BR,BL index order.
+  - `kp_scores`, `kp_min_score`, `kp_mean_score` — per-keypoint detector
+    scores.
+  - `kp_geometry_valid` — convex+winding check result.
+  - `kp_reject_reason` — `KP_OK` (0), `KP_NONFINITE` (1), `KP_LOW_SCORE`
+    (2), `KP_INVALID_GEOMETRY` (3), `KP_OUT_OF_IMAGE` (4).
 * Bbox center should not drift >2 px frame-to-frame on a static target.
-* Bbox size should not breathe more than ~5%.
-* Keypoint corners should stay ordered TL, TR, BR, BL and should not jump
-  between armor lights.
-* If bbox or keypoints jitter, the detector is upstream of auto-aim and must
-  be fixed there. Check the engine, confidence threshold, NMS, keypoint score
-  threshold, lighting, exposure, and model weights.
+* Keypoint coordinates should stay locked to the same physical armor corner
+  frame-to-frame; if `kp_image_points[0]` (assumed-TL) jumps to the right
+  edge, the model has either swapped indices or the geometry check has
+  silently rejected this detection. Check `kp_reject_reason`.
+* If `kp_geometry_valid=false` for >5% of frames on a static target, the
+  trained keypoint model order does NOT match the assumed
+  TL,TR,BR,BL pixel convention. Stop and re-validate the model labels
+  before tuning anything else (see `docs/calibration_guide.md`).
+* If keypoints jitter, the detector is upstream of auto-aim and must be
+  fixed there. Check the engine, confidence threshold, NMS,
+  `keypoint_score_threshold`, lighting, exposure, and model weights.
 
 ### 2. PnP
 
-After P1: `/auto_aim/debug` includes `pnp_reproj_err`, `pnp_image_points`,
-and `pnp_tvec_*`.
+`/auto_aim/debug` includes `pnp_reproj_err`, `pnp_reproj_err_norm`,
+`pnp_small_reproj_err`, `pnp_large_reproj_err`, `pnp_size_margin`,
+`pnp_image_points`, and `pnp_tvec_*`. `pnp_image_points` is the four
+keypoints actually fed to PnP (post per-keypoint gating); `kp_image_points`
+is the same data **as received from the detector** for cross-check.
 
-* Reproj err normalized by bbox diagonal should be `< 0.05` for a clean
-  static frame. Higher usually means the four YOLOv26 corner keypoints are
-  noisy, out of order, or inconsistent with the real armor geometry.
-* `pnp.tvec.z` (depth in camera frame) should be steady within ~1% on a
-  static target.
-* If reproj err is OK but tvec jitters, inspect the raw keypoints and camera
-  intrinsics before touching EKF parameters.
+* `pnp_reproj_err_norm` (mean reprojection error / keypoint AABB diagonal)
+  should be `< 0.05` for a clean static frame. Persistent `> 0.10` means
+  the four YOLOv26 keypoint indices are correlated with the wrong physical
+  corners (silent label-vs-pixel mismatch), the four keypoints are noisy,
+  or the 3D model size (small/large armor) is being mis-selected.
+* `pnp_tvec_z` (depth in camera frame) should be steady within ~1% on a
+  static target. A 1% jitter at 5 m is 5 cm — noisy keypoints multiply by
+  range much more than bbox PnP did.
+* If reproj err is OK but tvec jitters, inspect the raw keypoints
+  (`kp_image_points`) and camera intrinsics before touching EKF
+  parameters.
+* If `pnp_is_large` flips frame-to-frame and `pnp_size_margin` is small,
+  test `pnp.force_armor_size:=small` or `large` on a bag to prove whether
+  size selection is causing pose jumps. Return it to `auto` afterward.
+* `pnp_reject_reason` enumerates why a frame was dropped: `DEGEN_BBOX`
+  here means the keypoint AABB is below 4 px, `REPROJ_ABS` means
+  `pnp_reproj_err` exceeded `keypoint_max_reproj_error` (default 15 px),
+  `REPROJ_NORM` triggers only when `enable_pnp_health_gate=true`.
 
 ### 3. Frame transform
 
@@ -148,6 +184,10 @@ After P1: `/auto_aim/debug` includes `ekf.state`, `ekf.innovation`,
 
 * Innovation norm should be `< 2 sigma_pos` most frames.
 * Mahalanobis distance should be `< maha_threshold` (default 13.3).
+* `best_match_mahalanobis`, `best_match_position_diff`,
+  `best_match_yaw_diff`, and `match_reject_reason` identify whether the
+  EKF rejected association by Mahalanobis, position, yaw jump, class
+  mismatch, or no measurement.
 * If innovation is large but maha is small, the measurement noise model
   (`r_pos_*`, `r_yaw_*`) may be over-confident: increase the slope.
 * If maha is large persistently, the tracker is drifting from the target
@@ -251,6 +291,22 @@ Beyond the original `bbox_*`, `pnp_*`, `ekf_state`, `aim_*`, `cmd_*`,
 | Field                      | What it tells you                                                |
 |----------------------------|------------------------------------------------------------------|
 | `pnp_reject_reason`        | Why a PnP attempt failed (see `PNP_*` enum). 0 = OK              |
+| `pnp_small_reproj_err`     | Reprojection error if the small armor model is used              |
+| `pnp_large_reproj_err`     | Reprojection error if the large armor model is used              |
+| `pnp_size_margin`          | Absolute small-vs-large reprojection margin; small = unstable    |
+| `raw_kp_detection_count`   | Number of keypoint detections received this frame                |
+| `class_reject_count`       | Detections rejected by `target_classes`                          |
+| `kp_low_score_reject_count`| Detections rejected by keypoint score                            |
+| `kp_geometry_reject_count` | Detections rejected by keypoint geometry / image bounds          |
+| `pnp_failed_count`         | Detections rejected by PnP solve or PnP health gates             |
+| `pose_z_reject_count`      | PnP poses rejected by `max_armor_z`                              |
+| `pose_range_reject_count`  | PnP poses rejected by `max_armor_distance`                       |
+| `armors_passed_to_tracker_count` | Final measurements passed into `Tracker::update`          |
+| `best_match_mahalanobis`   | Best same-class association score seen by tracker                |
+| `best_match_position_diff` | Predicted-vs-measured armor position difference [m]              |
+| `best_match_yaw_diff`      | Predicted-vs-measured yaw difference [rad]                       |
+| `match_reject_reason`      | `accepted`, `mahalanobis_gate`, `position_gate`, etc.            |
+| `tracker_miss_reason`      | Why the tracker coasted/missed this frame                        |
 | `ekf_innovation_pos_norm`  | sqrt(yx²+yy²+yz²) [m]. Use this instead of the legacy mixed norm |
 | `ekf_innovation_yaw_abs`   | \|y_yaw\| [rad]                                                    |
 | `ekf_q_pos_eff`            | Effective `q_pos` at predict time (after adaptive Q schedule)    |
@@ -271,6 +327,13 @@ Beyond the original `bbox_*`, `pnp_*`, `ekf_state`, `aim_*`, `cmd_*`,
 | `pred_flight_time_s`       | Ballistic flight time                                            |
 | `pred_t_total_s`           | Final lead committed to the planner                              |
 | `smoothing_lag_rad`        | sqrt(yaw_lag² + pitch_lag²); always logged                       |
+| `meas_source`              | `MEAS_SOURCE_KEYPOINT` (1) whenever PnP ran; `NONE` (0) when no detection survived the keypoint gate |
+| `kp_image_points`          | Raw 4 keypoints in image pixels, TL,TR,BR,BL order              |
+| `kp_scores`                | Per-keypoint detector scores                                    |
+| `kp_min_score`             | min(`kp_scores`); compared against `min_keypoint_score`         |
+| `kp_mean_score`            | mean(`kp_scores`); useful for trends                            |
+| `kp_geometry_valid`        | Convex + clockwise-winding sanity check on the four corners     |
+| `kp_reject_reason`         | `KP_OK` / `KP_NONFINITE` / `KP_LOW_SCORE` / `KP_INVALID_GEOMETRY` / `KP_OUT_OF_IMAGE` |
 
 ### Recommended enable order (do not turn everything on at once)
 
@@ -322,3 +385,26 @@ python -c "import numpy, sys; a=numpy.loadtxt('yaw.csv'); print(a.std())"
 
 If standard deviation is significantly higher, walk back through the six
 stages above. Do not raise smoothing alpha to hide jitter — find the source.
+
+## Runtime profiling checklist
+
+Run these before changing tracker gates:
+
+```
+ros2 topic hz /camera/camera/color/image_raw
+ros2 topic hz /detector/armors_keypoints
+ros2 topic hz /auto_aim/debug
+ros2 topic hz /tracker/cmd_gimbal
+sudo tegrastats
+```
+
+For detector profiling, keep `/yolo/debug_image` disabled unless you are
+recording visual evidence:
+
+```
+ros2 launch launch_pkg debug_targeting.launch.py publish_debug_every:=0 detector_debug_scores:=false
+```
+
+If `/auto_aim/debug.latency_process_s` is tiny but total latency/FPS is bad,
+the bottleneck is upstream detector/postprocess, ROS image transport, debug
+image copying, logging, or GPU/CPU contention, not EKF math.

@@ -6,15 +6,16 @@ code does today.
 
 ## Subscribed topics
 
-Current match/debug launch path (`launch_pkg/launch/debug_targeting.launch.py`)
-uses the YOLOv26-pose keypoint detector and runs `auto_aim_node` with
-`use_keypoints=true`.
+`auto_aim_node` consumes YOLO-pose armor keypoints exclusively. The legacy
+bbox-only callback was removed in this branch — there is no `use_keypoints`
+flag any more, and `auto_aim` does not subscribe to `/detector/armors`.
+The detector still publishes that bbox topic for legacy debug consumers
+(e.g. RViz/viewer), but it is not part of the runtime measurement chain.
 
 ```
-/detector/armors_keypoints  auto_aim/ArmorKeypointArray  primary, use_keypoints=true
-/detector/armors            vision_msgs/Detection2DArray  fallback, use_keypoints=false
-/camera_info                sensor_msgs/CameraInfo
-/micro_imu                  std_msgs/Float32MultiArray    [yaw_rad, pitch_rad]
+/detector/armors_keypoints  auto_aim/ArmorKeypointArray  required
+/camera_info                sensor_msgs/CameraInfo       required
+/micro_imu                  std_msgs/Float32MultiArray   required, [yaw_rad, pitch_rad]
 ```
 
 ## Published topics
@@ -96,14 +97,18 @@ firmware publisher.
 | Keypoint gate               |
 |   filter target classes     |
 |   reject low-score corners  |
+|   reject non-finite corners |
+|   convex+winding sanity chk |
 +--------------+--------------+
                |
                v
 +-----------------------------+
-| PnPMeasurementModel         |
-|   direct keypoint corners   |
+| PnPSolver::solveKeypoints   |
+|   TL,TR,BR,BL pixels (in)   |
 |   IPPE PnP, small/large     |
 |   keep min reproj err       |
+|   reproj_err_norm = err /   |
+|     keypoint AABB diagonal  |
 +--------------+--------------+
                |  (rvec, tvec, is_large, reproj_err, image_points)
                v
@@ -169,11 +174,43 @@ firmware publisher.
        /auto_aim/debug
 ```
 
-The legacy bbox-only path still exists for detector bring-up or fallback:
-when `use_keypoints=false`, `auto_aim_node` subscribes to `/detector/armors`,
-uses `DetectionAdapter::convert()`, builds synthetic corners from the bbox and
-`light_ratio`, then runs the same downstream transform, tracker, planner, and
-fire gate.
+## Measurement-model contract
+
+The pipeline has exactly one measurement model: YOLO-pose keypoints. The
+`ArmorKeypoint.msg` schema fixes the keypoint index order:
+
+```
+keypoints_xy = [TLx, TLy, TRx, TRy, BRx, BRy, BLx, BLy]   image pixels
+```
+
+`PnPSolver::init()` builds the matching armor-frame object points in the
+exact same order:
+
+```
+TL = (0, +hy, +hz)    image-left,  image-up
+TR = (0, -hy, +hz)    image-right, image-up
+BR = (0, -hy, -hz)    image-right, image-down
+BL = (0, +hy, -hz)    image-left,  image-down
+```
+
+with the X axis as plate normal (out of the plate toward the viewer),
+Y as image-left when face-on, Z as image-up. PnP correspondence is
+index-by-index — the i-th 2D keypoint maps to the i-th 3D point above.
+**There is no runtime reordering.** Operators must verify on a known
+frame that keypoint 0 in `kp_image_points` is in the upper-left quadrant
+of the armor and that the indices walk clockwise. See
+`docs/calibration_guide.md` for the verification overlay.
+
+Detector keypoints are expected in original image pixel coordinates after
+letterbox unpadding/rescaling. The detector should not clip keypoints before
+publishing, because clipping can make PnP solve a distorted quadrilateral.
+`auto_aim_node` rejects out-of-image keypoints as `KP_OUT_OF_IMAGE`.
+
+The C++ side defends against ordering mistakes only with a convex+winding
+check (`enable_keypoint_geometry_check`, default ON): a self-intersecting
+or non-convex quad is rejected as `KP_INVALID_GEOMETRY`. That stops bow-tie
+configurations but **does not detect a 90° rotation of the index labels**
+— that case must be caught visually before competition.
 
 ## EKF state and observation
 

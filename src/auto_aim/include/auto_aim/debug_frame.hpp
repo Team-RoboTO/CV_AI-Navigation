@@ -19,17 +19,39 @@ struct DebugFrame
   float bbox_cx = 0, bbox_cy = 0, bbox_w = 0, bbox_h = 0;
   float detect_confidence = 0;
   std::string class_id;
+  uint32_t raw_kp_detection_count = 0;
+  uint32_t class_reject_count = 0;
+  uint32_t kp_low_score_reject_count = 0;
+  uint32_t kp_geometry_reject_count = 0;
+  uint32_t pnp_failed_count = 0;
+  uint32_t pose_z_reject_count = 0;
+  uint32_t pose_range_reject_count = 0;
+  uint32_t armors_passed_to_tracker_count = 0;
 
   // PnP
   bool pnp_ok = false;
   bool pnp_is_large = false;
   float pnp_reproj_err = 0;       // mean pixel error
-  float pnp_reproj_err_norm = 0;  // / bbox diagonal
-  std::array<float, 8> pnp_image_points{};  // x0 y0 x1 y1 x2 y2 x3 y3
+  float pnp_reproj_err_norm = 0;  // / keypoint AABB diagonal
+  float pnp_small_reproj_err = 0;
+  float pnp_large_reproj_err = 0;
+  float pnp_size_margin = 0;
+  std::array<float, 8> pnp_image_points{};  // post-check corners fed to PnP
   float pnp_tvec_x = 0, pnp_tvec_y = 0, pnp_tvec_z = 0;
   // 0=OK 1=DEGEN_BBOX 2=NONFINITE 3=BAD_LIGHT_RATIO 4=SOLVER_FAIL
   // 5=REPROJ_ABS 6=REPROJ_NORM 7=DEPTH_TOO_CLOSE 8=DEPTH_TOO_FAR
   uint8_t pnp_reject_reason = 0;
+
+  // YOLO-pose keypoint diagnostics. The pipeline currently has only one
+  // measurement model (keypoints); the source flag exists so a future bbox
+  // fallback would be visible without changing the message schema.
+  uint8_t meas_source = 0;        // 0=NONE 1=KEYPOINT
+  std::array<float, 8> kp_image_points{};   // raw model-order TL,TR,BR,BL
+  std::array<float, 4> kp_scores{};
+  float   kp_min_score = 0;
+  float   kp_mean_score = 0;
+  bool    kp_geometry_valid = false;
+  uint8_t kp_reject_reason = 0;   // 0=OK 1=NONFINITE 2=LOW_SCORE 3=INVALID_GEOMETRY 4=OUT_OF_IMAGE
 
   // Frame transform
   float odom_x = 0, odom_y = 0, odom_z = 0, odom_yaw = 0;
@@ -37,6 +59,9 @@ struct DebugFrame
   // EKF
   uint8_t tracker_state = 0;
   std::string tracker_target_id;
+  uint32_t tracker_assigned_count = 0;
+  uint32_t tracker_association_reject_count = 0;
+  std::string tracker_miss_reason;
   std::array<float, 9> ekf_state{};
   float ekf_innovation_norm = 0;       // legacy, mixes meters and radians
   float ekf_innovation_pos_norm = 0;   // sqrt(yx^2 + yy^2 + yz^2) [m]
@@ -53,6 +78,10 @@ struct DebugFrame
   float ekf_measurement_age_s = 0;     // s since last accepted measurement
   // 0=NONE 1=ACCEPTED 2=DEGRADED 3=REJECTED
   uint8_t ekf_measurement_quality = 0;
+  float best_match_mahalanobis = 0;
+  float best_match_position_diff = 0;
+  float best_match_yaw_diff = 0;
+  std::string match_reject_reason;
 
   // Aim
   bool aim_target_valid = false;

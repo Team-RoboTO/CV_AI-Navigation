@@ -11,6 +11,16 @@ auto_aim:
   ros__parameters:
     # ------------------- Detection / tracking -------------------
     target_classes: ["0"]
+    keypoint_topic: "/detector/armors_keypoints"
+    min_keypoint_score: 0.30
+    keypoint_max_reproj_error: 15.0
+    "pnp.force_armor_size": "auto"
+    enable_pnp_health_gate: false
+    pnp_max_reproj_err_norm: 0.10
+    pnp_min_depth_m: 0.10
+    pnp_max_depth_m: 12.0
+    enable_keypoint_geometry_check: true
+    # Legacy bbox-PnP parameter; unused on the keypoint path.
     light_ratio: 0.85
     max_armor_distance: 8.0
     max_armor_z: 1.2
@@ -88,3 +98,10 @@ auto_aim:
     enable_pnp_refine: false
     enable_anti_gyro: false
     enable_adaptive_q: false
+    enable_adaptive_r: false
+
+    # ------------------- Debug / profiling -------------------
+    "debug.publish_enabled": true
+    "debug.histogram_log_enabled": true
+    "debug.publish_markers": true
+    "debug.fire_log_period_s": 10.0

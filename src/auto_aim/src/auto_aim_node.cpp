@@ -1,11 +1,12 @@
 // one ROS2 node for the whole auto-aim path.
-// it takes YOLO detections, camera intrinsics, and micro yaw/pitch, then runs
-// PnP, the EKF tracker, aim prediction, and command publishing.
+// it takes YOLO-pose keypoint detections, camera intrinsics, and micro
+// yaw/pitch, then runs PnP, the EKF tracker, aim prediction, and command
+// publishing.
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
-#include <vision_msgs/msg/detection2_d_array.hpp>
 #include <auto_aim/msg/armor_keypoint_array.hpp>
+#include <auto_aim/msg/auto_aim_debug.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <std_msgs/msg/header.hpp>
@@ -25,7 +26,6 @@
 #include "auto_aim/config_validator.hpp"
 #include "auto_aim/debug_frame.hpp"
 #include "auto_aim/debug_publisher.hpp"
-#include "auto_aim/detection_adapter.hpp"
 #include "auto_aim/fire_gate.hpp"
 #include "auto_aim/frame_transformer.hpp"
 #include "auto_aim/pnp_solver.hpp"
@@ -33,6 +33,37 @@
 
 namespace auto_aim
 {
+
+namespace
+{
+
+// Validate that the four keypoints form a convex quadrilateral with
+// clockwise winding 0->1->2->3 in image coordinates (x right, y down). The
+// expected winding for TL,TR,BR,BL in image-y-down is clockwise.
+//
+// Returns true when the quad is well-formed. Robust to in-plane rotation
+// (does not assume axis-aligned armor); only catches index swaps and
+// bow-tie configurations that would silently feed PnP a wrong correspondence.
+bool keypointGeometryOk(const std::array<cv::Point2f, 4> & c)
+{
+  auto cross = [](cv::Point2f a, cv::Point2f b, cv::Point2f d) {
+    return (b.x - a.x) * (d.y - a.y) - (b.y - a.y) * (d.x - a.x);
+  };
+  // Triangulate the quad two different ways and require all four sub-triangles
+  // to share the same sign. Convex + non-self-intersecting <=> all same sign.
+  const double s1 = cross(c[0], c[1], c[2]);
+  const double s2 = cross(c[0], c[2], c[3]);
+  const double s3 = cross(c[1], c[2], c[3]);
+  const double s4 = cross(c[1], c[3], c[0]);
+  if (!(std::isfinite(s1) && std::isfinite(s2) && std::isfinite(s3) &&
+        std::isfinite(s4))) {
+    return false;
+  }
+  // Clockwise in image-y-down means positive cross product for TL,TR,BR.
+  return (s1 > 0 && s2 > 0 && s3 > 0 && s4 > 0);
+}
+
+}  // namespace
 
 class AutoAimNode : public rclcpp::Node
 {
@@ -136,14 +167,16 @@ public:
     target_classes_ = std::set<std::string>(tc.begin(), tc.end());
     target_classes_.erase("1");  // skip grey/dead detections.
 
-    // YOLOv26-pose path. When enabled, the node consumes real armor corner
-    // keypoints and runs direct keypoint PnP. The bbox-only topic remains as a
-    // launch-selectable fallback for detector bring-up.
-    use_keypoints_ = declare_parameter("use_keypoints", false);
+    // YOLO-pose keypoint path is the only measurement model. There is no
+    // longer a bbox fallback inside this node — the detector still publishes
+    // /detector/armors for legacy debug consumers, but auto_aim does not
+    // subscribe to it.
     keypoint_topic_ = declare_parameter(
       "keypoint_topic", std::string("/detector/armors_keypoints"));
-    min_keypoint_score_ = declare_parameter("min_keypoint_score", 0.05);
+    min_keypoint_score_ = declare_parameter("min_keypoint_score", 0.30);
     keypoint_max_reproj_error_ = declare_parameter("keypoint_max_reproj_error", 15.0);
+    enable_keypoint_geometry_check_ =
+      declare_parameter("enable_keypoint_geometry_check", true);
 
     smooth_alpha_ = declare_parameter("cmd_smooth_alpha", 0.4);
 
@@ -171,6 +204,7 @@ public:
     use_measured_latency_   = declare_parameter("use_measured_latency", false);
     gimbal_response_delay_  = declare_parameter("gimbal_response_delay_s", 0.030);
     latency_ema_alpha_      = declare_parameter("latency_ema_alpha", 0.10);
+    publish_markers_enabled_ = declare_parameter("debug.publish_markers", true);
 
     // EMA delay compensation. When the published yaw/pitch is EMA-smoothed
     // with cmd_smooth_alpha < 1.0, the steady-state lag against a moving
@@ -190,12 +224,27 @@ public:
     pnp_max_reproj_err_norm_  = declare_parameter("pnp_max_reproj_err_norm", 0.10);
     pnp_min_depth_m_          = declare_parameter("pnp_min_depth_m", 0.10);
     pnp_max_depth_m_          = declare_parameter("pnp_max_depth_m", 12.0);
+    const std::string force_armor_size =
+      declare_parameter("pnp.force_armor_size", std::string("auto"));
+    if (force_armor_size == "auto") {
+      pnp_force_size_mode_ = PnPSolver::ArmorSizeMode::AUTO;
+    } else if (force_armor_size == "small") {
+      pnp_force_size_mode_ = PnPSolver::ArmorSizeMode::SMALL;
+    } else if (force_armor_size == "large") {
+      pnp_force_size_mode_ = PnPSolver::ArmorSizeMode::LARGE;
+    } else {
+      RCLCPP_FATAL(get_logger(),
+        "Invalid pnp.force_armor_size='%s' (expected auto|small|large)",
+        force_armor_size.c_str());
+      throw std::runtime_error("auto_aim: invalid pnp.force_armor_size");
+    }
 
     // validate every parameter so a typo or wrong-units value fails loudly
     // at startup instead of silently mis-aiming the robot.
     auto vr = ConfigValidator::validate(
       cfg_, target_classes_, yaw_sign_, pitch_sign_,
-      smooth_alpha_, pitch_offset_deg, yaw_offset_deg);
+      smooth_alpha_, pitch_offset_deg, yaw_offset_deg,
+      min_keypoint_score_, keypoint_max_reproj_error_);
     if (!ConfigValidator::logResult(vr, get_logger())) {
       RCLCPP_FATAL(get_logger(),
         "Invalid auto_aim configuration: %zu error(s). Fix the YAML and re-launch.",
@@ -204,19 +253,13 @@ public:
     }
 
     // subscribers
-    if (use_keypoints_) {
-      kpt_sub_ = create_subscription<auto_aim::msg::ArmorKeypointArray>(
-        keypoint_topic_, rclcpp::SensorDataQoS(),
-        std::bind(&AutoAimNode::keypointCallback, this, std::placeholders::_1));
-      RCLCPP_INFO(get_logger(),
-        "Using YOLOv26-pose keypoint detections on %s", keypoint_topic_.c_str());
-    } else {
-      det_sub_ = create_subscription<vision_msgs::msg::Detection2DArray>(
-        "/detector/armors", rclcpp::SensorDataQoS(),
-        std::bind(&AutoAimNode::detectionCallback, this, std::placeholders::_1));
-      RCLCPP_WARN(get_logger(),
-        "Using legacy bbox-only detections on /detector/armors");
-    }
+    kpt_sub_ = create_subscription<auto_aim::msg::ArmorKeypointArray>(
+      keypoint_topic_, rclcpp::SensorDataQoS(),
+      std::bind(&AutoAimNode::keypointCallback, this, std::placeholders::_1));
+    RCLCPP_INFO(get_logger(),
+      "Subscribed to YOLO-pose keypoints on %s (min_score=%.2f, max_reproj=%.1f, geom_check=%d)",
+      keypoint_topic_.c_str(), min_keypoint_score_, keypoint_max_reproj_error_,
+      enable_keypoint_geometry_check_ ? 1 : 0);
 
     cam_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(
       "/camera_info", rclcpp::SensorDataQoS(),
@@ -250,7 +293,11 @@ public:
 
     // structured per-frame debug. /auto_aim/debug consumers can plot every
     // pipeline stage to diagnose where jitter or bias enters.
-    debug_pub_ = std::make_unique<DebugPublisher>(this);
+    debug_pub_ = std::make_unique<DebugPublisher>(
+      this, "/auto_aim/debug",
+      declare_parameter("debug.fire_log_period_s", 10.0),
+      declare_parameter("debug.publish_enabled", true),
+      declare_parameter("debug.histogram_log_enabled", true));
 
     RCLCPP_INFO(get_logger(), "Auto-aim node started: using /micro_imu [yaw_rad, pitch_rad], publishing absolute rad commands in micro convention");
   }
@@ -288,132 +335,7 @@ private:
     imu_translation_ = frame_transformer_.translation();
   }
 
-  // main detection and tracking path.
-  void detectionCallback(const vision_msgs::msg::Detection2DArray::ConstSharedPtr msg)
-  {
-    if (!pnp_.ready()) return;
-    if (!imu_valid_) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-        "Waiting for /micro_imu: Float32MultiArray [yaw_rad, pitch_rad]");
-      return;
-    }
-
-    DebugFrame f;
-    rclcpp::Time t_proc_start = this->now();
-    f.latency_capture_to_process_s = (t_proc_start - rclcpp::Time(msg->header.stamp)).seconds();
-
-    // compute dt from image stamps.
-    rclcpp::Time now = msg->header.stamp;
-    double dt = 1.0 / cfg_.ref_freq;
-    if (last_time_.nanoseconds() > 0)
-      dt = std::clamp((now - last_time_).seconds(), 0.01, 0.10);
-    last_time_ = now;
-
-    // P3: DetectionAdapter does the class filter + minimum-size gate so the
-    // hot path here only deals with valid candidates.
-    auto candidates = DetectionAdapter::convert(*msg, target_classes_);
-    const double max_oblique_rad = cfg_.max_oblique_deg * M_PI / 180.0;
-
-    std::vector<ArmorDetection> armors;
-    bool first_passing_logged = false;
-    for (const auto & cand : candidates) {
-      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
-        "Detection: cx=%.1f cy=%.1f w=%.1f h=%.1f class=%s",
-        cand.cx, cand.cy, cand.w, cand.h, cand.class_id.c_str());
-
-      // record the first detection that passes the class filter for debug.
-      if (!first_passing_logged) {
-        f.detection_present = true;
-        f.bbox_cx = (float)cand.cx; f.bbox_cy = (float)cand.cy;
-        f.bbox_w  = (float)cand.w;  f.bbox_h  = (float)cand.h;
-        f.detect_confidence = (float)cand.confidence;
-        f.class_id = cand.class_id;
-      }
-
-      // bbox-PnP. PnPResult exposes reproj err and image points for /auto_aim/debug.
-      // The optional health gate adds a normalized-reprojection threshold and
-      // a depth band; both are off by default (zero / very large).
-      const double pnp_norm_gate = enable_pnp_health_gate_ ? pnp_max_reproj_err_norm_ : 0.0;
-      const double pnp_min_depth = enable_pnp_health_gate_ ? pnp_min_depth_m_         : 0.0;
-      const double pnp_max_depth = enable_pnp_health_gate_ ? pnp_max_depth_m_         : 1.0e6;
-      auto pnp = pnp_.solve(cand.cx, cand.cy, cand.w, cand.h, cfg_.light_ratio,
-                            10.0, enable_pnp_refine_, 4.0,
-                            pnp_norm_gate, pnp_min_depth, pnp_max_depth);
-      if (!pnp.ok) {
-        if (!first_passing_logged) {
-          // populate the debug frame even when PnP fails, so the consumer
-          // can see why this detection was dropped.
-          f.pnp_ok = false;
-          f.pnp_reproj_err = (float)pnp.reproj_err;
-          f.pnp_reproj_err_norm = (float)pnp.reproj_err_norm;
-          f.pnp_image_points = pnp.image_points;
-          f.pnp_reject_reason = (uint8_t)pnp.reject_reason;
-          first_passing_logged = true;
-        }
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
-          "PnP FAILED reason=%u bbox=(%.0f,%.0f,%.0f,%.0f) reproj=%.2f reproj_norm=%.3f",
-          (unsigned)pnp.reject_reason, cand.cx, cand.cy, cand.w, cand.h,
-          pnp.reproj_err, pnp.reproj_err_norm);
-        continue;
-      }
-
-      // P3: FrameTransformer encapsulates camera->odom and the bearing/yaw
-      // clamp that protects the EKF from flipped plate normals.
-      auto td = frame_transformer_.apply(pnp.rvec, pnp.tvec, max_oblique_rad);
-      if (!td.valid) continue;
-
-      tf2::Vector3 p_cam(pnp.tvec.at<double>(0), pnp.tvec.at<double>(1),
-                         pnp.tvec.at<double>(2));
-
-      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
-        "PnP OK: cam=(%.2f,%.2f,%.2f) large=%d reproj=%.2f",
-        p_cam.x(), p_cam.y(), p_cam.z(), pnp.is_large, pnp.reproj_err);
-      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
-        "Odom: pos=(%.2f,%.2f,%.2f) yaw=%.2f", td.x, td.y, td.z, td.yaw);
-
-      // reject clearly bad poses.
-      if (std::abs(td.z) > cfg_.max_armor_z) {
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
-          "REJECTED: z=%.2f exceeds max_armor_z=%.1f", td.z, cfg_.max_armor_z);
-        continue;
-      }
-      if (std::hypot(td.x, td.y) > cfg_.max_armor_dist) {
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
-          "REJECTED: range=%.2f exceeds max_armor_dist=%.1f",
-          std::hypot(td.x, td.y), cfg_.max_armor_dist);
-        continue;
-      }
-
-      // record the first PnP-successful detection in the debug frame.
-      if (!first_passing_logged) {
-        f.pnp_ok = true;
-        f.pnp_is_large = pnp.is_large;
-        f.pnp_reproj_err = (float)pnp.reproj_err;
-        f.pnp_reproj_err_norm = (float)pnp.reproj_err_norm;
-        f.pnp_image_points = pnp.image_points;
-        f.pnp_reject_reason = (uint8_t)pnp.reject_reason;  // OK = 0
-        f.pnp_tvec_x = (float)p_cam.x();
-        f.pnp_tvec_y = (float)p_cam.y();
-        f.pnp_tvec_z = (float)p_cam.z();
-        f.odom_x = (float)td.x;
-        f.odom_y = (float)td.y;
-        f.odom_z = (float)td.z;
-        f.odom_yaw = (float)td.yaw;
-        first_passing_logged = true;
-      }
-
-      ArmorDetection a;
-      a.x = td.x; a.y = td.y; a.z = td.z; a.yaw = td.yaw;
-      a.class_id = cand.class_id;
-      a.confidence = cand.confidence;
-      a.pnp_reproj_err_norm = pnp.reproj_err_norm;
-      armors.push_back(std::move(a));
-    }
-
-    finalizeFrame(msg->header, f, armors, dt, t_proc_start);
-  }
-
-  // YOLOv26-pose path: direct PnP from the four predicted armor corners.
+  // YOLO-pose path: direct PnP from the four predicted armor corners.
   void keypointCallback(const auto_aim::msg::ArmorKeypointArray::ConstSharedPtr msg)
   {
     if (!pnp_.ready()) return;
@@ -424,6 +346,7 @@ private:
     }
 
     DebugFrame f;
+    f.raw_kp_detection_count = static_cast<uint32_t>(msg->detections.size());
     rclcpp::Time t_proc_start = this->now();
     f.latency_capture_to_process_s = (t_proc_start - rclcpp::Time(msg->header.stamp)).seconds();
 
@@ -439,56 +362,125 @@ private:
     const double pnp_max_depth = enable_pnp_health_gate_ ? pnp_max_depth_m_         : 1.0e6;
 
     std::vector<ArmorDetection> armors;
-    bool first_passing_logged = false;
+    bool det_logged = false;   // detection-side debug populated for this frame?
+    bool pnp_logged = false;   // PnP-side debug populated for this frame?
     for (const auto & det : msg->detections) {
       const std::string cid = std::to_string(det.class_id);
-      if (target_classes_.find(cid) == target_classes_.end()) continue;
-
-      if (!first_passing_logged) {
-        f.detection_present = true;
-        f.bbox_cx = det.bbox_cx; f.bbox_cy = det.bbox_cy;
-        f.bbox_w  = det.bbox_w;  f.bbox_h  = det.bbox_h;
-        f.detect_confidence = det.confidence;
-        f.class_id = cid;
+      if (target_classes_.find(cid) == target_classes_.end()) {
+        f.class_reject_count++;
+        continue;
       }
 
+      // Per-detection keypoint extraction + sanity checks. The contract from
+      // ArmorKeypoint.msg is index order TL,TR,BR,BL in image pixels.
       std::array<cv::Point2f, 4> corners;
-      bool kpts_ok = true;
+      std::array<float, 4> scores{};
+      std::array<float, 8> raw_kp{};
+      bool kpts_finite = true;
+      bool kpts_low_score = false;
+      bool kpts_out_of_image = false;
+      double sum_score = 0.0;
+      double min_score = 1.0;
       for (size_t i = 0; i < corners.size(); ++i) {
         const float x = det.keypoints_xy[2 * i + 0];
         const float y = det.keypoints_xy[2 * i + 1];
         const float score = det.keypoint_scores[i];
         const bool valid = det.keypoint_valid[i];
         corners[i] = cv::Point2f(x, y);
-        if (!valid || !std::isfinite(x) || !std::isfinite(y) ||
-            score < min_keypoint_score_) {
-          kpts_ok = false;
+        scores[i] = score;
+        raw_kp[2 * i + 0] = x;
+        raw_kp[2 * i + 1] = y;
+        sum_score += static_cast<double>(score);
+        if (score < min_score) min_score = score;
+        if (!valid || !std::isfinite(x) || !std::isfinite(y)) {
+          kpts_finite = false;
+        }
+        if (msg->image_width > 0 && msg->image_height > 0 &&
+            (x < 0.0f || y < 0.0f ||
+             x > static_cast<float>(msg->image_width) ||
+             y > static_cast<float>(msg->image_height))) {
+          kpts_out_of_image = true;
+        }
+        if (score < min_keypoint_score_) {
+          kpts_low_score = true;
         }
       }
+      const float mean_score = static_cast<float>(sum_score / 4.0);
+      const bool geom_ok =
+        kpts_finite && !kpts_out_of_image && (!enable_keypoint_geometry_check_ ||
+                        keypointGeometryOk(corners));
 
-      if (!kpts_ok) {
-        if (!first_passing_logged) {
+      // Always populate the per-frame debug fields for the FIRST detection
+      // that passed the class filter, even when we end up rejecting the
+      // measurement. /auto_aim/debug consumers can see exactly why a frame
+      // was dropped without re-running the detector.
+      auto fillFirstDet = [&]() {
+        if (det_logged) return;
+        f.detection_present = true;
+        f.bbox_cx = det.bbox_cx; f.bbox_cy = det.bbox_cy;
+        f.bbox_w  = det.bbox_w;  f.bbox_h  = det.bbox_h;
+        f.detect_confidence = det.confidence;
+        f.class_id = cid;
+        f.meas_source = auto_aim::msg::AutoAimDebug::MEAS_SOURCE_KEYPOINT;
+        f.kp_image_points = raw_kp;
+        f.kp_scores = scores;
+        f.kp_min_score = static_cast<float>(min_score);
+        f.kp_mean_score = mean_score;
+        f.kp_geometry_valid = geom_ok;
+        det_logged = true;
+      };
+
+      if (!kpts_finite || kpts_low_score || kpts_out_of_image || !geom_ok) {
+        fillFirstDet();
+        if (!pnp_logged) {
+          if (!kpts_finite) {
+            f.kp_reject_reason = auto_aim::msg::AutoAimDebug::KP_NONFINITE;
+          } else if (kpts_low_score) {
+            f.kp_reject_reason = auto_aim::msg::AutoAimDebug::KP_LOW_SCORE;
+          } else if (kpts_out_of_image) {
+            f.kp_reject_reason = auto_aim::msg::AutoAimDebug::KP_OUT_OF_IMAGE;
+          } else {
+            f.kp_reject_reason = auto_aim::msg::AutoAimDebug::KP_INVALID_GEOMETRY;
+          }
           f.pnp_ok = false;
-          f.pnp_image_points = det.keypoints_xy;
+          f.pnp_image_points = raw_kp;
           f.pnp_reject_reason = (uint8_t)PnPResult::REASON_NONFINITE;
-          first_passing_logged = true;
+          pnp_logged = true;
+        }
+        if (kpts_low_score) {
+          f.kp_low_score_reject_count++;
+        } else {
+          f.kp_geometry_reject_count++;
         }
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
-          "Skipping class=%s: invalid/low-score YOLOv26 keypoints", cid.c_str());
+          "Skipping class=%s: kp finite=%d low_score=%d out_of_image=%d geom_ok=%d min=%.2f mean=%.2f",
+          cid.c_str(), kpts_finite ? 1 : 0, kpts_low_score ? 1 : 0,
+          kpts_out_of_image ? 1 : 0,
+          geom_ok ? 1 : 0, min_score, mean_score);
         continue;
       }
 
+      // The keypoints passed every per-detection gate; record them as the
+      // current "best" debug frame and then run PnP.
+      fillFirstDet();
+
       auto pnp = pnp_.solveKeypoints(
         corners, keypoint_max_reproj_error_, enable_pnp_refine_,
-        pnp_norm_gate, pnp_min_depth, pnp_max_depth);
+        pnp_norm_gate, pnp_min_depth, pnp_max_depth, pnp_force_size_mode_);
       if (!pnp.ok) {
-        if (!first_passing_logged) {
+        f.pnp_failed_count++;
+        if (!pnp_logged) {
+          f.kp_reject_reason = auto_aim::msg::AutoAimDebug::KP_OK;
           f.pnp_ok = false;
           f.pnp_reproj_err = (float)pnp.reproj_err;
           f.pnp_reproj_err_norm = (float)pnp.reproj_err_norm;
+          f.pnp_is_large = pnp.is_large;
+          f.pnp_small_reproj_err = (float)pnp.small_reproj_err;
+          f.pnp_large_reproj_err = (float)pnp.large_reproj_err;
+          f.pnp_size_margin = (float)pnp.size_margin;
           f.pnp_image_points = pnp.image_points;
           f.pnp_reject_reason = (uint8_t)pnp.reject_reason;
-          first_passing_logged = true;
+          pnp_logged = true;
         }
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
           "Keypoint PnP FAILED reason=%u class=%s reproj=%.2f reproj_norm=%.3f",
@@ -503,29 +495,21 @@ private:
       tf2::Vector3 p_cam(pnp.tvec.at<double>(0), pnp.tvec.at<double>(1),
                          pnp.tvec.at<double>(2));
 
-      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+      RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 1000,
         "Keypoint PnP OK: cam=(%.2f,%.2f,%.2f) large=%d reproj=%.2f",
         p_cam.x(), p_cam.y(), p_cam.z(), pnp.is_large, pnp.reproj_err);
-      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+      RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 1000,
         "Odom: pos=(%.2f,%.2f,%.2f) yaw=%.2f", td.x, td.y, td.z, td.yaw);
 
-      if (std::abs(td.z) > cfg_.max_armor_z) {
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
-          "REJECTED: z=%.2f exceeds max_armor_z=%.1f", td.z, cfg_.max_armor_z);
-        continue;
-      }
-      if (std::hypot(td.x, td.y) > cfg_.max_armor_dist) {
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
-          "REJECTED: range=%.2f exceeds max_armor_dist=%.1f",
-          std::hypot(td.x, td.y), cfg_.max_armor_dist);
-        continue;
-      }
-
-      if (!first_passing_logged) {
+      if (!pnp_logged) {
+        f.kp_reject_reason = auto_aim::msg::AutoAimDebug::KP_OK;
         f.pnp_ok = true;
         f.pnp_is_large = pnp.is_large;
         f.pnp_reproj_err = (float)pnp.reproj_err;
         f.pnp_reproj_err_norm = (float)pnp.reproj_err_norm;
+        f.pnp_small_reproj_err = (float)pnp.small_reproj_err;
+        f.pnp_large_reproj_err = (float)pnp.large_reproj_err;
+        f.pnp_size_margin = (float)pnp.size_margin;
         f.pnp_image_points = pnp.image_points;
         f.pnp_reject_reason = (uint8_t)pnp.reject_reason;
         f.pnp_tvec_x = (float)p_cam.x();
@@ -535,7 +519,21 @@ private:
         f.odom_y = (float)td.y;
         f.odom_z = (float)td.z;
         f.odom_yaw = (float)td.yaw;
-        first_passing_logged = true;
+        pnp_logged = true;
+      }
+
+      if (std::abs(td.z) > cfg_.max_armor_z) {
+        f.pose_z_reject_count++;
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+          "REJECTED: z=%.2f exceeds max_armor_z=%.1f", td.z, cfg_.max_armor_z);
+        continue;
+      }
+      if (std::hypot(td.x, td.y) > cfg_.max_armor_dist) {
+        f.pose_range_reject_count++;
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+          "REJECTED: range=%.2f exceeds max_armor_dist=%.1f",
+          std::hypot(td.x, td.y), cfg_.max_armor_dist);
+        continue;
       }
 
       ArmorDetection a;
@@ -545,6 +543,7 @@ private:
       a.pnp_reproj_err_norm = pnp.reproj_err_norm;
       armors.push_back(std::move(a));
     }
+    f.armors_passed_to_tracker_count = static_cast<uint32_t>(armors.size());
 
     finalizeFrame(msg->header, f, armors, dt, t_proc_start);
   }
@@ -556,7 +555,7 @@ private:
     double dt,
     const rclcpp::Time & t_proc_start)
   {
-    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+    RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 1000,
       "Passing %zu armors to tracker (state=%d)", armors.size(), (int)tracker_->state());
 
     // update tracker. now_s is wall-clock seconds, used for measurement-age
@@ -571,6 +570,9 @@ private:
       for (int i = 0; i < 9; ++i) f.ekf_state[i] = (float)xs(i);
       f.tracker_state = (uint8_t)tracker_->state();
       f.tracker_target_id = tracker_->targetId();
+      f.tracker_assigned_count = tracker_->lastAssignedCount();
+      f.tracker_association_reject_count = tracker_->lastAssociationRejectCount();
+      f.tracker_miss_reason = tracker_->lastTrackerMissReason();
       f.ekf_innovation_norm     = (float)tracker_->lastInnovationNorm();
       f.ekf_innovation_pos_norm = (float)tracker_->lastInnovationPosNorm();
       f.ekf_innovation_yaw_abs  = (float)tracker_->lastInnovationYawAbs();
@@ -587,6 +589,10 @@ private:
       f.ekf_miss_count  = tracker_->consecutiveMissCount();
       f.ekf_measurement_age_s = (float)tracker_->measurementAgeSeconds(now_s_wall);
       f.ekf_measurement_quality = (uint8_t)tracker_->lastMeasurementQuality();
+      f.best_match_mahalanobis = (float)tracker_->lastBestMatchMahalanobis();
+      f.best_match_position_diff = (float)tracker_->lastBestMatchPositionDiff();
+      f.best_match_yaw_diff = (float)tracker_->lastBestMatchYawDiff();
+      f.match_reject_reason = tracker_->lastMatchRejectReason();
     }
 
     // ---- Prediction-lead composition ----
@@ -684,7 +690,9 @@ private:
 
     // publish outputs.
     publishCommand(header, aim, aim_cam_total_angle, f);
-    publishMarkers(header, aim);
+    if (publish_markers_enabled_) {
+      publishMarkers(header, aim);
+    }
 
     // latency: process end and publish stamp.
     rclcpp::Time t_proc_end = this->now();
@@ -962,6 +970,7 @@ private:
   double latency_ema_alpha_      = 0.10;
   double latency_estimate_s_     = 0.0;
   bool   latency_estimate_initialized_ = false;
+  bool   publish_markers_enabled_ = true;
 
   // P3 EMA delay compensation
   bool   enable_ema_delay_compensation_ = false;
@@ -972,12 +981,13 @@ private:
   double pnp_max_reproj_err_norm_  = 0.10;
   double pnp_min_depth_m_          = 0.10;
   double pnp_max_depth_m_          = 12.0;
+  PnPSolver::ArmorSizeMode pnp_force_size_mode_ = PnPSolver::ArmorSizeMode::AUTO;
 
-  // YOLOv26-pose keypoint input
-  bool use_keypoints_ = false;
+  // YOLO-pose keypoint input
   std::string keypoint_topic_ = "/detector/armors_keypoints";
-  double min_keypoint_score_ = 0.05;
+  double min_keypoint_score_ = 0.30;
   double keypoint_max_reproj_error_ = 15.0;
+  bool   enable_keypoint_geometry_check_ = true;
 
   std::unique_ptr<FireGate> fire_gate_;
   double last_aim_yaw_ = 0, last_aim_pitch_ = 0;   // camera-frame ballistic command angles
@@ -986,7 +996,6 @@ private:
   bool smooth_init_ = false;
 
   rclcpp::Subscription<auto_aim::msg::ArmorKeypointArray>::SharedPtr kpt_sub_;
-  rclcpp::Subscription<vision_msgs::msg::Detection2DArray>::SharedPtr det_sub_;
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr cam_sub_;
   rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr imu_sub_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_pub_;

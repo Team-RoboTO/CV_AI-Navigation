@@ -17,7 +17,9 @@ class DebugPublisher
 {
 public:
   DebugPublisher(rclcpp::Node * node, const std::string & topic = "/auto_aim/debug",
-                 double fire_log_period_s = 10.0);
+                 double fire_log_period_s = 10.0,
+                 bool publish_enabled = true,
+                 bool histogram_log_enabled = true);
 
   // Copy fields from the DebugFrame into the ROS message and publish.
   void publish(const std_msgs::msg::Header & header, const DebugFrame & f);
@@ -27,6 +29,8 @@ private:
   rclcpp::Publisher<auto_aim::msg::AutoAimDebug>::SharedPtr pub_;
   rclcpp::Time last_log_time_;
   double fire_log_period_s_;
+  bool publish_enabled_;
+  bool histogram_log_enabled_;
   std::unordered_map<uint8_t, uint64_t> blocker_counts_;
 };
 

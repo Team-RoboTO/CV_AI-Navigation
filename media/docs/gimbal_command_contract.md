@@ -105,14 +105,13 @@ Field mapping (debug only, not consumed by firmware):
 | Topic                | Type                                  | QoS               |
 |----------------------|---------------------------------------|-------------------|
 | `/detector/armors_keypoints` | `auto_aim/ArmorKeypointArray` | `SensorDataQoS()` |
-| `/detector/armors`   | `vision_msgs/Detection2DArray` fallback | `SensorDataQoS()` |
 | `/camera_info`       | `sensor_msgs/CameraInfo`              | `SensorDataQoS()` |
 | `/micro_imu`         | `std_msgs/Float32MultiArray`          | `SensorDataQoS()` |
 
-`debug_targeting.launch.py` starts `auto_aim_node` with `use_keypoints=true`,
-so the runtime path consumes `/detector/armors_keypoints`. The bbox-only
-`/detector/armors` subscriber is used only when `use_keypoints=false` for
-detector bring-up or fallback.
+`auto_aim_node` consumes YOLO-pose keypoints exclusively. The detector
+still publishes `/detector/armors` (`vision_msgs/Detection2DArray`) for
+legacy debug consumers (e.g. RViz overlays), but `auto_aim` does not
+subscribe to it. There is no bbox fallback path.
 
 `/micro_imu` is a `Float32MultiArray` with at least two elements:
 

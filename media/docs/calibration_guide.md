@@ -8,12 +8,14 @@ nobody can debug.
 ## Order of operations
 
 1. Camera intrinsics (`/camera_info`).
-2. Gimbal sign convention (`gimbal.yaw_sign`, `gimbal.pitch_sign`).
-3. Bullet speed (`bullet_speed`).
-4. Gimbal height (`gimbal_height`).
-5. Barrel offset (`barrel_offset_x/y/z`).
-6. Static pitch test at known distances (verify the chain).
-7. Optional: bore-sight residual measurement (do NOT compensate with
+2. **YOLO-pose keypoint ordering check** (the new measurement model — silent
+   if wrong, see step 2 below).
+3. Gimbal sign convention (`gimbal.yaw_sign`, `gimbal.pitch_sign`).
+4. Bullet speed (`bullet_speed`).
+5. Gimbal height (`gimbal_height`).
+6. Barrel offset (`barrel_offset_x/y/z`).
+7. Static pitch test at known distances (verify the chain).
+8. Optional: bore-sight residual measurement (do NOT compensate with
    `pitch_offset_deg`/`yaw_offset_deg`; instead, fix the underlying input).
 
 ## 1. Camera intrinsics
@@ -30,7 +32,57 @@ error.
 
 A 1% focal-length error at 5 m of range is ~5 cm of position error.
 
-## 2. Gimbal sign convention
+## 2. YOLO-pose keypoint ordering (CRITICAL, silent if wrong)
+
+The `auto_aim` PnP path indexes each detection's four keypoints as
+TL, TR, BR, BL in image pixels and feeds them to a fixed 3D armor model
+in that exact order. **There is no runtime reordering.** If the trained
+model emits keypoints in a different convention (a real risk: many
+RoboMaster light-bar models annotate the four light-bar endpoints in
+some other order), PnP will still solve and `pnp_reproj_err_norm` may
+even look acceptable, but the recovered yaw and tvec will be silently
+wrong by up to 90°. The robot will then aim at a plausible but incorrect
+location.
+
+This must be verified once per model export, on a known frame. The
+verification procedure:
+
+1. Park the robot in front of a static armor at ~3 m.
+2. Run the bench launch:
+   ```
+   ros2 launch launch_pkg debug_targeting.launch.py publish_debug_every:=1
+   ```
+3. Record one rosbag covering at least 5 s of stable detections:
+   ```
+   ros2 bag record /detector/armors_keypoints /yolo/debug_image /auto_aim/debug
+   ```
+4. Open one frame of `/yolo/debug_image` in any image viewer.
+5. From the matching `/auto_aim/debug` message, read `kp_image_points` —
+   the eight floats are `(TLx, TLy, TRx, TRy, BRx, BRy, BLx, BLy)` in
+   the model's index order.
+6. Plot the four points on the frame, labelled `0/1/2/3`. Confirm
+   physically:
+   - Point `0` is the upper-left armor corner.
+   - Point `1` is the upper-right armor corner.
+   - Point `2` is the lower-right armor corner.
+   - Point `3` is the lower-left armor corner.
+   - Walking `0→1→2→3` is clockwise in the image (image y grows down).
+7. Confirm `/auto_aim/debug.kp_geometry_valid == true` for the same frame.
+   If it is `false`, the convex+winding sanity check rejected the quad —
+   either the keypoints are bow-tied (likely a label permutation in the
+   trained weights) or the armor is at an extreme oblique angle. Re-do
+   on a face-on frame; if `kp_geometry_valid` stays `false`, the model
+   is mis-labeled and **must be retrained or the indices remapped before
+   the keypoint path is safe to use in competition**.
+
+The convex/winding check does not catch a uniform index rotation such as
+TR,BR,BL,TL. That case is still convex and clockwise, but PnP correspondence
+is wrong. The visual `0/1/2/3` check above is mandatory.
+
+This is a one-time per-model check. It does **not** need to be redone
+between bag captures or between robots, only between model exports.
+
+## 3. Gimbal sign convention
 
 With the robot on blocks (no firing), set the target yaw to a known
 value via the operator UI and confirm the gimbal moves the expected
@@ -44,7 +96,7 @@ Same procedure for pitch with the convention "positive = nose up".
 
 The validator emits a FATAL error if either sign is not exactly +/- 1.
 
-## 3. Bullet speed
+## 4. Bullet speed
 
 Ground truth: chronograph the actual bullet at the barrel.
 
@@ -62,7 +114,7 @@ For RoboMaster 17mm referees, expected range is 15..30 m/s. Defaults of
 If the actual bullet speed is below 5 m/s or above 50 m/s, the
 `ConfigValidator` will emit an error at startup.
 
-## 4. Gimbal height
+## 5. Gimbal height
 
 Definition: the vertical distance from the floor to the camera optical
 center, with the gimbal at zero pitch.
@@ -77,7 +129,7 @@ Procedure:
 
 Typical values: 0.25–0.40 m. Outside that range the validator warns.
 
-## 5. Barrel offset
+## 6. Barrel offset
 
 Definition: the offset from the camera optical center to the barrel
 exit, in the **gimbal body frame**:
@@ -98,7 +150,7 @@ Most RoboMaster gimbals have the barrel directly below the camera by
 
 The validator warns if any component exceeds 30 cm magnitude.
 
-## 6. Static pitch test
+## 7. Static pitch test
 
 Goal: verify the chain camera → PnP → transform → ballistic produces a
 hit at a known distance.
@@ -136,9 +188,9 @@ Fix the root cause that the data points to. Do not paper over it with
 `pitch_offset_deg` or `yaw_offset_deg`. Those parameters exist for
 backwards compatibility and the validator warns on any non-zero value.
 
-## 7. Bore-sight residual (last resort)
+## 8. Bore-sight residual (last resort)
 
-If after steps 1–6 there is still a small constant angular offset that
+If after steps 1–7 there is still a small constant angular offset that
 cannot be explained, you can set `pitch_offset_deg` / `yaw_offset_deg`
 as a final compensation. The recommended workflow is:
 
@@ -147,7 +199,7 @@ as a final compensation. The recommended workflow is:
 3. Convert to degrees and put the value in the YAML.
 
 Validate that this offset stays within ~0.5° on each axis. A larger
-value indicates one of steps 1–6 is wrong.
+value indicates one of steps 1–7 is wrong.
 
 ## Reading `/auto_aim/debug` during calibration
 

@@ -7,6 +7,7 @@ from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import ComposableNodeContainer, Node
 from launch_ros.descriptions import ComposableNode
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -23,6 +24,8 @@ def generate_launch_description():
     camera_info_topic = LaunchConfiguration("camera_info_topic")
     use_fake_micro_imu = LaunchConfiguration("use_fake_micro_imu")
     detector_threshold = LaunchConfiguration("detector_threshold")
+    publish_debug_every = LaunchConfiguration("publish_debug_every")
+    detector_debug_scores = LaunchConfiguration("detector_debug_scores")
 
     realsense_node = ComposableNode(
         name="camera",
@@ -62,11 +65,12 @@ def generate_launch_description():
             "engine_path": engine_path,
             "image_topic": image_topic,
             "frame_id": "camera_color_optical_frame",
-            "threshold": detector_threshold,
+            "threshold": ParameterValue(detector_threshold, value_type=float),
             "nms_iou": 0.20,
             "keypoint_score_threshold": 0.05,
-            "publish_debug_every": 4,
-            "debug_scores": True,
+            "publish_debug_every": ParameterValue(publish_debug_every, value_type=int),
+            "debug_scores": ParameterValue(detector_debug_scores, value_type=bool),
+            "clip_keypoints_to_image": False,
         }],
         output="screen",
         emulate_tty=True,
@@ -79,10 +83,9 @@ def generate_launch_description():
         parameters=[
             params_file,
             {
-                "use_keypoints": True,
+                # Keypoint topic + thresholds come from params_file; this dict
+                # only overrides the per-launch pieces.
                 "keypoint_topic": "/detector/armors_keypoints",
-                "min_keypoint_score": 0.05,
-                "keypoint_max_reproj_error": 15.0,
                 # Debug/calibration keeps both common YOLOv26 color ids live.
                 # Tighten this to the enemy color before a match.
                 "target_classes": ["0", "2", "3"],
@@ -139,6 +142,16 @@ def generate_launch_description():
             "detector_threshold",
             default_value="0.20",
             description="YOLOv26 confidence threshold. For bench diagnosis, try 0.10 if max_conf is below 0.20.",
+        ),
+        DeclareLaunchArgument(
+            "publish_debug_every",
+            default_value="0",
+            description="Publish /yolo/debug_image every N detector frames. 0 disables the image copy.",
+        ),
+        DeclareLaunchArgument(
+            "detector_debug_scores",
+            default_value="false",
+            description="Log detector score summaries every 60 frames.",
         ),
         realsense_container,
         fake_micro_imu,

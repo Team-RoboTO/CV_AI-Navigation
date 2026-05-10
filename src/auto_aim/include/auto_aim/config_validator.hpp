@@ -38,7 +38,9 @@ struct ConfigValidator
     double pitch_sign,
     double smooth_alpha,
     double pitch_offset_deg,
-    double yaw_offset_deg);
+    double yaw_offset_deg,
+    double min_keypoint_score,
+    double keypoint_max_reproj_error);
 
   // Log every error at FATAL level and every warning at WARN level. Returns
   // ok() so the caller can chain `if (!log(validate(...))) abort();`.

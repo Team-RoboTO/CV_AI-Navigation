@@ -42,7 +42,9 @@ ValidationResult ConfigValidator::validate(
   double pitch_sign,
   double smooth_alpha,
   double pitch_offset_deg,
-  double yaw_offset_deg)
+  double yaw_offset_deg,
+  double min_keypoint_score,
+  double keypoint_max_reproj_error)
 {
   ValidationResult r;
 
@@ -164,6 +166,15 @@ ValidationResult ConfigValidator::validate(
   if (std::abs(pitch_sign - 1.0) > 1e-6 && std::abs(pitch_sign + 1.0) > 1e-6) {
     r.errors.push_back("gimbal.pitch_sign must be +1.0 or -1.0");
   }
+
+  // YOLO-pose keypoint gates. min_keypoint_score < 0.10 lets near-noise
+  // keypoints into PnP and silently degrades aim. Hard error outside [0,1].
+  checkRange("min_keypoint_score", min_keypoint_score,
+             0.10, 0.95, 0.0, 1.0, r.errors, r.warnings);
+  // keypoint_max_reproj_error is in pixels; competition values typically
+  // 5..20 px. Anything above 50 px effectively disables the gate.
+  checkRange("keypoint_max_reproj_error", keypoint_max_reproj_error,
+             3.0, 25.0, 0.0, 200.0, r.errors, r.warnings);
 
   // Bore-sight offsets: warn loudly. The brief explicitly forbids using these
   // as a substitute for calibration.

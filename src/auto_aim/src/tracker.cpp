@@ -350,6 +350,13 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
 {
   // Default to MQ_NONE; ekfUpdate paths overwrite this when they run.
   last_meas_quality_ = MQ_NONE;
+  last_best_match_mahalanobis_ = 0.0;
+  last_best_match_position_diff_ = 0.0;
+  last_best_match_yaw_diff_ = 0.0;
+  last_match_reject_reason_.clear();
+  last_tracker_miss_reason_.clear();
+  last_assigned_count_ = 0;
+  last_association_reject_count_ = 0;
 
   if (switch_cooldown_counter_ > 0) switch_cooldown_counter_--;
 
@@ -363,17 +370,23 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
     if (closest && shouldSwitch(*closest)) {
       initFromDetection(*closest);
       state_ = DETECTING;
+      last_assigned_count_ = 1;
+      last_match_reject_reason_ = "accepted_switch";
       return;
     }
   }
 
   // lost state: start from the closest detection.
   if (state_ == LOST) {
-    if (detections.empty()) return;
+    if (detections.empty()) {
+      last_tracker_miss_reason_ = "no_detections";
+      return;
+    }
     auto best = std::min_element(detections.begin(), detections.end(),
       [](const auto& a, const auto& b) { return a.range() < b.range(); });
     initFromDetection(*best);
     state_ = DETECTING;
+    last_assigned_count_ = 1;
     return;
   }
 
@@ -387,16 +400,33 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
   bool matched = false;
   ArmorDetection best_det{};
   double best_maha = cfg_.maha_threshold;
+  double best_seen_maha = 1e9;
+  bool saw_same_class = false;
 
   for (const auto & det : detections) {
     if (det.class_id != target_id_) continue;
+    saw_same_class = true;
     double pred_yaw = x_(6);
     double uw = pred_yaw + angles::shortest_angular_distance(pred_yaw, det.yaw);
     Eigen::Vector4d z(det.x, det.y, det.z, uw);
     double m = ekfMahalanobis(z);
+    if (m < best_seen_maha) {
+      best_seen_maha = m;
+      last_best_match_mahalanobis_ = m;
+    }
     if (m < best_maha) { best_maha = m; best_det = det; matched = true; }
   }
   last_mahalanobis_ = matched ? best_maha : 0.0;
+  if (!matched) {
+    if (detections.empty()) {
+      last_match_reject_reason_ = "no_detections";
+    } else if (!saw_same_class) {
+      last_match_reject_reason_ = "class_mismatch";
+    } else {
+      last_match_reject_reason_ = "mahalanobis_gate";
+      last_association_reject_count_ = 1;
+    }
+  }
 
   // update or coast.
   if (matched) {
@@ -404,6 +434,8 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
     double yd = std::abs(angles::shortest_angular_distance(x_(6), meas_yaw));
     Eigen::Vector3d dp(best_det.x, best_det.y, best_det.z);
     double pd = (pred_armor - dp).norm();
+    last_best_match_position_diff_ = pd;
+    last_best_match_yaw_diff_ = yd;
 
     // obliquity check.
     double bearing = std::atan2(best_det.y, best_det.x);
@@ -414,6 +446,8 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
       // normal EKF update.
       Eigen::Vector4d z(best_det.x, best_det.y, best_det.z, meas_yaw);
       x_ = ekfUpdate(z, best_det);
+      last_assigned_count_ = 1;
+      last_match_reject_reason_ = "accepted";
       // Quality classification: oblique view means the yaw measurement was
       // effectively ignored (R(3,3) blown up upstream), so flag DEGRADED.
       // Adaptive R inflation does not by itself trigger DEGRADED — we rely on
@@ -430,10 +464,18 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
       // face switch.
       handleArmorJump(best_det);
       last_meas_quality_ = MQ_ACCEPTED;
+      last_assigned_count_ = 1;
+      last_match_reject_reason_ = "accepted_face_jump";
     } else {
       // measurement available but failed the gate (e.g. too far, or yaw jump
       // with oblique view that we don't trust as a face switch).
       last_meas_quality_ = MQ_REJECTED;
+      last_association_reject_count_ = 1;
+      if (pd >= cfg_.max_match_dist) {
+        last_match_reject_reason_ = "position_gate";
+      } else {
+        last_match_reject_reason_ = "yaw_jump_gate";
+      }
       matched = false;
     }
   }
@@ -467,6 +509,12 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
   } else if (state_ == TEMP_LOST) {
     if (matched) { state_ = TRACKING; lost_count_ = 0; }
     else if (++lost_count_ > lost_thresh_) { state_ = LOST; }
+  }
+
+  if (!matched && last_tracker_miss_reason_.empty()) {
+    last_tracker_miss_reason_ = last_match_reject_reason_.empty()
+      ? "unmatched"
+      : last_match_reject_reason_;
   }
 
   // Track-quality counters and last-match timestamp. now_s == 0.0 means the

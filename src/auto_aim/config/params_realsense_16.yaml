@@ -11,10 +11,32 @@ auto_aim:
   ros__parameters:
     # ------------------- Detection / tracking -------------------
     target_classes: ["0"]      # Set to this YOLOv26 model's enemy armor ids.
-    use_keypoints: true
+    # YOLO-pose keypoints are the only measurement model. The detector still
+    # publishes /detector/armors for legacy debug consumers, but auto_aim only
+    # subscribes to /detector/armors_keypoints. See docs/auto_aim_pipeline.md.
     keypoint_topic: "/detector/armors_keypoints"
-    min_keypoint_score: 0.05
+    # Reject any detection where any of the four keypoints scores below this.
+    # 0.30 is a noise-vs-signal threshold for the YOLOv26-pose model; raise
+    # toward 0.50 for cleaner static rigs, lower only after measuring the
+    # per-keypoint score distribution on a real bag.
+    min_keypoint_score: 0.30
+    # Mean PnP pixel reprojection error gate (against the keypoints
+    # themselves). Values >25 px usually indicate a label mis-correspondence
+    # or a degenerate quadrilateral.
     keypoint_max_reproj_error: 15.0
+    # Temporary diagnostic override. Keep "auto" for normal operation; force
+    # "small" or "large" only to prove whether size flips are causing pose jumps.
+    "pnp.force_armor_size": "auto"
+    enable_pnp_health_gate: false
+    pnp_max_reproj_err_norm: 0.10
+    pnp_min_depth_m: 0.10
+    pnp_max_depth_m: 12.0
+    # Convex+winding sanity check on the four keypoints. ON by default;
+    # disable only for debug rigs where you want to see how mis-ordered
+    # keypoints would behave inside PnP.
+    enable_keypoint_geometry_check: true
+    # Legacy bbox-PnP parameter, kept only because TrackerConfig still owns
+    # the field. The keypoint path does not use it.
     light_ratio: 0.85
     max_armor_distance: 8.0
     max_armor_z: 1.2
@@ -91,3 +113,10 @@ auto_aim:
     enable_pnp_refine: false
     enable_anti_gyro: false
     enable_adaptive_q: false
+    enable_adaptive_r: false
+
+    # ------------------- Debug / profiling -------------------
+    "debug.publish_enabled": true
+    "debug.histogram_log_enabled": true
+    "debug.publish_markers": true
+    "debug.fire_log_period_s": 10.0

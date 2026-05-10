@@ -27,26 +27,37 @@ struct PnPResult
     REASON_DEPTH_TOO_FAR   = 8,
   };
 
+  // Which measurement model produced this PnP. Mirrors MEAS_SOURCE_* in
+  // msg/AutoAimDebug.msg. Only KEYPOINT is currently in use; the enum exists
+  // so a future bbox fallback would be visible in /auto_aim/debug without
+  // changing the schema again.
+  enum class Source : uint8_t {
+    NONE     = 0,
+    KEYPOINT = 1,
+  };
+
   bool   ok            = false;  // solvePnP succeeded AND every health gate passed
   bool   solver_ok     = false;  // solvePnP itself returned a valid pose
   bool   is_large      = false;  // true if the large armor model fit better
+  Source source        = Source::NONE;
   RejectReason reject_reason = REASON_OK;
   cv::Mat rvec;
   cv::Mat tvec;
   double reproj_err     = 0.0;   // mean pixel error of the chosen model
-  double reproj_err_norm = 0.0;  // reproj_err / bbox diagonal
-  // Synthetic image corners that PnP was fed (light-bar inscribed rectangle).
+  double reproj_err_norm = 0.0;  // reproj_err / keypoint AABB diagonal
+  double small_reproj_err = 0.0;
+  double large_reproj_err = 0.0;
+  double size_margin = 0.0;      // abs(small-large), pixels
+  // Image corners that PnP was fed (in TL,TR,BR,BL order).
   // x0 y0 x1 y1 x2 y2 x3 y3
   std::array<float, 8> image_points{};
 };
 
-// Converts 2D YOLO bounding boxes into 3D armor poses with PnP. Tries the
+// Converts four YOLO-pose armor corners into a 3D armor pose. Tries the
 // small and large armor models, keeps the lower reprojection error.
 //
-// This is bbox-PnP: the four image points are the corners of an inscribed
-// rectangle scaled by `light_ratio`. It is approximate by construction; the
-// reprojection error reflects how well the rectangle fits the synthetic
-// corners, not how well the rectangle fits the actual armor.
+// Keypoint order is fixed by the ArmorKeypoint.msg contract:
+//   [0]=TL, [1]=TR, [2]=BR, [3]=BL  (image pixels, x right, y down).
 class PnPSolver
 {
 public:
@@ -56,47 +67,26 @@ public:
 
   PnPSolver() = default;
 
+  enum class ArmorSizeMode : uint8_t {
+    AUTO = 0,
+    SMALL = 1,
+    LARGE = 2,
+  };
+
   // Initialize from camera intrinsics K (row-major 3x3) and distortion d.
   void init(const std::array<double, 9> & K, const std::vector<double> & dist);
 
-  // Solve PnP from a YOLO bbox.
-  //
-  //   cx, cy            - bbox center [px]
-  //   w, h              - bbox size [px]
-  //   light_ratio       - shrink factor applied to both width and height to
-  //                       approximate the light-bar inscribed rectangle
-  //   max_reproj_err    - reject the result if the mean pixel error exceeds
-  //                       this threshold (after picking the better of small/
-  //                       large armor models)
-  //   refine_lm         - run solvePnPRefineLM after IPPE for an extra LM
-  //                       iteration. Default false; P4 enables behind a flag.
-  //   require_min_size  - bbox must have width and height >= this many pixels
-  //                       to be considered (P4 hardening)
-  //   max_reproj_err_norm - reject when (reproj_err / bbox_diag) exceeds
-  //                       this. Pass 0.0 to disable the normalized gate
-  //                       (only the absolute max_reproj_err applies).
-  //   min_depth_m / max_depth_m - reject when tvec.z is outside this band.
-  //                       Pass 0.0 (min) and a large value (max) to disable.
-  PnPResult solve(double cx, double cy, double w, double h, double light_ratio,
-                  double max_reproj_err = 10.0,
-                  bool refine_lm = false,
-                  double require_min_size = 4.0,
-                  double max_reproj_err_norm = 0.0,
-                  double min_depth_m = 0.0,
-                  double max_depth_m = 1.0e6) const;
-
   // Solve PnP from four YOLO-pose armor corners in image pixels.
   //
-  // The keypoint order must be TL, TR, BR, BL. This is the preferred path for
-  // YOLOv26-pose because it uses the actual learned armor corners instead of
-  // reconstructing a synthetic rectangle from the bbox.
+  // The keypoint order must be TL, TR, BR, BL.
   PnPResult solveKeypoints(
     const std::array<cv::Point2f, 4> & corners_tl_tr_br_bl,
     double max_reproj_err = 15.0,
     bool refine_lm = false,
     double max_reproj_err_norm = 0.0,
     double min_depth_m = 0.0,
-    double max_depth_m = 1.0e6) const;
+    double max_depth_m = 1.0e6,
+    ArmorSizeMode force_size = ArmorSizeMode::AUTO) const;
 
   bool ready() const { return ready_; }
 
@@ -110,7 +100,6 @@ private:
 
   cv::Mat K_, dist_;
   std::vector<cv::Point3f> pts_small_, pts_large_;
-  std::vector<cv::Point3f> pts_small_tl_tr_br_bl_, pts_large_tl_tr_br_bl_;
   bool ready_ = false;
 };
 

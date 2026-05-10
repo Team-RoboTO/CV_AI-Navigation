@@ -37,6 +37,12 @@ MAX_DETECTIONS = 30
 PAD_VALUE = 0.447
 
 
+def _as_bool(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
 class Yolo26PoseRealSenseNode(Node):
     def __init__(self):
         super().__init__("yolo26_pose_realsense_node")
@@ -49,6 +55,7 @@ class Yolo26PoseRealSenseNode(Node):
         self.declare_parameter("keypoint_score_threshold", 0.05)
         self.declare_parameter("publish_debug_every", 0)
         self.declare_parameter("debug_scores", True)
+        self.declare_parameter("clip_keypoints_to_image", False)
         self.declare_parameter("class_names", DEFAULT_CLASS_NAMES)
         self.declare_parameter("device_id", 0)
 
@@ -61,7 +68,10 @@ class Yolo26PoseRealSenseNode(Node):
             self.get_parameter("keypoint_score_threshold").value
         )
         self.publish_debug_every = int(self.get_parameter("publish_debug_every").value)
-        self.debug_scores = bool(self.get_parameter("debug_scores").value)
+        self.debug_scores = _as_bool(self.get_parameter("debug_scores").value)
+        self.clip_keypoints_to_image = _as_bool(
+            self.get_parameter("clip_keypoints_to_image").value
+        )
         self.class_names = list(self.get_parameter("class_names").value)
         self.device_id = int(self.get_parameter("device_id").value)
 
@@ -428,8 +438,9 @@ class Yolo26PoseRealSenseNode(Node):
                 cls = int(v_classes[int(raw_i)])
                 conf = float(v_confs[int(raw_i)])
                 kp = kpts[int(raw_i)].copy()
-                kp[:, 0] = np.clip(kp[:, 0], 0.0, float(width))
-                kp[:, 1] = np.clip(kp[:, 1], 0.0, float(height))
+                if self.clip_keypoints_to_image:
+                    kp[:, 0] = np.clip(kp[:, 0], 0.0, float(width))
+                    kp[:, 1] = np.clip(kp[:, 1], 0.0, float(height))
 
                 det = Detection2D()
                 det.header = det_array.header

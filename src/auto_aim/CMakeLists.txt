@@ -38,7 +38,6 @@ add_library(${PROJECT_NAME}_component SHARED
   src/tracker.cpp
   src/config_validator.cpp
   src/debug_publisher.cpp
-  src/detection_adapter.cpp
   src/fire_gate.cpp
   src/frame_transformer.cpp
   src/auto_aim_node.cpp

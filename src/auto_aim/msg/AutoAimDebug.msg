@@ -14,12 +14,26 @@ float32 bbox_h
 float32 detect_confidence
 string  class_id
 
+# Per-frame detection/filter counters. These identify where measurements
+# disappear before the EKF sees them.
+uint32 raw_kp_detection_count
+uint32 class_reject_count
+uint32 kp_low_score_reject_count
+uint32 kp_geometry_reject_count
+uint32 pnp_failed_count
+uint32 pose_z_reject_count
+uint32 pose_range_reject_count
+uint32 armors_passed_to_tracker_count
+
 # ----- PnP -----
 bool   pnp_ok
 bool   pnp_is_large
 float32 pnp_reproj_err          # mean pixel reprojection error
-float32 pnp_reproj_err_norm     # divided by bbox diagonal
-float32[8] pnp_image_points     # 4 corners (x0 y0 x1 y1 x2 y2 x3 y3)
+float32 pnp_reproj_err_norm     # divided by the keypoint AABB diagonal
+float32 pnp_small_reproj_err
+float32 pnp_large_reproj_err
+float32 pnp_size_margin         # abs(small-large), pixels; small margin means size choice is unstable
+float32[8] pnp_image_points     # 4 corners actually fed to PnP (post reorder/check)
 float32 pnp_tvec_x
 float32 pnp_tvec_y
 float32 pnp_tvec_z
@@ -35,6 +49,30 @@ uint8 PNP_REPROJ_NORM       = 6
 uint8 PNP_DEPTH_TOO_CLOSE   = 7
 uint8 PNP_DEPTH_TOO_FAR     = 8
 
+# Which measurement model produced this frame's PnP. Operators MUST verify
+# this is MEAS_SOURCE_KEYPOINT in /auto_aim/debug; if it ever shows
+# MEAS_SOURCE_NONE, no detection passed the keypoint gate this frame.
+uint8  meas_source              # see MEAS_SOURCE_* below
+uint8 MEAS_SOURCE_NONE     = 0
+uint8 MEAS_SOURCE_KEYPOINT = 1
+
+# ----- Keypoints (YOLO-pose path) -----
+# Raw keypoints in image pixels, model-index order TL,TR,BR,BL (per
+# ArmorKeypoint.msg contract). Compare against pnp_image_points to see
+# whether the geometry sanity check reordered or rejected the quad.
+float32[8] kp_image_points
+float32[4] kp_scores            # per-keypoint detector scores
+float32 kp_min_score            # min(kp_scores)
+float32 kp_mean_score           # mean(kp_scores)
+bool   kp_geometry_valid        # winding + convexity check passed
+uint8  kp_reject_reason         # 0=OK, see KP_REJECT_* below
+
+uint8 KP_OK                = 0
+uint8 KP_NONFINITE         = 1
+uint8 KP_LOW_SCORE         = 2
+uint8 KP_INVALID_GEOMETRY  = 3
+uint8 KP_OUT_OF_IMAGE      = 4
+
 # ----- Frame transform (odom = micro reference) -----
 float32 odom_x
 float32 odom_y
@@ -44,6 +82,9 @@ float32 odom_yaw
 # ----- Tracker EKF -----
 uint8  tracker_state            # 0=LOST 1=DETECTING 2=TRACKING 3=TEMP_LOST
 string tracker_target_id
+uint32 tracker_assigned_count
+uint32 tracker_association_reject_count
+string tracker_miss_reason
 float32[9] ekf_state            # xc vxc yc vyc za vza yaw vyaw r
 float32 ekf_innovation_norm     # legacy, mixes meters and radians
 float32 ekf_innovation_pos_norm # sqrt(yx^2 + yy^2 + yz^2) [m]
@@ -59,6 +100,10 @@ uint32 ekf_match_count          # consecutive matched frames
 uint32 ekf_miss_count           # consecutive missed frames
 float32 ekf_measurement_age_s   # s since last accepted measurement
 uint8 ekf_measurement_quality   # see EKF_MQ_* below
+float32 best_match_mahalanobis
+float32 best_match_position_diff
+float32 best_match_yaw_diff
+string match_reject_reason
 
 uint8 EKF_MQ_NONE     = 0
 uint8 EKF_MQ_ACCEPTED = 1
