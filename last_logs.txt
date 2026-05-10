@@ -1,0 +1,355 @@
+[auto_aim_node-4] [INFO] [1778422723.460064332] [auto_aim]: Passing 0 armors to tracker (state=0)
+[auto_aim_node-4] [INFO] [1778422724.471865540] [auto_aim]: Passing 0 armors to tracker (state=0)
+[fake_micro_imu-2] publishing #15360: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422725.223022210] [auto_aim]: Keypoint PnP OK: cam=(0.61,0.36,2.27) large=0 reproj=0.26
+[auto_aim_node-4] [INFO] [1778422725.223143654] [auto_aim]: Odom: pos=(2.27,-0.61,-0.03) yaw=0.25
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422725.381866757] [yolo26_pose_realsense]: post_nms max_conf=0.033 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422725.512422601] [auto_aim]: Passing 0 armors to tracker (state=0)
+[auto_aim_node-4] [INFO] [1778422726.254337571] [auto_aim]: Keypoint PnP OK: cam=(0.76,0.65,1.81) large=1 reproj=0.32
+[auto_aim_node-4] [INFO] [1778422726.254535497] [auto_aim]: Odom: pos=(1.81,-0.76,-0.33) yaw=0.59
+[auto_aim_node-4] [INFO] [1778422726.528833363] [auto_aim]: Passing 3 armors to tracker (state=2)
+[fake_micro_imu-2] publishing #15480: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422727.452234460] [auto_aim]: Keypoint PnP OK: cam=(0.55,0.55,1.58) large=0 reproj=0.21
+[auto_aim_node-4] [INFO] [1778422727.452380289] [auto_aim]: Odom: pos=(1.58,-0.55,-0.23) yaw=0.34
+[auto_aim_node-4] [INFO] [1778422727.854437686] [auto_aim]: Passing 2 armors to tracker (state=2)
+[auto_aim_node-4] [INFO] [1778422728.468420222] [auto_aim]: Keypoint PnP OK: cam=(0.18,0.54,1.44) large=0 reproj=0.61
+[auto_aim_node-4] [INFO] [1778422728.468557314] [auto_aim]: Odom: pos=(1.44,-0.18,-0.22) yaw=0.85
+[auto_aim_node-4] [INFO] [1778422728.855257329] [auto_aim]: Passing 4 armors to tracker (state=3)
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422728.930607170] [yolo26_pose_realsense]: post_nms max_conf=0.525 threshold=0.200
+[fake_micro_imu-2] publishing #15600: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422729.516518866] [auto_aim]: Keypoint PnP OK: cam=(0.54,0.39,1.44) large=0 reproj=0.34
+[auto_aim_node-4] [INFO] [1778422729.516636982] [auto_aim]: Odom: pos=(1.44,-0.54,-0.07) yaw=-0.36
+[auto_aim_node-4] [INFO] [1778422729.857917607] [auto_aim]: Passing 4 armors to tracker (state=2)
+[auto_aim_node-4] [INFO] [1778422730.538002460] [auto_aim]: Keypoint PnP OK: cam=(0.21,0.55,1.42) large=0 reproj=0.83
+[auto_aim_node-4] [INFO] [1778422730.538180386] [auto_aim]: Odom: pos=(1.42,-0.21,-0.22) yaw=-0.72
+[auto_aim_node-4] [INFO] [1778422730.889918302] [auto_aim]: Passing 5 armors to tracker (state=3)
+[fake_micro_imu-2] publishing #15720: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422731.555258016] [auto_aim]: Keypoint PnP OK: cam=(0.55,0.40,1.46) large=0 reproj=0.31
+[auto_aim_node-4] [INFO] [1778422731.555375172] [auto_aim]: Odom: pos=(1.46,-0.55,-0.07) yaw=-0.36
+[auto_aim_node-4] [INFO] [1778422731.891470705] [auto_aim]: Passing 4 armors to tracker (state=2)
+[auto_aim_node-4] [INFO] [1778422731.957168816] [auto_aim]: Fire blocker histogram (last 10s): NOT_TRACKING=117(61.2565%) OFF_AXIS=74(38.7435%)
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422731.995529646] [yolo26_pose_realsense]: post_nms max_conf=0.465 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422732.564984853] [auto_aim]: Keypoint PnP OK: cam=(0.53,0.40,1.41) large=0 reproj=0.62
+[auto_aim_node-4] [INFO] [1778422732.565102777] [auto_aim]: Odom: pos=(1.41,-0.53,-0.07) yaw=-0.36
+[auto_aim_node-4] [INFO] [1778422732.907445164] [auto_aim]: Passing 4 armors to tracker (state=3)
+[fake_micro_imu-2] publishing #15840: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422733.655238048] [auto_aim]: Keypoint PnP OK: cam=(0.53,0.39,1.39) large=0 reproj=0.61
+[auto_aim_node-4] [INFO] [1778422733.655367588] [auto_aim]: Odom: pos=(1.39,-0.53,-0.06) yaw=-0.37
+[auto_aim_node-4] [INFO] [1778422733.955469950] [auto_aim]: Passing 2 armors to tracker (state=2)
+[auto_aim_node-4] [INFO] [1778422734.657772722] [auto_aim]: Keypoint PnP OK: cam=(0.24,0.57,1.46) large=0 reproj=0.54
+[auto_aim_node-4] [INFO] [1778422734.657926519] [auto_aim]: Odom: pos=(1.46,-0.24,-0.25) yaw=0.70
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422734.920721236] [yolo26_pose_realsense]: post_nms max_conf=0.626 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422734.958154677] [auto_aim]: Passing 5 armors to tracker (state=2)
+[fake_micro_imu-2] publishing #15960: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [WARN] [1778422735.460828218] [auto_aim]: REJECTED: z=1.36 exceeds max_armor_z=1.2
+[auto_aim_node-4] [INFO] [1778422735.756995224] [auto_aim]: Keypoint PnP OK: cam=(0.28,0.55,1.38) large=0 reproj=0.88
+[auto_aim_node-4] [INFO] [1778422735.757112380] [auto_aim]: Odom: pos=(1.38,-0.28,-0.23) yaw=-0.59
+[auto_aim_node-4] [INFO] [1778422735.990626906] [auto_aim]: Passing 3 armors to tracker (state=2)
+[auto_aim_node-4] [INFO] [1778422736.823076197] [auto_aim]: Keypoint PnP OK: cam=(0.33,0.55,1.38) large=0 reproj=0.79
+[auto_aim_node-4] [INFO] [1778422736.823344141] [auto_aim]: Odom: pos=(1.38,-0.33,-0.23) yaw=0.33
+[auto_aim_node-4] [INFO] [1778422736.997914371] [auto_aim]: Passing 3 armors to tracker (state=3)
+[fake_micro_imu-2] publishing #16080: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422737.829696344] [auto_aim]: Keypoint PnP OK: cam=(0.29,0.56,1.41) large=0 reproj=0.84
+[auto_aim_node-4] [INFO] [1778422737.829816636] [auto_aim]: Odom: pos=(1.41,-0.29,-0.24) yaw=-0.57
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422737.936928890] [yolo26_pose_realsense]: post_nms max_conf=0.527 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422738.056820109] [auto_aim]: Passing 3 armors to tracker (state=1)
+[auto_aim_node-4] [INFO] [1778422738.849164418] [auto_aim]: Keypoint PnP OK: cam=(0.29,0.57,1.42) large=0 reproj=0.71
+[auto_aim_node-4] [INFO] [1778422738.849271333] [auto_aim]: Odom: pos=(1.42,-0.29,-0.24) yaw=0.50
+[auto_aim_node-4] [INFO] [1778422739.094289936] [auto_aim]: Passing 4 armors to tracker (state=3)
+[fake_micro_imu-2] publishing #16200: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422739.855210147] [auto_aim]: Keypoint PnP OK: cam=(0.27,0.56,1.39) large=0 reproj=0.71
+[auto_aim_node-4] [INFO] [1778422739.856481195] [auto_aim]: Odom: pos=(1.39,-0.27,-0.24) yaw=-0.60
+[auto_aim_node-4] [INFO] [1778422740.096565050] [auto_aim]: Passing 3 armors to tracker (state=1)
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422740.923790559] [yolo26_pose_realsense]: post_nms max_conf=0.514 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422740.928319119] [auto_aim]: Keypoint PnP OK: cam=(0.32,0.58,1.42) large=0 reproj=0.82
+[auto_aim_node-4] [INFO] [1778422740.928564726] [auto_aim]: Odom: pos=(1.42,-0.32,-0.25) yaw=-0.55
+[auto_aim_node-4] [INFO] [1778422741.105382163] [auto_aim]: Passing 4 armors to tracker (state=2)
+[fake_micro_imu-2] publishing #16320: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422741.928719805] [auto_aim]: Keypoint PnP OK: cam=(0.35,0.68,1.67) large=1 reproj=0.70
+[auto_aim_node-4] [INFO] [1778422741.928846817] [auto_aim]: Odom: pos=(1.67,-0.35,-0.36) yaw=0.85
+[auto_aim_node-4] [INFO] [1778422742.005707842] [auto_aim]: Fire blocker histogram (last 10s): NOT_TRACKING=54(26.3415%) OFF_AXIS=151(73.6585%)
+[auto_aim_node-4] [INFO] [1778422742.128785049] [auto_aim]: Passing 4 armors to tracker (state=2)
+[auto_aim_node-4] [INFO] [1778422742.954445773] [auto_aim]: Keypoint PnP OK: cam=(0.33,0.62,1.58) large=1 reproj=0.80
+[auto_aim_node-4] [INFO] [1778422742.954588881] [auto_aim]: Odom: pos=(1.58,-0.33,-0.30) yaw=0.88
+[auto_aim_node-4] [INFO] [1778422743.132413229] [auto_aim]: Passing 2 armors to tracker (state=2)
+[fake_micro_imu-2] publishing #16440: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422743.957223878] [yolo26_pose_realsense]: post_nms max_conf=0.502 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422743.959467213] [auto_aim]: Keypoint PnP OK: cam=(0.32,0.64,1.71) large=1 reproj=0.72
+[auto_aim_node-4] [INFO] [1778422743.959571569] [auto_aim]: Odom: pos=(1.71,-0.32,-0.31) yaw=0.79
+[auto_aim_node-4] [INFO] [1778422744.138751736] [auto_aim]: Passing 2 armors to tracker (state=3)
+[auto_aim_node-4] [INFO] [1778422744.966478765] [auto_aim]: Keypoint PnP OK: cam=(0.22,0.50,1.32) large=0 reproj=0.73
+[auto_aim_node-4] [INFO] [1778422744.966657235] [auto_aim]: Odom: pos=(1.32,-0.22,-0.17) yaw=-0.57
+[auto_aim_node-4] [INFO] [1778422745.192605090] [auto_aim]: Passing 2 armors to tracker (state=1)
+[fake_micro_imu-2] publishing #16560: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422745.992984918] [auto_aim]: Keypoint PnP OK: cam=(0.09,0.44,1.17) large=0 reproj=1.09
+[auto_aim_node-4] [INFO] [1778422745.993122330] [auto_aim]: Odom: pos=(1.17,-0.09,-0.12) yaw=-0.41
+[auto_aim_node-4] [INFO] [1778422746.213996968] [auto_aim]: Passing 3 armors to tracker (state=3)
+[auto_aim_node-4] [INFO] [1778422746.996722445] [auto_aim]: Keypoint PnP OK: cam=(0.25,0.36,1.11) large=0 reproj=0.76
+[auto_aim_node-4] [INFO] [1778422746.996894451] [auto_aim]: Odom: pos=(1.11,-0.25,-0.04) yaw=0.57
+[fake_micro_imu-2] publishing #16680: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422747.204673859] [yolo26_pose_realsense]: post_nms max_conf=0.552 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422747.245715606] [auto_aim]: Passing 1 armors to tracker (state=2)
+[auto_aim_node-4] [INFO] [1778422748.012215865] [auto_aim]: Keypoint PnP OK: cam=(0.53,0.61,1.59) large=0 reproj=0.18
+[auto_aim_node-4] [INFO] [1778422748.012414688] [auto_aim]: Odom: pos=(1.59,-0.53,-0.29) yaw=0.28
+[auto_aim_node-4] [INFO] [1778422748.295098034] [auto_aim]: Passing 3 armors to tracker (state=2)
+[auto_aim_node-4] [INFO] [1778422749.038128815] [auto_aim]: Keypoint PnP OK: cam=(0.53,0.59,1.60) large=0 reproj=0.16
+[auto_aim_node-4] [INFO] [1778422749.038241139] [auto_aim]: Odom: pos=(1.60,-0.53,-0.27) yaw=0.32
+[fake_micro_imu-2] publishing #16800: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422749.364206495] [auto_aim]: Passing 5 armors to tracker (state=2)
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422750.047127117] [yolo26_pose_realsense]: post_nms max_conf=0.543 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422750.049912774] [auto_aim]: Keypoint PnP OK: cam=(0.11,0.57,1.75) large=0 reproj=0.34
+[auto_aim_node-4] [INFO] [1778422750.050011593] [auto_aim]: Odom: pos=(1.75,-0.11,-0.25) yaw=1.05
+[auto_aim_node-4] [INFO] [1778422750.365441992] [auto_aim]: Passing 4 armors to tracker (state=2)
+[auto_aim_node-4] [INFO] [1778422751.059804544] [auto_aim]: Keypoint PnP OK: cam=(0.33,0.50,1.44) large=0 reproj=0.87
+[auto_aim_node-4] [INFO] [1778422751.060065097] [auto_aim]: Odom: pos=(1.44,-0.33,-0.17) yaw=0.16
+[fake_micro_imu-2] publishing #16920: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422751.366000283] [auto_aim]: Passing 3 armors to tracker (state=3)
+[auto_aim_node-4] [INFO] [1778422752.041532224] [auto_aim]: Fire blocker histogram (last 10s): OFF_AXIS=165(82.5%) NOT_TRACKING=35(17.5%)
+[auto_aim_node-4] [INFO] [1778422752.099362822] [auto_aim]: Keypoint PnP OK: cam=(0.28,0.50,1.40) large=0 reproj=0.73
+[auto_aim_node-4] [INFO] [1778422752.099508906] [auto_aim]: Odom: pos=(1.40,-0.28,-0.17) yaw=-0.42
+[auto_aim_node-4] [INFO] [1778422752.407206453] [auto_aim]: Passing 2 armors to tracker (state=3)
+[auto_aim_node-4] [WARN] [1778422752.463100894] [auto_aim]: REJECTED: z=2.13 exceeds max_armor_z=1.2
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422752.732744948] [yolo26_pose_realsense]: post_nms max_conf=0.479 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422753.121151897] [auto_aim]: Keypoint PnP OK: cam=(0.35,0.62,1.74) large=1 reproj=0.69
+[auto_aim_node-4] [INFO] [1778422753.121268445] [auto_aim]: Odom: pos=(1.74,-0.35,-0.29) yaw=0.73
+[fake_micro_imu-2] publishing #17040: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422753.428437462] [auto_aim]: Passing 3 armors to tracker (state=1)
+[auto_aim_node-4] [INFO] [1778422754.148349431] [auto_aim]: Keypoint PnP OK: cam=(0.34,0.61,1.74) large=1 reproj=0.72
+[auto_aim_node-4] [INFO] [1778422754.148500732] [auto_aim]: Odom: pos=(1.74,-0.34,-0.29) yaw=0.77
+[auto_aim_node-4] [INFO] [1778422754.445179850] [auto_aim]: Passing 4 armors to tracker (state=3)
+[auto_aim_node-4] [INFO] [1778422755.177513140] [auto_aim]: Keypoint PnP OK: cam=(0.30,0.50,1.42) large=0 reproj=0.61
+[auto_aim_node-4] [INFO] [1778422755.177668665] [auto_aim]: Odom: pos=(1.42,-0.30,-0.18) yaw=-0.51
+[fake_micro_imu-2] publishing #17160: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422755.329817032] [yolo26_pose_realsense]: post_nms max_conf=0.545 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422755.481014554] [auto_aim]: Passing 3 armors to tracker (state=2)
+[auto_aim_node-4] [INFO] [1778422756.195193157] [auto_aim]: Keypoint PnP OK: cam=(0.30,0.50,1.42) large=0 reproj=0.75
+[auto_aim_node-4] [INFO] [1778422756.195320457] [auto_aim]: Odom: pos=(1.42,-0.30,-0.18) yaw=-0.47
+[auto_aim_node-4] [INFO] [1778422756.494800015] [auto_aim]: Passing 4 armors to tracker (state=3)
+[fake_micro_imu-2] publishing #17280: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422757.264626332] [auto_aim]: Keypoint PnP OK: cam=(0.38,0.59,1.64) large=1 reproj=0.72
+[auto_aim_node-4] [INFO] [1778422757.264774561] [auto_aim]: Odom: pos=(1.64,-0.38,-0.26) yaw=0.72
+[auto_aim_node-4] [INFO] [1778422757.531829413] [auto_aim]: Passing 2 armors to tracker (state=1)
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422758.296544592] [yolo26_pose_realsense]: post_nms max_conf=0.496 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422758.302192290] [auto_aim]: Keypoint PnP OK: cam=(0.34,0.52,1.44) large=0 reproj=0.67
+[auto_aim_node-4] [INFO] [1778422758.302329159] [auto_aim]: Odom: pos=(1.44,-0.34,-0.19) yaw=-0.39
+[auto_aim_node-4] [INFO] [1778422758.543120908] [auto_aim]: Passing 3 armors to tracker (state=3)
+[fake_micro_imu-2] publishing #17400: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422759.499396453] [auto_aim]: Keypoint PnP OK: cam=(0.52,0.51,1.54) large=0 reproj=0.37
+[auto_aim_node-4] [INFO] [1778422759.499544010] [auto_aim]: Odom: pos=(1.54,-0.52,-0.18) yaw=0.28
+[auto_aim_node-4] [INFO] [1778422759.545842115] [auto_aim]: Passing 3 armors to tracker (state=3)
+[auto_aim_node-4] [INFO] [1778422760.500165791] [auto_aim]: Keypoint PnP OK: cam=(0.50,0.51,1.53) large=0 reproj=0.24
+[auto_aim_node-4] [INFO] [1778422760.500313476] [auto_aim]: Odom: pos=(1.53,-0.50,-0.19) yaw=0.12
+[auto_aim_node-4] [INFO] [1778422760.574937502] [auto_aim]: Passing 4 armors to tracker (state=1)
+[fake_micro_imu-2] publishing #17520: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422761.527410111] [auto_aim]: Keypoint PnP OK: cam=(0.48,0.52,1.52) large=0 reproj=0.98
+[auto_aim_node-4] [INFO] [1778422761.527527395] [auto_aim]: Odom: pos=(1.52,-0.48,-0.20) yaw=-0.13
+[auto_aim_node-4] [INFO] [1778422761.577551570] [auto_aim]: Passing 3 armors to tracker (state=2)
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422761.670794169] [yolo26_pose_realsense]: post_nms max_conf=0.578 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422762.062223613] [auto_aim]: Fire blocker histogram (last 10s): OFF_AXIS=138(66.6667%) NOT_TRACKING=69(33.3333%)
+[auto_aim_node-4] [INFO] [1778422762.549328630] [auto_aim]: Keypoint PnP OK: cam=(0.48,0.53,1.53) large=0 reproj=0.21
+[auto_aim_node-4] [INFO] [1778422762.549459354] [auto_aim]: Odom: pos=(1.53,-0.48,-0.20) yaw=0.03
+[auto_aim_node-4] [INFO] [1778422762.587579217] [auto_aim]: Passing 4 armors to tracker (state=2)
+[fake_micro_imu-2] publishing #17640: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422763.706264126] [auto_aim]: Keypoint PnP OK: cam=(0.55,0.46,1.46) large=0 reproj=0.52
+[auto_aim_node-4] [INFO] [1778422763.706394146] [auto_aim]: Odom: pos=(1.46,-0.55,-0.13) yaw=0.57
+[auto_aim_node-4] [INFO] [1778422763.706694476] [auto_aim]: Passing 3 armors to tracker (state=1)
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422764.742589981] [yolo26_pose_realsense]: post_nms max_conf=0.631 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422764.745593468] [auto_aim]: Keypoint PnP OK: cam=(0.55,0.46,1.47) large=0 reproj=0.40
+[auto_aim_node-4] [INFO] [1778422764.745715200] [auto_aim]: Odom: pos=(1.47,-0.55,-0.14) yaw=0.57
+[auto_aim_node-4] [INFO] [1778422764.746076620] [auto_aim]: Passing 3 armors to tracker (state=2)
+[fake_micro_imu-2] publishing #17760: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422765.778597682] [auto_aim]: Keypoint PnP OK: cam=(0.54,0.44,1.46) large=0 reproj=0.33
+[auto_aim_node-4] [INFO] [1778422765.778733335] [auto_aim]: Odom: pos=(1.46,-0.54,-0.11) yaw=0.59
+[auto_aim_node-4] [INFO] [1778422765.779052065] [auto_aim]: Passing 3 armors to tracker (state=1)
+[auto_aim_node-4] [INFO] [1778422766.831867402] [auto_aim]: Keypoint PnP OK: cam=(0.53,0.37,1.43) large=0 reproj=0.42
+[auto_aim_node-4] [INFO] [1778422766.832016879] [auto_aim]: Odom: pos=(1.43,-0.53,-0.05) yaw=-0.36
+[auto_aim_node-4] [INFO] [1778422766.832344921] [auto_aim]: Passing 3 armors to tracker (state=1)
+[fake_micro_imu-2] publishing #17880: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422767.845276948] [yolo26_pose_realsense]: post_nms max_conf=0.520 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422767.848809251] [auto_aim]: Keypoint PnP OK: cam=(0.16,0.51,1.43) large=0 reproj=0.65
+[auto_aim_node-4] [INFO] [1778422767.849029258] [auto_aim]: Odom: pos=(1.43,-0.16,-0.19) yaw=0.92
+[auto_aim_node-4] [INFO] [1778422767.849659550] [auto_aim]: Passing 3 armors to tracker (state=2)
+[auto_aim_node-4] [INFO] [1778422768.850107694] [auto_aim]: Keypoint PnP OK: cam=(0.36,0.29,1.19) large=0 reproj=0.57
+[auto_aim_node-4] [INFO] [1778422768.850287700] [auto_aim]: Odom: pos=(1.19,-0.36,0.03) yaw=0.75
+[auto_aim_node-4] [INFO] [1778422768.850946344] [auto_aim]: Passing 6 armors to tracker (state=3)
+[auto_aim_node-4] [WARN] [1778422769.012544099] [auto_aim]: REJECTED: z=2.29 exceeds max_armor_z=1.2
+[fake_micro_imu-2] publishing #18000: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422769.874172233] [auto_aim]: Keypoint PnP OK: cam=(0.27,0.37,1.15) large=0 reproj=0.84
+[auto_aim_node-4] [INFO] [1778422769.874289965] [auto_aim]: Odom: pos=(1.15,-0.27,-0.04) yaw=0.58
+[auto_aim_node-4] [INFO] [1778422769.874716890] [auto_aim]: Passing 4 armors to tracker (state=3)
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422770.394546110] [yolo26_pose_realsense]: post_nms max_conf=0.587 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422770.875884256] [auto_aim]: Keypoint PnP OK: cam=(0.12,0.60,1.74) large=0 reproj=0.43
+[auto_aim_node-4] [INFO] [1778422770.877110023] [auto_aim]: Odom: pos=(1.74,-0.12,-0.28) yaw=-1.02
+[auto_aim_node-4] [INFO] [1778422770.877736411] [auto_aim]: Passing 4 armors to tracker (state=3)
+[fake_micro_imu-2] publishing #18120: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422771.886386542] [auto_aim]: Keypoint PnP OK: cam=(0.53,0.59,1.63) large=0 reproj=0.18
+[auto_aim_node-4] [INFO] [1778422771.886516018] [auto_aim]: Odom: pos=(1.63,-0.53,-0.27) yaw=0.40
+[auto_aim_node-4] [INFO] [1778422771.886829788] [auto_aim]: Passing 3 armors to tracker (state=2)
+[auto_aim_node-4] [INFO] [1778422772.074556050] [auto_aim]: Fire blocker histogram (last 10s): NOT_TRACKING=54(26.3415%) OFF_AXIS=151(73.6585%)
+[auto_aim_node-4] [INFO] [1778422772.899956093] [auto_aim]: Keypoint PnP OK: cam=(0.52,0.55,1.59) large=0 reproj=0.15
+[auto_aim_node-4] [INFO] [1778422772.900068256] [auto_aim]: Odom: pos=(1.59,-0.52,-0.23) yaw=0.36
+[auto_aim_node-4] [INFO] [1778422772.900418412] [auto_aim]: Passing 3 armors to tracker (state=2)
+[fake_micro_imu-2] publishing #18240: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422773.198893874] [yolo26_pose_realsense]: post_nms max_conf=0.639 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422773.910911737] [auto_aim]: Keypoint PnP OK: cam=(0.25,0.47,1.36) large=0 reproj=0.90
+[auto_aim_node-4] [INFO] [1778422773.911085887] [auto_aim]: Odom: pos=(1.36,-0.25,-0.15) yaw=-0.55
+[auto_aim_node-4] [INFO] [1778422773.912772532] [auto_aim]: Passing 2 armors to tracker (state=1)
+[auto_aim_node-4] [INFO] [1778422774.938100983] [auto_aim]: Passing 0 armors to tracker (state=3)
+[fake_micro_imu-2] publishing #18360: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422775.618494581] [yolo26_pose_realsense]: post_nms max_conf=0.048 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422775.945059316] [auto_aim]: Passing 0 armors to tracker (state=0)
+[auto_aim_node-4] [INFO] [1778422776.968802213] [auto_aim]: Passing 0 armors to tracker (state=0)
+[fake_micro_imu-2] publishing #18480: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422777.973276692] [auto_aim]: Passing 0 armors to tracker (state=0)
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422778.211598155] [yolo26_pose_realsense]: post_nms max_conf=0.183 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422778.991810112] [auto_aim]: Passing 0 armors to tracker (state=0)
+[fake_micro_imu-2] publishing #18600: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422780.012040161] [auto_aim]: Passing 0 armors to tracker (state=0)
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422780.820042278] [yolo26_pose_realsense]: post_nms max_conf=0.209 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422781.026198467] [auto_aim]: Passing 0 armors to tracker (state=0)
+[fake_micro_imu-2] publishing #18720: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422782.108612020] [auto_aim]: Passing 0 armors to tracker (state=0)
+[auto_aim_node-4] [INFO] [1778422782.109533777] [auto_aim]: Fire blocker histogram (last 10s): NOT_TRACKING=173(73.617%) OFF_AXIS=62(26.383%)
+[auto_aim_node-4] [INFO] [1778422783.132648334] [auto_aim]: Passing 0 armors to tracker (state=0)
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422783.165921739] [yolo26_pose_realsense]: post_nms max_conf=0.096 threshold=0.200
+[fake_micro_imu-2] publishing #18840: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422784.157247194] [auto_aim]: Passing 0 armors to tracker (state=0)
+[auto_aim_node-4] [INFO] [1778422785.177314390] [auto_aim]: Passing 0 armors to tracker (state=0)
+[fake_micro_imu-2] publishing #18960: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422786.079215703] [yolo26_pose_realsense]: post_nms max_conf=0.130 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422786.180712355] [auto_aim]: Passing 0 armors to tracker (state=0)
+[fake_micro_imu-2] publishing #19080: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422787.223763447] [auto_aim]: Passing 0 armors to tracker (state=0)
+[auto_aim_node-4] [INFO] [1778422788.241343652] [auto_aim]: Passing 0 armors to tracker (state=0)
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422788.777977628] [yolo26_pose_realsense]: post_nms max_conf=0.133 threshold=0.200
+[fake_micro_imu-2] publishing #19200: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422789.244240961] [auto_aim]: Passing 0 armors to tracker (state=0)
+[auto_aim_node-4] [INFO] [1778422790.257462149] [auto_aim]: Passing 0 armors to tracker (state=0)
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422790.981330339] [yolo26_pose_realsense]: post_nms max_conf=0.094 threshold=0.200
+[fake_micro_imu-2] publishing #19320: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422791.257586282] [auto_aim]: Passing 0 armors to tracker (state=0)
+[auto_aim_node-4] [INFO] [1778422792.115385623] [auto_aim]: Fire blocker histogram (last 10s): NOT_TRACKING=239(100%)
+[auto_aim_node-4] [INFO] [1778422792.277331740] [auto_aim]: Passing 0 armors to tracker (state=0)
+[fake_micro_imu-2] publishing #19440: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422793.295792741] [yolo26_pose_realsense]: post_nms max_conf=0.125 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422793.296840743] [auto_aim]: Passing 0 armors to tracker (state=0)
+[auto_aim_node-4] [INFO] [1778422794.326459793] [auto_aim]: Passing 0 armors to tracker (state=0)
+[fake_micro_imu-2] publishing #19560: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422795.446279618] [auto_aim]: Passing 0 armors to tracker (state=0)
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422795.929953614] [yolo26_pose_realsense]: post_nms max_conf=0.049 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422796.513075590] [auto_aim]: Passing 0 armors to tracker (state=0)
+[fake_micro_imu-2] publishing #19680: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422797.515139400] [auto_aim]: Passing 0 armors to tracker (state=0)
+[auto_aim_node-4] [INFO] [1778422798.809730485] [auto_aim]: Passing 0 armors to tracker (state=0)
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422798.876140010] [yolo26_pose_realsense]: post_nms max_conf=0.053 threshold=0.200
+[fake_micro_imu-2] publishing #19800: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422799.815134113] [auto_aim]: Passing 0 armors to tracker (state=0)
+[auto_aim_node-4] [INFO] [1778422800.823068573] [auto_aim]: Passing 0 armors to tracker (state=0)
+[fake_micro_imu-2] publishing #19920: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422801.341249421] [yolo26_pose_realsense]: post_nms max_conf=0.011 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422801.849178520] [auto_aim]: Passing 0 armors to tracker (state=0)
+[auto_aim_node-4] [INFO] [1778422802.032314396] [auto_aim]: Keypoint PnP OK: cam=(-3.65,-1.84,6.32) large=0 reproj=0.03
+[auto_aim_node-4] [INFO] [1778422802.032443808] [auto_aim]: Odom: pos=(6.32,3.65,2.16) yaw=-0.54
+[auto_aim_node-4] [WARN] [1778422802.032473857] [auto_aim]: REJECTED: z=2.16 exceeds max_armor_z=1.2
+[auto_aim_node-4] [INFO] [1778422802.133537696] [auto_aim]: Fire blocker histogram (last 10s): NOT_TRACKING=226(100%)
+[auto_aim_node-4] [INFO] [1778422802.914786998] [auto_aim]: Passing 0 armors to tracker (state=0)
+[fake_micro_imu-2] publishing #20040: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422803.926740241] [auto_aim]: Passing 0 armors to tracker (state=0)
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422804.657636269] [yolo26_pose_realsense]: post_nms max_conf=0.009 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422804.959734918] [auto_aim]: Passing 0 armors to tracker (state=0)
+[fake_micro_imu-2] publishing #20160: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422806.049567970] [auto_aim]: Passing 0 armors to tracker (state=0)
+[auto_aim_node-4] [INFO] [1778422807.049632070] [auto_aim]: Passing 0 armors to tracker (state=0)
+[fake_micro_imu-2] publishing #20280: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422807.352075658] [yolo26_pose_realsense]: post_nms max_conf=0.100 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422807.747921242] [auto_aim]: Keypoint PnP OK: cam=(-4.64,-2.48,7.20) large=1 reproj=0.14
+[auto_aim_node-4] [INFO] [1778422807.748076031] [auto_aim]: Odom: pos=(7.20,4.64,2.80) yaw=0.57
+[auto_aim_node-4] [WARN] [1778422807.748101567] [auto_aim]: REJECTED: z=2.80 exceeds max_armor_z=1.2
+[auto_aim_node-4] [INFO] [1778422808.058714118] [auto_aim]: Passing 0 armors to tracker (state=0)
+[auto_aim_node-4] [INFO] [1778422809.082857027] [auto_aim]: Passing 0 armors to tracker (state=0)
+[fake_micro_imu-2] publishing #20400: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422810.087620795] [auto_aim]: Passing 0 armors to tracker (state=0)
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422810.325801101] [yolo26_pose_realsense]: post_nms max_conf=0.178 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422811.088295217] [auto_aim]: Passing 0 armors to tracker (state=0)
+[fake_micro_imu-2] publishing #20520: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422811.508309310] [auto_aim]: Keypoint PnP OK: cam=(-4.49,-2.40,6.96) large=1 reproj=0.07
+[auto_aim_node-4] [INFO] [1778422811.509415297] [auto_aim]: Odom: pos=(6.96,4.49,2.72) yaw=0.57
+[auto_aim_node-4] [WARN] [1778422811.510032533] [auto_aim]: REJECTED: z=2.72 exceeds max_armor_z=1.2
+[auto_aim_node-4] [INFO] [1778422812.109827964] [auto_aim]: Passing 0 armors to tracker (state=0)
+[auto_aim_node-4] [INFO] [1778422812.145132281] [auto_aim]: Fire blocker histogram (last 10s): NOT_TRACKING=212(100%)
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422812.565987840] [yolo26_pose_realsense]: post_nms max_conf=0.030 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422813.188817056] [auto_aim]: Passing 0 armors to tracker (state=0)
+[fake_micro_imu-2] publishing #20640: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422814.196572887] [auto_aim]: Passing 0 armors to tracker (state=0)
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422815.190674333] [yolo26_pose_realsense]: post_nms max_conf=0.168 threshold=0.200
+[fake_micro_imu-2] publishing #20760: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422815.225631695] [auto_aim]: Passing 0 armors to tracker (state=0)
+[auto_aim_node-4] [INFO] [1778422815.431928944] [auto_aim]: Keypoint PnP OK: cam=(-4.23,-2.25,6.54) large=1 reproj=0.04
+[auto_aim_node-4] [INFO] [1778422815.432061877] [auto_aim]: Odom: pos=(6.54,4.23,2.57) yaw=-0.55
+[auto_aim_node-4] [WARN] [1778422815.432084373] [auto_aim]: REJECTED: z=2.57 exceeds max_armor_z=1.2
+[auto_aim_node-4] [INFO] [1778422816.242458725] [auto_aim]: Passing 0 armors to tracker (state=0)
+[fake_micro_imu-2] publishing #20880: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422817.251511140] [auto_aim]: Passing 0 armors to tracker (state=0)
+[yolo26_pose_realsense_node.py-3] [INFO] [1778422817.669844348] [yolo26_pose_realsense]: post_nms max_conf=0.009 threshold=0.200
+[auto_aim_node-4] [INFO] [1778422818.255834478] [auto_aim]: Passing 0 armors to tracker (state=0)
+[fake_micro_imu-2] publishing #21000: std_msgs.msg.Float32MultiArray(layout=std_msgs.msg.MultiArrayLayout(dim=[], data_offset=0), data=[0.0, 0.0])
+[fake_micro_imu-2] 
+[auto_aim_node-4] [INFO] [1778422819.258518852] [auto_aim]: Passing 0 armors to tracker (state=0)
+^C[WARNING] [launch]: user interrupted with ctrl-c (SIGINT)
+[component_container_mt-1] [INFO] [1778422819.445062964] [rclcpp]: signal_handler(signum=2)
+[INFO] [auto_aim_node-4]: process has finished cleanly [pid 581810]
+[ERROR] [fake_micro_imu-2]: process has died [pid 581670, exit code 2, cmd 'ros2 topic pub /micro_imu std_msgs/msg/Float32MultiArray {data: [0.0, 0.0]} -r 60 --print 120'].
+[auto_aim_node-4] [INFO] [1778422819.447509793] [rclcpp]: signal_handler(signum=2)
+[component_container_mt-1] [INFO] [1778422819.469473720] [camera.camera]: Stop Sensor: RGB Camera
+[component_container_mt-1] [INFO] [1778422819.469599292] [camera.camera]: Close Sensor. 
+[INFO] [yolo26_pose_realsense_node.py-3]: process has finished cleanly [pid 581755]
+[component_container_mt-1] [INFO] [1778422820.250506887] [camera.camera]: Close Sensor - Done. 
+[INFO] [component_container_mt-1]: process has finished cleanly [pid 581668]
+admin@ubuntu:/home/roboto/workspaces/isaac_ros-dev$ ^C

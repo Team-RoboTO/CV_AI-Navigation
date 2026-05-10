@@ -1,0 +1,93 @@
+# Auto-aim parameters for the 16 Jetson + Intel RealSense D435/D435i robot.
+#
+# Use this file with the auto_aim_realsense_16.launch.py launch file. Values
+# below override the C++ defaults in TrackerConfig and the node parameters.
+#
+# Where two robots have different physical geometry, override per-robot values
+# here. Do NOT mask measurement errors with bore-sight offsets — see
+# docs/calibration_guide.md.
+
+auto_aim:
+  ros__parameters:
+    # ------------------- Detection / tracking -------------------
+    target_classes: ["0"]      # Set to this YOLOv26 model's enemy armor ids.
+    use_keypoints: true
+    keypoint_topic: "/detector/armors_keypoints"
+    min_keypoint_score: 0.05
+    keypoint_max_reproj_error: 15.0
+    light_ratio: 0.85
+    max_armor_distance: 8.0
+    max_armor_z: 1.2
+
+    # State machine
+    confirm_frames: 3
+    lost_timeout: 0.4
+
+    # EKF process noise
+    q_pos: 5.0
+    q_yaw: 10.0
+    q_r:  1.0e-6
+
+    # EKF measurement noise (grows with range)
+    r_pos_base: 0.05
+    r_pos_slope: 0.04
+    r_yaw_base: 0.05
+    r_yaw_slope: 0.005
+    max_oblique_deg: 65.0
+
+    # Velocity damping (per ref_freq frame)
+    alpha_pos: 0.90
+    alpha_yaw: 0.90
+    alpha_coast: 0.70
+
+    # Armor geometry
+    initial_radius: 0.24
+    radius_ema_alpha: 0.05
+
+    # ------------------- Ballistics / physical -------------------
+    # MEASURE bullet speed on the 16 robot. Default 25 m/s is a placeholder.
+    bullet_speed: 25.0
+    gravity: 9.8
+
+    # 16 Jetson + RealSense robot geometry. Verify with a tape measure.
+    gimbal_height: 0.325
+    barrel_offset_x: 0.0    # forward [m] (barrel ahead of camera)
+    barrel_offset_y: 0.0    # left    [m] (barrel left of camera)
+    barrel_offset_z: -0.10  # up      [m] (barrel below camera)
+
+    # ------------------- Fire gate -------------------
+    angular_window: 0.09
+    window_ref_dist: 3.0
+    min_fire_dist: 0.3
+    max_fire_dist: 8.0
+
+    # ------------------- Timing -------------------
+    time_bias: 0.05
+    ref_freq: 30.0
+
+    # ------------------- Match / association -------------------
+    max_match_dist: 0.5
+    maha_threshold: 13.3
+
+    # ------------------- Target switching -------------------
+    switch_range_ratio: 0.85
+    switch_cooldown: 10
+
+    # ------------------- Command shaping -------------------
+    cmd_smooth_alpha: 0.4
+
+    # ------------------- Gimbal sign convention -------------------
+    # Flip these to -1.0 if the microcontroller axis is inverted.
+    "gimbal.yaw_sign": 1.0
+    "gimbal.pitch_sign": 1.0
+
+    # ------------------- Bore-sight offsets (avoid using) -------------------
+    # Leave at zero. If you find yourself tuning these to "fix" pitch error,
+    # the underlying calibration is wrong instead. See docs/calibration_guide.md.
+    pitch_offset_deg: 0.0
+    yaw_offset_deg: 0.0
+
+    # ------------------- Optional flags (P4+, default off) -------------------
+    enable_pnp_refine: false
+    enable_anti_gyro: false
+    enable_adaptive_q: false

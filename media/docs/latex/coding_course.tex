@@ -1,0 +1,472 @@
+\chapter{Coding Course}
+
+\section{Goal Of This Course}
+
+This chapter teaches the minimum coding knowledge needed to read, run, and
+debug this package. It does not try to teach all of C++ or all of ROS 2. It
+teaches the ideas that appear in this repository:
+
+\begin{itemize}
+  \item source files and header files,
+  \item variables, functions, structs, and classes,
+  \item loops and conditions,
+  \item ROS 2 nodes, topics, messages, publishers, and subscribers,
+  \item CMake and package metadata,
+  \item practical debugging habits.
+\end{itemize}
+
+\section{What A Program Is}
+
+A program is a set of instructions for the computer. Source code is the human
+readable text that describes those instructions. A compiler translates C++
+source code into machine code that the computer can run.
+
+This package is a ROS 2 package named \repo. ROS 2 is a robotics framework. It
+lets separate programs communicate by sending messages on named channels called
+topics.
+
+\section{Files, Folders, And Builds}
+
+The important hand-written code is under \file{src/}. Generated files under
+\file{build/} and \file{install/} are build output. New members should usually
+read and edit \file{src/}, not generated output.
+
+\begin{longtable}{p{0.28\textwidth}p{0.62\textwidth}}
+\toprule
+Folder or file & Beginner explanation \\
+\midrule
+\file{src/src/*.cpp} & C++ implementation files. These contain function
+bodies: what the code actually does. \\
+\file{src/include/auto_aim/*.hpp} & C++ header files. These declare the
+types and functions other files can use. \\
+\file{src/msg/*.msg} & ROS message definitions. ROS generates C++ code from
+these during the build. \\
+\file{src/config/*.yaml} & Parameter values loaded at runtime. This is where
+robot-specific tuning belongs. \\
+\file{src/launch/*.py} & Launch scripts that start the node with parameters. \\
+\file{src/CMakeLists.txt} & Build instructions for CMake and colcon. \\
+\file{src/package.xml} & ROS package metadata and dependencies. \\
+\bottomrule
+\end{longtable}
+
+Typical build and run commands from the workspace root:
+
+\begin{lstlisting}
+colcon build --packages-select auto_aim
+source install/setup.bash
+ros2 launch auto_aim auto_aim_realsense_16.launch.py
+\end{lstlisting}
+
+If you edit C++ or message files, rebuild. If you only edit YAML parameters,
+you usually only need to relaunch.
+
+\section{C++ Source And Header Files}
+
+C++ projects often split code into headers and source files.
+
+\begin{itemize}
+  \item A header file, such as \file{tracker.hpp}, says what a class or
+  function looks like.
+  \item A source file, such as \file{tracker.cpp}, contains the implementation.
+\end{itemize}
+
+Example from the tracker header:
+
+\begin{lstlisting}[language=C++]
+class Tracker
+{
+public:
+  explicit Tracker(const TrackerConfig & cfg);
+  void update(const std::vector<ArmorDetection> & detections, double dt);
+  AimResult computeAim(double current_yaw, double current_pitch,
+                       double override_pred_lead_s = -1.0) const;
+};
+\end{lstlisting}
+
+This says a \code{Tracker} has a constructor, an \code{update} function, and a
+\code{computeAim} function. The detailed math lives in \file{tracker.cpp}.
+
+\section{Includes}
+
+At the top of a C++ file, \texttt{\#include} brings in declarations from another
+file or library:
+
+\begin{lstlisting}[language=C++]
+#include <rclcpp/rclcpp.hpp>
+#include "auto_aim/tracker.hpp"
+\end{lstlisting}
+
+Angle brackets usually mean an external library or system header. Quotes
+usually mean a header from this package.
+
+\section{Namespaces}
+
+The code is wrapped in:
+
+\begin{lstlisting}[language=C++]
+namespace auto_aim
+{
+  // code here
+}
+\end{lstlisting}
+
+A namespace is a named container that prevents name collisions. The class is
+\code{auto_aim::Tracker}, not just \code{Tracker}, when referred to from
+outside the namespace.
+
+\section{Variables And Types}
+
+A variable stores a value. A type tells C++ what kind of value it stores.
+
+\begin{lstlisting}[language=C++]
+double bullet_speed = 25.0;
+bool tracking = false;
+int confirm_frames = 3;
+std::string class_id = "0";
+\end{lstlisting}
+
+Common types in this repo:
+
+\begin{longtable}{p{0.24\textwidth}p{0.66\textwidth}}
+\toprule
+Type & Meaning \\
+\midrule
+\code{double} & Floating point number, used for math. \\
+\code{float} & Smaller floating point number, often used in ROS messages. \\
+\code{int} & Whole number. \\
+\code{bool} & True or false. \\
+\code{std::string} & Text. \\
+\code{std::vector<T>} & Resizable list of values of type \code{T}. \\
+\code{std::array<T,N>} & Fixed-size list with exactly \code{N} values. \\
+\code{Eigen::VectorXd} & Math vector from the Eigen library. \\
+\code{cv::Mat} & Matrix/image container from OpenCV. \\
+\bottomrule
+\end{longtable}
+
+\section{Structs}
+
+A struct groups related values under one name. For example:
+
+\begin{lstlisting}[language=C++]
+struct ArmorDetection
+{
+  double x, y, z;
+  double yaw;
+  std::string class_id;
+  double confidence;
+};
+\end{lstlisting}
+
+Instead of passing six separate values everywhere, the code passes one
+\code{ArmorDetection}.
+
+Important structs in this package:
+
+\begin{itemize}
+  \item \code{TrackerConfig}: all tracker, ballistic, and gate parameters.
+  \item \code{ArmorDetection}: one transformed detection in odom frame.
+  \item \code{AimResult}: output from the aim planner.
+  \item \code{DebugFrame}: internal per-frame debug data before publishing.
+  \item \code{PnPResult}: output from the PnP solver.
+\end{itemize}
+
+\section{Functions}
+
+A function is reusable code with a name. It may take inputs and return an
+output.
+
+\begin{lstlisting}[language=C++]
+double Tracker::targetRange() const
+{
+  return std::sqrt(x_(0)*x_(0) + x_(2)*x_(2) + x_(4)*x_(4));
+}
+\end{lstlisting}
+
+This function returns a \code{double}. The \code{const} at the end means it
+does not modify the \code{Tracker} object.
+
+\section{Classes}
+
+A class groups data and functions together. In this repo, each major pipeline
+piece is a class or stateless helper:
+
+\begin{longtable}{p{0.24\textwidth}p{0.66\textwidth}}
+\toprule
+Class or helper & Responsibility \\
+\midrule
+\code{AutoAimNode} & ROS wiring: parameters, subscriptions, callbacks,
+publishers. \\
+\code{PnPSolver} & 2D box to 3D armor pose. \\
+\code{FrameTransformer} & Camera frame to odom frame. \\
+\code{Tracker} & EKF, target association, aiming, and ballistics. \\
+\code{FireGate} & Fire/hold decision and reason. \\
+\code{DetectionAdapter} & Convert detector messages into candidates. \\
+\code{DebugPublisher} & Publish structured debug messages. \\
+\code{ConfigValidator} & Validate parameters at startup. \\
+\bottomrule
+\end{longtable}
+
+\section{Public And Private}
+
+Classes often have \code{public} and \code{private} sections.
+
+\begin{itemize}
+  \item \code{public}: other code is allowed to call these functions or read
+  these members.
+  \item \code{private}: internal implementation details. Other code should not
+  depend on them.
+\end{itemize}
+
+For example, other code can call \code{tracker_->update(...)}, but it cannot
+directly change \code{x_}, the EKF state. That keeps the tracker responsible
+for its own consistency.
+
+\section{Pointers And Unique Ownership}
+
+Some objects are stored through pointers:
+
+\begin{lstlisting}[language=C++]
+std::unique_ptr<Tracker> tracker_;
+tracker_ = std::make_unique<Tracker>(cfg);
+\end{lstlisting}
+
+A pointer stores the location of an object. \code{std::unique_ptr} means one
+owner is responsible for that object. When the owner is destroyed, the object
+is automatically cleaned up.
+
+To call a function through a pointer, use \code{->}:
+
+\begin{lstlisting}[language=C++]
+tracker_->update(armors, dt);
+\end{lstlisting}
+
+\section{References And \texorpdfstring{\code{const}}{const}}
+
+You will often see parameters like:
+
+\begin{lstlisting}[language=C++]
+void update(const std::vector<ArmorDetection> & detections, double dt);
+\end{lstlisting}
+
+\code{&} means pass by reference. The function can use the original object
+without copying the whole vector. \code{const} means the function promises not
+to modify that vector.
+
+This is common for performance and safety.
+
+\section{Conditions}
+
+\code{if} chooses between code paths:
+
+\begin{lstlisting}[language=C++]
+if (!pnp_.ready()) return;
+if (!imu_valid_) {
+  RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+    "Waiting for /micro_imu");
+  return;
+}
+\end{lstlisting}
+
+The \code{return} exits the current function early. This pattern is called a
+guard clause. It keeps the rest of the function from running when required
+inputs are missing.
+
+\section{Loops}
+
+A loop repeats work. This package often loops over detections or four armor
+faces:
+
+\begin{lstlisting}[language=C++]
+for (const auto & det : detections) {
+  // use det
+}
+\end{lstlisting}
+
+\code{const auto & det} means: for each detection, call it \code{det}, do not
+copy it, and do not modify it.
+
+\section{ROS 2 Nodes}
+
+A ROS 2 node is a running component that communicates with other nodes. The
+\code{AutoAimNode} class inherits from \code{rclcpp::Node}:
+
+\begin{lstlisting}[language=C++]
+class AutoAimNode : public rclcpp::Node
+\end{lstlisting}
+
+This gives it ROS features such as parameters, subscriptions, publishers, and
+logging.
+
+\section{Topics And Messages}
+
+A topic is a named channel. A message type defines what data is sent on that
+channel.
+
+\begin{longtable}{p{0.32\textwidth}p{0.32\textwidth}p{0.26\textwidth}}
+\toprule
+Topic & Message type & Direction \\
+\midrule
+\topic{/detector/armors} & \code{vision_msgs/Detection2DArray} & input \\
+\topic{/camera_info} & \code{sensor_msgs/CameraInfo} & input \\
+\topic{/micro_imu} & \code{std_msgs/Float32MultiArray} & input \\
+\topic{/tracker/cmd_gimbal} & \code{geometry_msgs/Twist} & output \\
+\topic{/cmd_vel_AI} & \code{geometry_msgs/Twist} & output legacy \\
+\topic{/tracker/aim_pixels} & \code{geometry_msgs/Twist} & output debug \\
+\topic{/tracker/marker} & \code{visualization_msgs/MarkerArray} & output debug \\
+\topic{/auto_aim/debug} & \code{auto_aim/AutoAimDebug} & output debug \\
+\bottomrule
+\end{longtable}
+
+\section{Subscriptions}
+
+A subscription tells ROS: when a message arrives on this topic, call this
+function.
+
+\begin{lstlisting}[language=C++]
+det_sub_ = create_subscription<vision_msgs::msg::Detection2DArray>(
+  "/detector/armors", rclcpp::SensorDataQoS(),
+  std::bind(&AutoAimNode::detectionCallback, this, std::placeholders::_1));
+\end{lstlisting}
+
+This means \code{detectionCallback} runs once for each incoming detection
+frame.
+
+\section{Publishers}
+
+A publisher sends messages:
+
+\begin{lstlisting}[language=C++]
+cmd_pub_ = create_publisher<geometry_msgs::msg::Twist>(
+  "/tracker/cmd_gimbal", rclcpp::SensorDataQoS());
+
+geometry_msgs::msg::Twist cmd;
+cmd.angular.z = yaw_target_micro;
+cmd.angular.y = pitch_target_micro;
+cmd.angular.x = fire_decision ? 1.0 : 0.0;
+cmd_pub_->publish(cmd);
+\end{lstlisting}
+
+The firmware contract depends on these exact fields. Do not move yaw, pitch,
+fire, or distance to different fields without a matching firmware change.
+
+\section{Parameters}
+
+Parameters are runtime settings. The node declares them at startup:
+
+\begin{lstlisting}[language=C++]
+cfg.bullet_speed = declare_parameter("bullet_speed", 25.0);
+\end{lstlisting}
+
+If a YAML file provides \param{bullet_speed}, ROS uses the YAML value. If not,
+the default \code{25.0} is used.
+
+Robot-specific values belong in \file{src/config/params_realsense_16.yaml} or
+\file{src/config/params_zed_64.yaml}, not hard-coded into C++.
+
+\section{Launch Files}
+
+Launch files start nodes and provide parameters. For example,
+\file{auto_aim_realsense_16.launch.py} loads
+\file{config/params_realsense_16.yaml}. Use launch files for normal robot runs
+because they keep the startup command consistent.
+
+\section{Logging}
+
+ROS logging prints useful runtime information:
+
+\begin{lstlisting}[language=C++]
+RCLCPP_INFO(get_logger(), "Auto-aim node started");
+RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "PnP FAILED");
+\end{lstlisting}
+
+Throttled logs print at most once per time window. This prevents the terminal
+from being flooded at 30 frames per second.
+
+\section{External Libraries Used Here}
+
+\begin{longtable}{p{0.22\textwidth}p{0.68\textwidth}}
+\toprule
+Library & Why this package uses it \\
+\midrule
+ROS 2 \code{rclcpp} & Nodes, parameters, publishers, subscribers, logging. \\
+OpenCV & PnP, camera matrices, Rodrigues rotations, point projection. \\
+Eigen & Linear algebra for EKF state, matrices, covariance, and Kalman math. \\
+\code{tf2} & Quaternions, vector rotations, marker orientations. \\
+\code{angles} & Correct wrap-around math for radians near $+\pi$ and $-\pi$. \\
+\bottomrule
+\end{longtable}
+
+\section{How To Read A New File}
+
+Use this routine when opening a file for the first time:
+
+\begin{enumerate}
+  \item Read the matching header first if one exists.
+  \item Identify the main data types: structs and classes.
+  \item Find the public functions. These are the file's interface.
+  \item Find where those functions are called with \code{rg "functionName"}.
+  \item Read implementation from the top-level function inward.
+  \item Track units: meters, radians, pixels, seconds.
+  \item Track frame: camera, gimbal body, or odom.
+\end{enumerate}
+
+\section{How To Make A Small Change Safely}
+
+\begin{enumerate}
+  \item State the behavior you want to change in one sentence.
+  \item Find the earliest pipeline stage responsible for that behavior.
+  \item Change only that module when possible.
+  \item Rebuild with \code{colcon build --packages-select auto_aim}.
+  \item Relaunch and record debug data.
+  \item Compare \topic{/auto_aim/debug} before and after.
+\end{enumerate}
+
+Avoid changing several unrelated parameters at once. If the behavior changes,
+you will not know which change caused it.
+
+\section{Useful Terminal Commands}
+
+\begin{longtable}{p{0.40\textwidth}p{0.50\textwidth}}
+\toprule
+Command & Purpose \\
+\midrule
+\code{rg "text" src} & Search the source tree quickly. \\
+\code{rg --files src} & List source files. \\
+\code{colcon build --packages-select auto_aim} & Build only this package. \\
+\code{source install/setup.bash} & Load the built package into the current shell. \\
+\code{ros2 topic list} & Show active ROS topics. \\
+\code{ros2 topic echo /auto_aim/debug} & Print debug messages. \\
+\code{ros2 topic hz /detector/armors} & Measure detector publish rate. \\
+\code{ros2 param list /auto_aim} & Show parameters for the node. \\
+\code{ros2 bag record ...} & Record data for offline debugging. \\
+\bottomrule
+\end{longtable}
+
+\section{Common Beginner Mistakes}
+
+\begin{itemize}
+  \item Editing generated files under \file{build/} or \file{install/}. Edit
+  \file{src/} instead.
+  \item Forgetting to rebuild after editing C++ or message files.
+  \item Forgetting to run \code{source install/setup.bash} after a build.
+  \item Mixing degrees and radians.
+  \item Mixing camera-frame and odom-frame coordinates.
+  \item Hiding calibration mistakes with \param{pitch_offset_deg} or
+  \param{yaw_offset_deg}.
+  \item Changing the \topic{/tracker/cmd_gimbal} field mapping without a
+  firmware update.
+\end{itemize}
+
+\section{First Exercises}
+
+\begin{enumerate}
+  \item Find where \param{bullet_speed} is declared in the C++ node.
+  \item Find where \topic{/tracker/cmd_gimbal} is created and where messages
+  are published on it.
+  \item Find all files that mention \code{FireGate}.
+  \item Change only a YAML value, relaunch, and confirm the parameter changed
+  with \code{ros2 param get}.
+  \item Record \topic{/auto_aim/debug} while pointing at a static target and
+  identify which fields belong to detection, PnP, EKF, aim, command, and fire
+  gate.
+\end{enumerate}

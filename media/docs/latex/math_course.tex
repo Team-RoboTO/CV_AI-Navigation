@@ -1,0 +1,623 @@
+\chapter{Mathematics Course}
+
+\section{What The Math Is For}
+
+The auto-aim system answers one question many times per second:
+
+\begin{quote}
+Given a camera image, the current gimbal yaw and pitch, and a moving target,
+what absolute yaw and pitch should the gimbal move to, and is it safe to fire?
+\end{quote}
+
+The repository solves that question as a chain of smaller math problems:
+
+\begin{enumerate}
+  \item A detector reports a 2D rectangle around an armor plate.
+  \item PnP estimates where that plate is in 3D camera coordinates.
+  \item A frame transform moves the 3D point into the robot's odom frame.
+  \item An Extended Kalman Filter estimates the enemy robot center, velocity,
+  yaw, yaw rate, and armor radius.
+  \item The aim planner predicts which of four armor faces should be hit at
+  bullet impact time.
+  \item The ballistic solver computes the pitch needed to compensate gravity.
+  \item The fire gate checks whether the command is accurate enough to shoot.
+\end{enumerate}
+
+Each step has its own units. Mixing units is one of the fastest ways to break
+this project. In this package, distances are meters unless a comment says
+millimeters, angles are radians unless a parameter name ends with
+\code{_deg}, and image coordinates are pixels.
+
+\section{Math Notation For Beginners}
+
+A scalar is one number, such as $3.0$ meters. A vector is a list of numbers,
+such as a 3D position:
+
+\[
+\vect{p} =
+\begin{bmatrix}
+x \\ y \\ z
+\end{bmatrix}.
+\]
+
+A matrix is a rectangular table of numbers. Multiplying a matrix by a vector
+can rotate, scale, or mix the vector components. A rotation matrix $R$ and a
+translation vector $\vect{t}$ transform a point from one frame to another:
+
+\[
+\vect{p}_{world} = R \vect{p}_{camera} + \vect{t}.
+\]
+
+The code often uses the same idea with quaternions instead of explicit
+rotation matrices. A quaternion is another way to store a 3D rotation. You do
+not need to manually multiply quaternions at first; you need to know that
+\code{tf2::quatRotate(q, p)} rotates point $\vect{p}$ by rotation $q$.
+
+\section{Coordinate Frames}
+
+A coordinate frame defines what the axes mean. The same physical armor can
+have different coordinates in different frames.
+
+\begin{longtable}{p{0.24\textwidth}p{0.65\textwidth}}
+\toprule
+Frame & Meaning in this repository \\
+\midrule
+Camera optical & ROS camera convention: $+Z$ forward from the camera,
+$+X$ right in the image, $+Y$ down in the image. PnP outputs points here. \\
+Gimbal body & Mechanical convention: $+X$ forward, $+Y$ left, $+Z$ up. The
+barrel offset is measured in this frame. \\
+Odom / micro reference & Fixed startup reference used by the microcontroller.
+The node publishes absolute yaw and pitch commands in this frame after sign
+conversion. \\
+\bottomrule
+\end{longtable}
+
+In \file{src/src/frame_transformer.cpp}, the current IMU yaw and pitch build a
+rotation:
+
+\[
+q_{camera\rightarrow odom} = q_{gimbal} q_{body\rightarrow camera}.
+\]
+
+Then a PnP point is transformed as:
+
+\[
+\vect{p}_{odom} =
+q_{camera\rightarrow odom} \vect{p}_{camera} +
+\begin{bmatrix}0\\0\\h_{gimbal}\end{bmatrix}.
+\]
+
+The code form is:
+
+\begin{lstlisting}[language=C++]
+tf2::Vector3 p_odom = tf2::quatRotate(rotation_, p_cam) + translation_;
+\end{lstlisting}
+
+\subsection{Yaw And Pitch}
+
+Yaw turns left/right around the vertical axis. Pitch turns up/down. The command
+published on \topic{/tracker/cmd_gimbal} is not a small change. It is an
+absolute destination:
+
+\[
+\text{command} =
+\begin{cases}
+\text{absolute yaw target in radians}\\
+\text{absolute pitch target in radians}
+\end{cases}
+\]
+
+The parameters \param{gimbal.yaw_sign} and \param{gimbal.pitch_sign} convert
+between the code's internal convention and the microcontroller's convention.
+They must be exactly $+1$ or $-1$.
+
+\section{Camera Projection}
+
+A camera maps a 3D point to a 2D pixel. Ignoring distortion for the moment:
+
+\[
+u = f_x \frac{X}{Z} + c_x,
+\qquad
+v = f_y \frac{Y}{Z} + c_y.
+\]
+
+Here $(X,Y,Z)$ is a point in camera optical coordinates, $(u,v)$ is the pixel,
+$f_x$ and $f_y$ are focal lengths in pixels, and $(c_x,c_y)$ is the optical
+center in pixels. These values come from \topic{/camera_info}.
+
+The code also uses the inverse idea for the HUD overlay. If the aim ray has a
+small yaw and pitch in the camera frame, the pixel is:
+
+\[
+u = c_x + f_x \tan(\theta_{yaw}),
+\qquad
+v = c_y - f_y \tan(\theta_{pitch}).
+\]
+
+This appears in \file{src/src/auto_aim_node.cpp} when publishing
+\topic{/tracker/aim_pixels}.
+
+\section{PnP: From 2D Rectangle To 3D Pose}
+
+PnP means ``Perspective-n-Point''. It estimates the camera-frame pose of a
+known 3D object from corresponding 3D object points and 2D image points.
+
+This repository does not get exact armor corner points from the detector. It
+gets a bounding box: center $(c_x,c_y)$, width $w$, and height $h$. The PnP
+solver builds a synthetic rectangle inside that box:
+
+\[
+x_{left} = c_x - \rho \frac{w}{2},
+\qquad
+x_{right} = c_x + \rho \frac{w}{2},
+\]
+
+\[
+y_{top} = c_y - \rho \frac{h}{2},
+\qquad
+y_{bottom} = c_y + \rho \frac{h}{2},
+\]
+
+where $\rho$ is \param{light_ratio}. The four image points are:
+
+\[
+(x_{left}, y_{bottom}),\quad
+(x_{left}, y_{top}),\quad
+(x_{right}, y_{top}),\quad
+(x_{right}, y_{bottom}).
+\]
+
+The 3D object model is a flat armor plate. The solver tries both dimensions:
+
+\begin{itemize}
+  \item small armor: $140$ mm by $125$ mm,
+  \item large armor: $235$ mm by $127$ mm.
+\end{itemize}
+
+It keeps the model with lower reprojection error. Reprojection error means:
+
+\begin{enumerate}
+  \item Estimate the pose.
+  \item Project the known 3D corners back into the image.
+  \item Measure the average pixel distance between projected corners and input
+  corners.
+\end{enumerate}
+
+The code rejects a PnP result when the mean reprojection error is too large.
+The debug topic also reports a normalized error:
+
+\[
+e_{norm} = \frac{e_{pixels}}{\sqrt{w^2+h^2}}.
+\]
+
+This makes errors easier to compare across targets of different pixel size.
+
+\section{Armor Yaw And Obliquity}
+
+The PnP solver estimates both position and orientation. Orientation can flip
+for flat rectangles because two poses can project similarly into the image.
+The frame transformer protects the tracker from a bad plate normal.
+
+Let the transformed armor center be $(x,y,z)$ in odom. The bearing from the
+robot to the armor is:
+
+\[
+\theta_{bearing} = \operatorname{atan2}(y,x).
+\]
+
+If the PnP yaw points the wrong way, the code adds $\pi$. If the yaw is still
+too far from the bearing by more than \param{max_oblique_deg}, the code clamps
+the yaw to the bearing. This means the position can still be used even when the
+plate orientation is unreliable.
+
+\section{Tracker State}
+
+The tracker models the enemy robot as a rotating body with armor plates on a
+circle around the robot center. The EKF state vector has nine values:
+
+\[
+\vect{x} =
+\begin{bmatrix}
+x_c & v_{xc} & y_c & v_{yc} & z_a & v_{za} & \psi & \dot{\psi} & r
+\end{bmatrix}^T.
+\]
+
+\begin{longtable}{p{0.15\textwidth}p{0.65\textwidth}p{0.12\textwidth}}
+\toprule
+Symbol & Meaning & Unit \\
+\midrule
+$x_c,y_c$ & enemy robot center position in odom & m \\
+$v_{xc},v_{yc}$ & enemy robot center horizontal velocity & m/s \\
+$z_a$ & armor height & m \\
+$v_{za}$ & armor vertical velocity & m/s \\
+$\psi$ & visible armor face yaw & rad \\
+$\dot{\psi}$ & armor yaw rate & rad/s \\
+$r$ & radius from enemy center to armor plate & m \\
+\bottomrule
+\end{longtable}
+
+The measurement vector is:
+
+\[
+\vect{z} =
+\begin{bmatrix}
+x_a & y_a & z_a & \psi
+\end{bmatrix}^T,
+\]
+
+where $(x_a,y_a,z_a)$ is the detected armor center in odom.
+
+\section{Measurement Model}
+
+The tracker assumes the armor is offset from the enemy center by radius $r$:
+
+\[
+x_a = x_c - r\cos\psi,
+\qquad
+y_a = y_c - r\sin\psi,
+\qquad
+z_a = z_a,
+\qquad
+\psi = \psi.
+\]
+
+In EKF notation this is:
+
+\[
+\vect{z}_{pred} = h(\vect{x}).
+\]
+
+The innovation is the difference between what was measured and what the
+current state predicted:
+
+\[
+\vect{y} = \vect{z} - h(\vect{x}).
+\]
+
+A small innovation means the new detection agrees with the tracker. A large
+innovation means the detection may be noisy, a different target, or a different
+armor face after the enemy rotated.
+
+\section{Why The Tracker Is An EKF}
+
+A normal Kalman filter works when the equations are linear. This tracker has
+$\sin\psi$ and $\cos\psi$, so the measurement model is nonlinear. An Extended
+Kalman Filter solves this by linearizing the nonlinear equation near the
+current estimate.
+
+The linearization is the Jacobian matrix $H$:
+
+\[
+H =
+\frac{\partial h}{\partial \vect{x}}.
+\]
+
+For the first two measurement rows:
+
+\[
+\frac{\partial x_a}{\partial x_c}=1,\quad
+\frac{\partial x_a}{\partial \psi}=r\sin\psi,\quad
+\frac{\partial x_a}{\partial r}=-\cos\psi,
+\]
+
+\[
+\frac{\partial y_a}{\partial y_c}=1,\quad
+\frac{\partial y_a}{\partial \psi}=-r\cos\psi,\quad
+\frac{\partial y_a}{\partial r}=-\sin\psi.
+\]
+
+These are exactly the non-zero entries built in
+\file{src/src/tracker.cpp} inside \code{Tracker::ekfUpdate}.
+
+\section{Prediction Step}
+
+Between frames, the target is predicted with a damped constant-velocity model.
+For a position and velocity pair:
+
+\[
+p_{new} = p + b v \Delta t,
+\qquad
+v_{new} = b v.
+\]
+
+The damping coefficient $b$ is computed from \param{alpha_pos},
+\param{alpha_yaw}, \param{alpha_coast}, the frame time $\Delta t$, and
+\param{ref_freq}. This keeps damping approximately consistent even if the
+detector rate changes.
+
+The covariance matrix $P$ stores uncertainty. During prediction it becomes:
+
+\[
+P_{new} = FPF^T + Q.
+\]
+
+$F$ is the Jacobian of the motion model. $Q$ is process noise. Larger
+\param{q_pos} or \param{q_yaw} makes the tracker respond faster but jitter
+more. Smaller values make it smoother but slower.
+
+\section{Update Step}
+
+When a detection is associated with the current track, the Kalman update is:
+
+\[
+S = HPH^T + R,
+\]
+
+\[
+K = PH^T S^{-1},
+\]
+
+\[
+\vect{x}_{new} = \vect{x} + K\vect{y}.
+\]
+
+$R$ is measurement noise. In this repository, $R$ grows with target distance.
+The code also increases yaw and position noise when the armor is viewed
+obliquely, because a nearly edge-on plate gives weaker orientation information.
+
+The covariance update uses Joseph form:
+
+\[
+P_{new} = (I-KH)P(I-KH)^T + KRK^T.
+\]
+
+Joseph form costs a little more computation but is more numerically stable.
+
+\section{Mahalanobis Distance}
+
+The tracker must decide whether a detection belongs to the current target.
+It uses Mahalanobis distance:
+
+\[
+d^2 = \vect{y}^T S^{-1} \vect{y}.
+\]
+
+This is better than plain Euclidean distance because it accounts for
+uncertainty. A detection far from a very uncertain prediction may still be
+reasonable. A detection close to a very certain prediction can be suspicious if
+the covariance says it should not move there.
+
+The parameter \param{maha_threshold} is the gate. If the distance is above
+this threshold, the detection is not associated with the current track.
+
+\section{Tracker State Machine}
+
+The tracker has four states:
+
+\begin{longtable}{p{0.22\textwidth}p{0.68\textwidth}}
+\toprule
+State & Meaning \\
+\midrule
+\code{LOST} & No target is trusted. The next valid detection initializes a new
+track. \\
+\code{DETECTING} & A possible target has been seen but needs consecutive matches
+before commands are trusted. \\
+\code{TRACKING} & The target is locked. The node may publish nonzero yaw/pitch
+and the fire gate may allow shooting. \\
+\code{TEMP_LOST} & The tracker had a target but missed recent detections. It
+coasts briefly before becoming \code{LOST}. \\
+\bottomrule
+\end{longtable}
+
+The purpose of this state machine is to avoid commanding the gimbal from a
+single accidental detection.
+
+\section{Armor Face Switching}
+
+When an enemy spins, the visible armor face changes. The tracker detects a
+large yaw jump. A jump near $90^\circ$ means the visible face changed to the
+alternate pair. The code swaps \code{radius_} and \code{other_radius_}, updates
+the height offset \code{dz_}, and then performs a normal EKF update from the
+new face.
+
+This is why the tracker state includes the enemy center and radius instead of
+only tracking the visible armor point. The center lets the code predict all
+four plates.
+
+\section{Aim Planning}
+
+The aim planner predicts four possible future armor faces:
+
+\[
+\psi_i(t) = \psi + \dot{\psi}t + i\frac{\pi}{2},
+\qquad i \in \{0,1,2,3\}.
+\]
+
+The enemy center is also predicted:
+
+\[
+x_c(t) = x_c + v_{xc}t,\qquad
+y_c(t) = y_c + v_{yc}t,\qquad
+z_c(t) = z_a + v_{za}t.
+\]
+
+For face $i$, the face center is:
+
+\[
+x_i = x_c(t) - r_i\cos\psi_i(t),
+\qquad
+y_i = y_c(t) - r_i\sin\psi_i(t),
+\qquad
+z_i = z_c(t) + dz_i.
+\]
+
+The planner evaluates all four faces and chooses the best one. The first pass
+uses a rough prediction time:
+
+\[
+t_{pred} = t_{bias} + \frac{1.5}{v_{bullet}},
+\]
+
+where $t_{bias}$ is the \param{time_bias} parameter, or measured latency when
+that feature is enabled. The second pass reuses the best face's computed
+bullet flight time.
+
+\section{Barrel Origin And Parallax}
+
+The aim vector starts at the barrel, not at the camera. This matters at close
+range. A $10$ cm camera-to-barrel offset at $1$ m is a large angular error.
+
+The barrel offset is measured in the gimbal body frame:
+
+\[
+\vect{o}_{barrel} =
+\begin{bmatrix}
+o_x\\o_y\\o_z
+\end{bmatrix}.
+\]
+
+The code rotates horizontal offset by current yaw:
+
+\[
+b_x = o_x\cos\theta - o_y\sin\theta,
+\qquad
+b_y = o_x\sin\theta + o_y\cos\theta,
+\qquad
+b_z = h_{gimbal} + o_z.
+\]
+
+Then the aim vector is face position minus barrel position.
+
+\section{Ballistics}
+
+Without gravity, pitch would be:
+
+\[
+\phi = \operatorname{atan2}(\Delta z, d),
+\]
+
+where $d$ is horizontal distance and $\Delta z$ is vertical target difference.
+Gravity makes the bullet drop during flight, so the barrel must aim higher.
+
+The solver iterates:
+
+\[
+v_x = v\cos\phi,
+\qquad
+t = \frac{d}{v_x},
+\]
+
+\[
+\phi = \operatorname{atan2}\left(\Delta z + \frac{1}{2}gt^2, d\right).
+\]
+
+After five iterations, it returns pitch and flight time. It rejects impossible
+geometry such as nearly vertical shots or a pitch magnitude above about
+$1.2$ radians.
+
+\section{Fire Margin}
+
+For each predicted face, the planner computes an angular window:
+
+\[
+w = w_0 \min\left(\frac{d_{ref}}{\max(R,0.5)},2.0\right).
+\]
+
+Here $w_0$ is \param{angular_window}, $d_{ref}$ is
+\param{window_ref_dist}, and $R$ is target range.
+
+The error is:
+
+\[
+e = |\operatorname{shortest\_angular\_distance}(bearing, face\_yaw)|.
+\]
+
+The margin is:
+
+\[
+margin = w - e.
+\]
+
+If the margin is positive, the selected face is aligned enough according to
+the planner. The fire gate still performs more checks before the actual fire
+flag is published.
+
+\section{Anti-Gyro Timing}
+
+When anti-gyro mode is enabled and the enemy yaw rate is high, face alignment
+timing matters. The residual is:
+
+\[
+residual = \frac{
+\operatorname{shortest\_angular\_distance}(face\_yaw,bearing)
+}{\dot{\psi}}.
+\]
+
+Its unit is seconds. A residual near zero means the bullet impact time and the
+face alignment time match. The fire gate can block shots when
+$|residual|$ is larger than \param{fire.anti_gyro_max_residual}.
+
+\section{Command Smoothing}
+
+The node smooths yaw and pitch commands using an exponential moving average.
+Pitch uses:
+
+\[
+p_{smooth} = \alpha p_{target} + (1-\alpha)p_{old}.
+\]
+
+Yaw uses the shortest angular distance so that a target crossing from
+$+\pi$ to $-\pi$ does not command a full revolution:
+
+\[
+y_{smooth} =
+normalize(y_{old} + \alpha \cdot shortest(y_{old}, y_{target})).
+\]
+
+\param{cmd_smooth_alpha}=1 means no smoothing. Smaller values smooth more but
+increase lag. The fire gate blocks shooting when smoothing lag is too large.
+
+\section{Fire Gate Logic}
+
+The fire gate is intentionally conservative. It allows fire only when all
+required checks pass:
+
+\begin{enumerate}
+  \item Tracker is in \code{TRACKING}.
+  \item Aim target is valid.
+  \item Ballistic solution is valid.
+  \item Distance is within \param{min_fire_dist} and \param{max_fire_dist}.
+  \item Optional stale-measurement and anti-gyro checks pass.
+  \item Planner margin is non-negative.
+  \item Camera-frame aim angle is inside \param{angular_window}.
+  \item Smoothed command is close enough to the unsmoothed target.
+\end{enumerate}
+
+If a margin-like check fails briefly after a shot was allowed, hysteresis can
+keep fire enabled across small angular drift. Hysteresis is dropped as soon as
+a hard check fails.
+
+\section{Debugging With The Math}
+
+When the robot misses or jitters, debug in the same order as the math pipeline:
+
+\begin{enumerate}
+  \item Detection: Are bounding boxes stable in pixels?
+  \item PnP: Is reprojection error low and depth stable?
+  \item Transform: Is odom position stable when the robot is still?
+  \item EKF: Are innovation and Mahalanobis distance reasonable?
+  \item Aim: Is the selected face stable and the predicted target plausible?
+  \item Command: Is smoothing lag large?
+  \item Fire gate: Which blocker reason dominates?
+\end{enumerate}
+
+Do not start by changing EKF noise if PnP depth is already noisy. Do not tune
+ballistics if the measured bullet speed is unknown. Fix the earliest wrong
+stage.
+
+\section{Practice Problems}
+
+\begin{enumerate}
+  \item A detector reports a box centered at $(500,300)$ with width $100$ px,
+  height $80$ px, and \param{light_ratio}=0.85. Compute the four synthetic PnP
+  image points.
+  \item A point has camera coordinates $(0.2, -0.1, 3.0)$ m. With
+  $f_x=f_y=700$, $c_x=480$, $c_y=300$, compute the projected pixel.
+  \item If \param{bullet_speed} is accidentally set too high, will long-range
+  shots tend to hit high or low? Explain using the gravity equation.
+  \item A target has $\operatorname{shortest}(bearing, face\_yaw)=0.06$ rad and
+  the scaled window is $0.05$ rad. What is the margin? Can the planner allow
+  fire?
+  \item Why is Mahalanobis distance better than plain distance for target
+  association?
+\end{enumerate}

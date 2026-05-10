@@ -30,6 +30,7 @@
   <exec_depend>isaac_ros_yolov8</exec_depend>
   <exec_depend>armor_tracker</exec_depend>
   <exec_depend>rm_trajectory</exec_depend>
+  <exec_depend>auto_aim</exec_depend>
   <exec_depend>auto_aim_targeting</exec_depend>
   <exec_depend>realsense2_camera</exec_depend>
   <exec_depend>imu_filter_madgwick</exec_depend>

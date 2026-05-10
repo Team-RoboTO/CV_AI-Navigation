@@ -39,6 +39,9 @@ src/isaac_*
 docs/superpowers/
 .devcontainer/
 .claude/
+.agents/
+.codex/
+.codex-plugins/
 compile_commands.json
 __pycache__/
 *.pyc
