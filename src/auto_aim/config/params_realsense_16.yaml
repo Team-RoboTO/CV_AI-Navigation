@@ -27,6 +27,10 @@ auto_aim:
     # Temporary diagnostic override. Keep "auto" for normal operation; force
     # "small" or "large" only to prove whether size flips are causing pose jumps.
     "pnp.force_armor_size": "auto"
+    # In auto mode, keep the previous small/large choice when reprojection
+    # errors are too close to distinguish geometry reliably. This prevents
+    # low-reprojection planar PnP scale flips from becoming 3D pose jumps.
+    "pnp.size_switch_margin_px": 0.50
     enable_pnp_health_gate: false
     pnp_max_reproj_err_norm: 0.10
     pnp_min_depth_m: 0.10
@@ -79,6 +83,9 @@ auto_aim:
 
     # ------------------- Fire gate -------------------
     angular_window: 0.09
+    # Real robot default: use camera-frame target angle as the final centering
+    # gate. For static fake-IMU video tests, override to "disabled" from launch.
+    "fire.alignment_source": "camera_angle"
     window_ref_dist: 3.0
     min_fire_dist: 0.3
     max_fire_dist: 8.0
@@ -90,6 +97,9 @@ auto_aim:
     # ------------------- Match / association -------------------
     max_match_dist: 0.5
     maha_threshold: 13.3
+    face_jump_max_match_dist_ratio: 1.5
+    face_jump_min_yaw: 0.78539816339
+    face_jump_max_yaw: 2.35619449019
 
     # ------------------- Target switching -------------------
     switch_range_ratio: 0.85
@@ -99,11 +109,15 @@ auto_aim:
 
     # ------------------- Command shaping -------------------
     cmd_smooth_alpha: 0.4
+    "cmd.temp_lost_coast_max_s": 0.08
 
     # ------------------- Gimbal sign convention -------------------
     # Flip these to -1.0 if the microcontroller axis is inverted.
     "gimbal.yaw_sign": 1.0
     "gimbal.pitch_sign": 1.0
+    # /micro_imu must be fresh because it defines the camera->odom transform
+    # and the current gimbal angles used by the fire gate.
+    "micro_imu.stale_threshold_s": 0.25
 
     # ------------------- Bore-sight offsets (avoid using) -------------------
     # Leave at zero. If you find yourself tuning these to "fix" pitch error,
@@ -122,3 +136,4 @@ auto_aim:
     "debug.histogram_log_enabled": true
     "debug.publish_markers": true
     "debug.fire_log_period_s": 10.0
+    "fire.enable_pose_gate": true

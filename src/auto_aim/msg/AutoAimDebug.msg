@@ -28,6 +28,7 @@ uint32 armors_passed_to_tracker_count
 # ----- PnP -----
 bool   pnp_ok
 bool   pnp_is_large
+bool   pnp_size_hysteresis_kept # true when auto mode kept prior size despite small reproj margin
 float32 pnp_reproj_err          # mean pixel reprojection error
 float32 pnp_reproj_err_norm     # divided by the keypoint AABB diagonal
 float32 pnp_small_reproj_err
@@ -74,6 +75,12 @@ uint8 KP_INVALID_GEOMETRY  = 3
 uint8 KP_OUT_OF_IMAGE      = 4
 
 # ----- Frame transform (odom = micro reference) -----
+string pose_source
+bool   pose_present
+bool   pose_fresh
+float32 pose_age_s
+float32 imu_yaw
+float32 imu_pitch
 float32 odom_x
 float32 odom_y
 float32 odom_z
@@ -121,6 +128,14 @@ float32 aim_target_y
 float32 aim_target_z
 float32 aim_flight_time         # seconds, ballistic
 float32 aim_pred_t              # prediction lead used by the planner
+float32 aim_rel_yaw             # current yaw error to command [rad], internal convention
+float32 aim_rel_pitch           # current pitch error to command [rad], internal convention
+float32 aim_fire_margin         # planner angular margin [rad]; negative blocks fire
+bool   aim_anti_gyro_active
+float32 aim_anti_gyro_residual  # seconds
+float32 aim_cam_yaw             # selected impact ray in camera frame [rad]
+float32 aim_cam_pitch           # selected impact ray in camera frame [rad]
+float32 aim_cam_total_angle     # sqrt(aim_cam_yaw^2 + aim_cam_pitch^2)
 
 # ----- Command publisher -----
 float32 cmd_yaw_pre_smooth      # ballistic ray (before EMA, in micro frame)
@@ -128,10 +143,19 @@ float32 cmd_pitch_pre_smooth
 float32 cmd_yaw_published       # what is on /tracker/cmd_gimbal angular.z
 float32 cmd_pitch_published     # what is on /tracker/cmd_gimbal angular.y
 bool   cmd_fire                 # what is on /tracker/cmd_gimbal angular.x
+bool   cmd_published            # false only when no safe absolute hold exists
+bool   cmd_hold_active          # true when publishing current-pose hold instead of a target
+bool   cmd_coast_active         # true when briefly commanding TEMP_LOST prediction
+bool   tracker_fresh_enough_for_command
+float32 coast_age_s             # age since last accepted measurement while coasting
 
 # ----- Fire gate (P6+ populates the reason; before P6 it stays empty) -----
 uint8  fire_blocker             # 0 = allowed, see FireBlocker enum below
+uint32 fire_blocker_mask         # bit N set means FIRE_* value N is also active
+string fire_blockers_active      # comma-separated names from fire_blocker_mask
 string fire_blocker_reason
+string fire_alignment_source     # camera_angle, relative_error, or disabled
+float32 fire_alignment_error     # angle actually used by OFF_AXIS gate [rad]
 
 # Fire blocker enumeration (mirrors FireGate::Blocker):
 uint8 FIRE_ALLOWED        = 0
@@ -144,6 +168,9 @@ uint8 FIRE_INVALID_BALLISTIC = 6
 uint8 FIRE_SMOOTHING_LAG  = 7
 uint8 FIRE_STALE_MEASUREMENT = 8
 uint8 FIRE_ANTI_GYRO_TIMING = 9
+uint8 FIRE_TEMP_LOST = 10
+uint8 FIRE_STALE_POSE = 11
+uint8 FIRE_NO_POSE_SOURCE = 12
 
 # ----- Latency (P7+) -----
 # All latencies are float64 seconds.

@@ -20,8 +20,25 @@ const char * blockerName(uint8_t b)
     case 7: return "SMOOTHING_LAG";
     case 8: return "STALE_MEASUREMENT";
     case 9: return "ANTI_GYRO_TIMING";
+    case 10: return "TEMP_LOST";
+    case 11: return "STALE_POSE";
+    case 12: return "NO_POSE_SOURCE";
     default: return "UNKNOWN";
   }
+}
+
+std::string blockerMaskNames(uint32_t mask)
+{
+  if (mask == 0) return "";
+  std::ostringstream os;
+  bool first = true;
+  for (uint8_t bit = 1; bit <= 12; ++bit) {
+    if ((mask & (1u << bit)) == 0) continue;
+    if (!first) os << ",";
+    os << blockerName(bit);
+    first = false;
+  }
+  return os.str();
 }
 }  // namespace
 
@@ -91,6 +108,7 @@ void DebugPublisher::publish(const std_msgs::msg::Header & header, const DebugFr
 
   m.pnp_ok = f.pnp_ok;
   m.pnp_is_large = f.pnp_is_large;
+  m.pnp_size_hysteresis_kept = f.pnp_size_hysteresis_kept;
   m.pnp_reproj_err = f.pnp_reproj_err;
   m.pnp_reproj_err_norm = f.pnp_reproj_err_norm;
   m.pnp_small_reproj_err = f.pnp_small_reproj_err;
@@ -110,6 +128,12 @@ void DebugPublisher::publish(const std_msgs::msg::Header & header, const DebugFr
   m.kp_geometry_valid = f.kp_geometry_valid;
   m.kp_reject_reason = f.kp_reject_reason;
 
+  m.pose_source = f.pose_source;
+  m.pose_present = f.pose_present;
+  m.pose_fresh = f.pose_fresh;
+  m.pose_age_s = f.pose_age_s;
+  m.imu_yaw = f.imu_yaw;
+  m.imu_pitch = f.imu_pitch;
   m.odom_x = f.odom_x; m.odom_y = f.odom_y; m.odom_z = f.odom_z;
   m.odom_yaw = f.odom_yaw;
 
@@ -148,15 +172,34 @@ void DebugPublisher::publish(const std_msgs::msg::Header & header, const DebugFr
   m.aim_target_z = f.aim_target_z;
   m.aim_flight_time = f.aim_flight_time;
   m.aim_pred_t = f.aim_pred_t;
+  m.aim_rel_yaw = f.aim_rel_yaw;
+  m.aim_rel_pitch = f.aim_rel_pitch;
+  m.aim_fire_margin = f.aim_fire_margin;
+  m.aim_anti_gyro_active = f.aim_anti_gyro_active;
+  m.aim_anti_gyro_residual = f.aim_anti_gyro_residual;
+  m.aim_cam_yaw = f.aim_cam_yaw;
+  m.aim_cam_pitch = f.aim_cam_pitch;
+  m.aim_cam_total_angle = f.aim_cam_total_angle;
 
   m.cmd_yaw_pre_smooth = f.cmd_yaw_pre_smooth;
   m.cmd_pitch_pre_smooth = f.cmd_pitch_pre_smooth;
   m.cmd_yaw_published = f.cmd_yaw_published;
   m.cmd_pitch_published = f.cmd_pitch_published;
   m.cmd_fire = f.cmd_fire;
+  m.cmd_published = f.cmd_published;
+  m.cmd_hold_active = f.cmd_hold_active;
+  m.cmd_coast_active = f.cmd_coast_active;
+  m.tracker_fresh_enough_for_command = f.tracker_fresh_enough_for_command;
+  m.coast_age_s = f.coast_age_s;
 
   m.fire_blocker = f.fire_blocker;
+  m.fire_blocker_mask = f.fire_blocker_mask;
+  m.fire_blockers_active = f.fire_blockers_active.empty()
+    ? blockerMaskNames(f.fire_blocker_mask)
+    : f.fire_blockers_active;
   m.fire_blocker_reason = f.fire_blocker_reason;
+  m.fire_alignment_source = f.fire_alignment_source;
+  m.fire_alignment_error = f.fire_alignment_error;
 
   m.latency_capture_to_process_s = f.latency_capture_to_process_s;
   m.latency_process_s = f.latency_process_s;

@@ -12,6 +12,75 @@ void FireGate::reset() { hysteresis_active_ = false; }
 FireGate::Decision FireGate::evaluate(const Inputs & in)
 {
   Decision d;
+  d.alignment_error = 0.0;
+
+  if (cfg_.enable_pose_gate && !in.pose_available) {
+    d.blocker_mask |= blockerBit(NO_POSE_SOURCE);
+  }
+  if (cfg_.enable_pose_gate && !in.pose_fresh) {
+    d.blocker_mask |= blockerBit(STALE_POSE);
+  }
+  if (!in.tracking) {
+    d.blocker_mask |= blockerBit(NOT_TRACKING);
+  }
+  if (in.temp_lost) {
+    d.blocker_mask |= blockerBit(TEMP_LOST);
+  }
+  if (!in.target_valid) {
+    d.blocker_mask |= blockerBit(INVALID_TARGET);
+  }
+  if (!in.ballistic_valid) {
+    d.blocker_mask |= blockerBit(INVALID_BALLISTIC);
+  }
+  if (in.distance < cfg_.min_fire_dist || in.distance > cfg_.max_fire_dist) {
+    d.blocker_mask |= blockerBit(OUT_OF_RANGE);
+  }
+  if (cfg_.enable_stale_gate && in.stale_seconds > cfg_.stale_threshold_s) {
+    d.blocker_mask |= blockerBit(STALE_MEASUREMENT);
+  }
+  if (cfg_.enable_anti_gyro_gate &&
+      std::abs(in.anti_gyro_residual) > cfg_.anti_gyro_max_residual) {
+    d.blocker_mask |= blockerBit(ANTI_GYRO_TIMING);
+  }
+
+  const bool margin_ok = in.planner_margin_ok;
+  if (!margin_ok) {
+    d.blocker_mask |= blockerBit(MARGIN_NEGATIVE);
+  }
+
+  if (cfg_.alignment_source == ALIGN_CAMERA_ANGLE) {
+    d.alignment_error = in.aim_cam_total_angle;
+  } else if (cfg_.alignment_source == ALIGN_RELATIVE_ERROR) {
+    d.alignment_error = in.relative_error_angle;
+  }
+
+  const bool alignment_gate_enabled = cfg_.alignment_source != ALIGN_DISABLED;
+  const bool off_axis =
+    alignment_gate_enabled && d.alignment_error >= cfg_.angular_window;
+  if (off_axis) {
+    d.blocker_mask |= blockerBit(OFF_AXIS);
+  }
+
+  bool smoothing_ok = true;
+  if (cfg_.enable_smoothing_gate && in.smoothing_lag_rad > cfg_.smoothing_lag_max) {
+    smoothing_ok = false;
+    d.blocker_mask |= blockerBit(SMOOTHING_LAG);
+  }
+
+  if (cfg_.enable_pose_gate) {
+    if (!in.pose_available) {
+      hysteresis_active_ = false;
+      d.blocker = NO_POSE_SOURCE;
+      d.reason = "no gimbal pose source is available";
+      return d;
+    }
+    if (!in.pose_fresh) {
+      hysteresis_active_ = false;
+      d.blocker = STALE_POSE;
+      d.reason = "gimbal pose source is stale";
+      return d;
+    }
+  }
 
   // 1) Tracker must be locked. Hysteresis cannot save us if there is no
   //    target.
@@ -19,6 +88,13 @@ FireGate::Decision FireGate::evaluate(const Inputs & in)
     hysteresis_active_ = false;
     d.blocker = NOT_TRACKING;
     d.reason = "tracker is not in TRACKING state";
+    return d;
+  }
+
+  if (in.temp_lost) {
+    hysteresis_active_ = false;
+    d.blocker = TEMP_LOST;
+    d.reason = "tracker is in TEMP_LOST prediction-only state";
     return d;
   }
 
@@ -64,21 +140,16 @@ FireGate::Decision FireGate::evaluate(const Inputs & in)
     return d;
   }
 
-  // 6) Geometry gates: planner margin AND camera-frame total angle.
-  //    These are the gates that hysteresis can paper over for a few frames.
-  bool margin_ok = in.planner_margin_ok;
-  bool off_axis  = in.aim_cam_total_angle >= cfg_.angular_window;
-
+  // 6) Geometry gates: planner margin and the configured alignment source.
+  //    camera_angle is a camera-frame centering metric. relative_error uses
+  //    current pose feedback. disabled is useful for static fake-IMU video
+  //    tests where no physical gimbal convergence can be proven.
   // 7) Smoothing-lag gate (diagnostic / opt-in, default OFF).
   //    EMA smoothing creates a near-constant phase lag against a moving
   //    target, so this gate would permanently block fire while the gimbal
   //    chases. Use it for acquisition / static QA only; in competition,
   //    leave it off and rely on geometry (margin/off-axis) + plan validity.
   //    smoothing_lag_rad is still logged on /auto_aim/debug regardless.
-  bool smoothing_ok = true;
-  if (cfg_.enable_smoothing_gate && in.smoothing_lag_rad > cfg_.smoothing_lag_max) {
-    smoothing_ok = false;
-  }
 
   // Primary path: all gates pass, fire and arm hysteresis.
   if (margin_ok && !off_axis && smoothing_ok) {
@@ -92,11 +163,12 @@ FireGate::Decision FireGate::evaluate(const Inputs & in)
   // Hysteresis path: the previous frame fired, the tracker is still locked,
   // and the angular drift is small. Keep firing through the noisy frame.
   if (hysteresis_active_) {
-    if (in.aim_cam_total_angle < cfg_.hysteresis_max_drift && smoothing_ok) {
+    if (!alignment_gate_enabled ||
+        (d.alignment_error < cfg_.hysteresis_max_drift && smoothing_ok)) {
       d.fire = true;
       d.blocker = ALLOWED;
       d.reason = "hysteresis hold (drift " +
-                 std::to_string(in.aim_cam_total_angle) + " rad)";
+                 std::to_string(d.alignment_error) + " rad)";
       return d;
     }
     // Drift outside hysteresis: drop to non-firing and fall through to the
@@ -112,7 +184,7 @@ FireGate::Decision FireGate::evaluate(const Inputs & in)
                " > " + std::to_string(cfg_.smoothing_lag_max);
   } else if (off_axis) {
     d.blocker = OFF_AXIS;
-    d.reason = "camera-frame angle " + std::to_string(in.aim_cam_total_angle) +
+    d.reason = "alignment error " + std::to_string(d.alignment_error) +
                " >= " + std::to_string(cfg_.angular_window);
   } else {
     d.blocker = MARGIN_NEGATIVE;

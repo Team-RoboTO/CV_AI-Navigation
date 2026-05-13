@@ -105,6 +105,12 @@ public:
     cfg.ref_freq         = declare_parameter("ref_freq", 30.0);
     cfg.max_match_dist   = declare_parameter("max_match_dist", 0.5);
     cfg.maha_threshold   = declare_parameter("maha_threshold", 13.3);
+    cfg.face_jump_max_match_dist_ratio =
+      declare_parameter("face_jump_max_match_dist_ratio", 1.5);
+    cfg.face_jump_min_yaw =
+      declare_parameter("face_jump_min_yaw", M_PI / 4.0);
+    cfg.face_jump_max_yaw =
+      declare_parameter("face_jump_max_yaw", 3.0 * M_PI / 4.0);
     cfg.switch_range_ratio = declare_parameter("switch_range_ratio", 0.85);
     cfg.switch_cooldown  = declare_parameter("switch_cooldown", 10);
     cfg.enable_tracking_switch =
@@ -163,6 +169,21 @@ public:
     fg_cfg.enable_stale_gate      = declare_parameter("fire.enable_stale_gate", false);
     // anti-gyro gate auto-enables when the planner is in anti-gyro mode.
     fg_cfg.enable_anti_gyro_gate  = declare_parameter("fire.enable_anti_gyro_gate", enable_anti_gyro_);
+    fg_cfg.enable_pose_gate       = declare_parameter("fire.enable_pose_gate", true);
+    fire_alignment_source_name_ =
+      declare_parameter("fire.alignment_source", std::string("camera_angle"));
+    if (fire_alignment_source_name_ == "camera_angle") {
+      fg_cfg.alignment_source = FireGate::ALIGN_CAMERA_ANGLE;
+    } else if (fire_alignment_source_name_ == "relative_error") {
+      fg_cfg.alignment_source = FireGate::ALIGN_RELATIVE_ERROR;
+    } else if (fire_alignment_source_name_ == "disabled") {
+      fg_cfg.alignment_source = FireGate::ALIGN_DISABLED;
+    } else {
+      RCLCPP_FATAL(get_logger(),
+        "Invalid fire.alignment_source='%s' (expected camera_angle|relative_error|disabled)",
+        fire_alignment_source_name_.c_str());
+      throw std::runtime_error("auto_aim: invalid fire.alignment_source");
+    }
     fire_gate_ = std::make_unique<FireGate>(fg_cfg);
 
     // target classes to track, usually "0" for blue or "3" for red.
@@ -183,6 +204,7 @@ public:
       declare_parameter("enable_keypoint_geometry_check", true);
 
     smooth_alpha_ = declare_parameter("cmd_smooth_alpha", 0.4);
+    temp_lost_coast_max_s_ = declare_parameter("cmd.temp_lost_coast_max_s", 0.08);
 
     // static bore-sight correction [deg].
     // aim the barrel at the armor center and put the HUD offsets here.
@@ -194,6 +216,8 @@ public:
     // gimbal sign corrections, flip if an axis is inverted.
     yaw_sign_   = declare_parameter("gimbal.yaw_sign", 1.0);
     pitch_sign_ = declare_parameter("gimbal.pitch_sign", 1.0);
+    imu_stale_threshold_s_ =
+      declare_parameter("micro_imu.stale_threshold_s", 0.25);
 
     // optional feature flags consumed by later phases (default off so the
     // node behaves identically to the legacy code path). enable_adaptive_q
@@ -229,6 +253,7 @@ public:
     pnp_max_reproj_err_norm_  = declare_parameter("pnp_max_reproj_err_norm", 0.10);
     pnp_min_depth_m_          = declare_parameter("pnp_min_depth_m", 0.10);
     pnp_max_depth_m_          = declare_parameter("pnp_max_depth_m", 12.0);
+    pnp_size_switch_margin_px_ = declare_parameter("pnp.size_switch_margin_px", 0.50);
     const std::string force_armor_size =
       declare_parameter("pnp.force_armor_size", std::string("auto"));
     if (force_armor_size == "auto") {
@@ -330,9 +355,12 @@ private:
     const double micro_yaw_rad = static_cast<double>(msg->data[0]);
     const double micro_pitch_rad = static_cast<double>(msg->data[1]);
 
+    micro_yaw_raw_ = micro_yaw_rad;
+    micro_pitch_raw_ = micro_pitch_rad;
     imu_yaw_   = yaw_sign_ * micro_yaw_rad;
     imu_pitch_ = pitch_sign_ * micro_pitch_rad;
     imu_valid_ = true;
+    last_imu_time_ = this->now();
 
     // FrameTransformer owns the rotation/translation; node members stay in
     // sync via accessors (also used by publishMarkers and the aim pixel path).
@@ -341,15 +369,26 @@ private:
     imu_translation_ = frame_transformer_.translation();
   }
 
+  void fillPoseDebug(DebugFrame & f)
+  {
+    f.pose_source = "micro_imu";
+    f.pose_present = imu_valid_;
+    f.imu_yaw = static_cast<float>(imu_yaw_);
+    f.imu_pitch = static_cast<float>(imu_pitch_);
+    if (!imu_valid_ || last_imu_time_.nanoseconds() == 0) {
+      f.pose_age_s = 0.0f;
+      f.pose_fresh = false;
+      return;
+    }
+    const double age = std::max(0.0, (this->now() - last_imu_time_).seconds());
+    f.pose_age_s = static_cast<float>(age);
+    f.pose_fresh = age <= imu_stale_threshold_s_;
+  }
+
   // YOLO-pose path: direct PnP from the four predicted armor corners.
   void keypointCallback(const auto_aim::msg::ArmorKeypointArray::ConstSharedPtr msg)
   {
     if (!pnp_.ready()) return;
-    if (!imu_valid_) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-        "Waiting for /micro_imu: Float32MultiArray [yaw_rad, pitch_rad]");
-      return;
-    }
 
     DebugFrame f;
     f.raw_kp_detection_count = static_cast<uint32_t>(msg->detections.size());
@@ -361,6 +400,28 @@ private:
     if (last_time_.nanoseconds() > 0)
       dt = std::clamp((now - last_time_).seconds(), 0.01, 0.10);
     last_time_ = now;
+    fillPoseDebug(f);
+
+    if (!f.pose_present || !f.pose_fresh) {
+      if (!f.pose_present) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "Waiting for /micro_imu: Float32MultiArray [yaw_rad, pitch_rad]");
+      } else {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "/micro_imu stale: age=%.3fs threshold=%.3fs",
+          f.pose_age_s, imu_stale_threshold_s_);
+      }
+      const double now_s_wall = this->now().seconds();
+      tracker_->update({}, dt, now_s_wall);
+      populateTrackerDebug(f, now_s_wall);
+      AimResult hold;
+      publishCommand(msg->header, hold, 0.0, f);
+      if (publish_markers_enabled_) {
+        publishMarkers(msg->header, hold);
+      }
+      finishDebugFrame(msg->header, f, t_proc_start);
+      return;
+    }
 
     const double max_oblique_rad = cfg_.max_oblique_deg * M_PI / 180.0;
     const double pnp_norm_gate = enable_pnp_health_gate_ ? pnp_max_reproj_err_norm_ : 0.0;
@@ -473,6 +534,27 @@ private:
       auto pnp = pnp_.solveKeypoints(
         corners, keypoint_max_reproj_error_, enable_pnp_refine_,
         pnp_norm_gate, pnp_min_depth, pnp_max_depth, pnp_force_size_mode_);
+      bool pnp_size_hysteresis_kept = false;
+      const bool size_hysteresis_tracks_this_detection =
+        pnp_size_initialized_ &&
+        (tracker_->targetId().empty() || cid == tracker_->targetId());
+      if (pnp.ok &&
+          pnp_force_size_mode_ == PnPSolver::ArmorSizeMode::AUTO &&
+          pnp_size_switch_margin_px_ > 0.0 &&
+          size_hysteresis_tracks_this_detection &&
+          pnp.is_large != pnp_last_is_large_ &&
+          pnp.size_margin < pnp_size_switch_margin_px_) {
+        const auto sticky_size = pnp_last_is_large_
+          ? PnPSolver::ArmorSizeMode::LARGE
+          : PnPSolver::ArmorSizeMode::SMALL;
+        auto sticky = pnp_.solveKeypoints(
+          corners, keypoint_max_reproj_error_, enable_pnp_refine_,
+          pnp_norm_gate, pnp_min_depth, pnp_max_depth, sticky_size);
+        if (sticky.ok) {
+          pnp = sticky;
+          pnp_size_hysteresis_kept = true;
+        }
+      }
       if (!pnp.ok) {
         f.pnp_failed_count++;
         if (!pnp_logged) {
@@ -481,6 +563,7 @@ private:
           f.pnp_reproj_err = (float)pnp.reproj_err;
           f.pnp_reproj_err_norm = (float)pnp.reproj_err_norm;
           f.pnp_is_large = pnp.is_large;
+          f.pnp_size_hysteresis_kept = pnp_size_hysteresis_kept;
           f.pnp_small_reproj_err = (float)pnp.small_reproj_err;
           f.pnp_large_reproj_err = (float)pnp.large_reproj_err;
           f.pnp_size_margin = (float)pnp.size_margin;
@@ -511,6 +594,7 @@ private:
         f.kp_reject_reason = auto_aim::msg::AutoAimDebug::KP_OK;
         f.pnp_ok = true;
         f.pnp_is_large = pnp.is_large;
+        f.pnp_size_hysteresis_kept = pnp_size_hysteresis_kept;
         f.pnp_reproj_err = (float)pnp.reproj_err;
         f.pnp_reproj_err_norm = (float)pnp.reproj_err_norm;
         f.pnp_small_reproj_err = (float)pnp.small_reproj_err;
@@ -548,10 +632,70 @@ private:
       a.confidence = static_cast<double>(det.confidence);
       a.pnp_reproj_err_norm = pnp.reproj_err_norm;
       armors.push_back(std::move(a));
+      if (tracker_->targetId().empty() || cid == tracker_->targetId()) {
+        pnp_last_is_large_ = pnp.is_large;
+        pnp_size_initialized_ = true;
+      }
     }
     f.armors_passed_to_tracker_count = static_cast<uint32_t>(armors.size());
 
     finalizeFrame(msg->header, f, armors, dt, t_proc_start);
+  }
+
+  void populateTrackerDebug(DebugFrame & f, double now_s_wall)
+  {
+    const auto & xs = tracker_->ekfState();
+    const auto & P  = tracker_->ekfCovariance();
+    for (int i = 0; i < 9; ++i) f.ekf_state[i] = (float)xs(i);
+    f.tracker_state = (uint8_t)tracker_->state();
+    f.tracker_target_id = tracker_->targetId();
+    f.tracker_assigned_count = tracker_->lastAssignedCount();
+    f.tracker_association_reject_count = tracker_->lastAssociationRejectCount();
+    f.tracker_miss_reason = tracker_->lastTrackerMissReason();
+    f.ekf_innovation_norm     = (float)tracker_->lastInnovationNorm();
+    f.ekf_innovation_pos_norm = (float)tracker_->lastInnovationPosNorm();
+    f.ekf_innovation_yaw_abs  = (float)tracker_->lastInnovationYawAbs();
+    f.ekf_mahalanobis         = (float)tracker_->lastMahalanobis();
+    f.ekf_q_pos_eff           = (float)tracker_->lastQPosEff();
+    f.ekf_q_yaw_eff           = (float)tracker_->lastQYawEff();
+    f.ekf_r_pos_eff           = (float)tracker_->lastRPosEff();
+    f.ekf_r_yaw_eff           = (float)tracker_->lastRYawEff();
+    const double pos_var = std::max(0.0, P(0,0) + P(2,2) + P(4,4));
+    const double yaw_var = std::max(0.0, P(6,6));
+    f.ekf_pos_sigma = (float)std::sqrt(pos_var);
+    f.ekf_yaw_sigma = (float)std::sqrt(yaw_var);
+    f.ekf_match_count = tracker_->consecutiveMatchCount();
+    f.ekf_miss_count  = tracker_->consecutiveMissCount();
+    f.ekf_measurement_age_s = (float)tracker_->measurementAgeSeconds(now_s_wall);
+    f.ekf_measurement_quality = (uint8_t)tracker_->lastMeasurementQuality();
+    f.best_match_mahalanobis = (float)tracker_->lastBestMatchMahalanobis();
+    f.best_match_position_diff = (float)tracker_->lastBestMatchPositionDiff();
+    f.best_match_yaw_diff = (float)tracker_->lastBestMatchYawDiff();
+    f.match_reject_reason = tracker_->lastMatchRejectReason();
+  }
+
+  void finishDebugFrame(
+    const std_msgs::msg::Header & header,
+    DebugFrame & f,
+    const rclcpp::Time & t_proc_start)
+  {
+    rclcpp::Time t_proc_end = this->now();
+    f.latency_process_s = (t_proc_end - t_proc_start).seconds();
+    f.latency_total_s = (t_proc_end - rclcpp::Time(header.stamp)).seconds();
+    f.latency_process_to_publish_s =
+      f.latency_total_s - f.latency_capture_to_process_s - f.latency_process_s;
+
+    if (!latency_estimate_initialized_) {
+      latency_estimate_s_ = f.latency_total_s;
+      latency_estimate_initialized_ = true;
+    } else {
+      latency_estimate_s_ =
+        (1.0 - latency_ema_alpha_) * latency_estimate_s_ +
+        latency_ema_alpha_ * f.latency_total_s;
+    }
+    f.latency_estimate_ema_s = latency_estimate_s_;
+
+    debug_pub_->publish(header, f);
   }
 
   void finalizeFrame(
@@ -570,36 +714,7 @@ private:
     tracker_->update(armors, dt, now_s_wall);
 
     // populate EKF debug fields after update.
-    {
-      const auto & xs = tracker_->ekfState();
-      const auto & P  = tracker_->ekfCovariance();
-      for (int i = 0; i < 9; ++i) f.ekf_state[i] = (float)xs(i);
-      f.tracker_state = (uint8_t)tracker_->state();
-      f.tracker_target_id = tracker_->targetId();
-      f.tracker_assigned_count = tracker_->lastAssignedCount();
-      f.tracker_association_reject_count = tracker_->lastAssociationRejectCount();
-      f.tracker_miss_reason = tracker_->lastTrackerMissReason();
-      f.ekf_innovation_norm     = (float)tracker_->lastInnovationNorm();
-      f.ekf_innovation_pos_norm = (float)tracker_->lastInnovationPosNorm();
-      f.ekf_innovation_yaw_abs  = (float)tracker_->lastInnovationYawAbs();
-      f.ekf_mahalanobis         = (float)tracker_->lastMahalanobis();
-      f.ekf_q_pos_eff           = (float)tracker_->lastQPosEff();
-      f.ekf_q_yaw_eff           = (float)tracker_->lastQYawEff();
-      f.ekf_r_pos_eff           = (float)tracker_->lastRPosEff();
-      f.ekf_r_yaw_eff           = (float)tracker_->lastRYawEff();
-      const double pos_var = std::max(0.0, P(0,0) + P(2,2) + P(4,4));
-      const double yaw_var = std::max(0.0, P(6,6));
-      f.ekf_pos_sigma = (float)std::sqrt(pos_var);
-      f.ekf_yaw_sigma = (float)std::sqrt(yaw_var);
-      f.ekf_match_count = tracker_->consecutiveMatchCount();
-      f.ekf_miss_count  = tracker_->consecutiveMissCount();
-      f.ekf_measurement_age_s = (float)tracker_->measurementAgeSeconds(now_s_wall);
-      f.ekf_measurement_quality = (uint8_t)tracker_->lastMeasurementQuality();
-      f.best_match_mahalanobis = (float)tracker_->lastBestMatchMahalanobis();
-      f.best_match_position_diff = (float)tracker_->lastBestMatchPositionDiff();
-      f.best_match_yaw_diff = (float)tracker_->lastBestMatchYawDiff();
-      f.match_reject_reason = tracker_->lastMatchRejectReason();
-    }
+    populateTrackerDebug(f, now_s_wall);
 
     // ---- Prediction-lead composition ----
     //
@@ -651,6 +766,11 @@ private:
     f.aim_target_z = (float)aim.target_z;
     f.aim_flight_time = (float)aim.flight_time;
     f.aim_pred_t = (float)aim.pred_t;
+    f.aim_rel_yaw = (float)aim.rel_yaw;
+    f.aim_rel_pitch = (float)aim.rel_pitch;
+    f.aim_fire_margin = (float)aim.fire_margin;
+    f.aim_anti_gyro_active = aim.anti_gyro_active;
+    f.aim_anti_gyro_residual = (float)aim.anti_gyro_residual;
 
     // Prediction-lead component breakdown (always logged; zero where the
     // corresponding flag was off, so the debug consumer can verify exactly
@@ -681,11 +801,15 @@ private:
         imp_cam_yaw   = aim_cam_yaw;
         imp_cam_pitch = aim_cam_pitch;
         aim_cam_total_angle = std::sqrt(aim_cam_yaw*aim_cam_yaw + aim_cam_pitch*aim_cam_pitch);
+        f.aim_cam_yaw = static_cast<float>(aim_cam_yaw);
+        f.aim_cam_pitch = static_cast<float>(aim_cam_pitch);
+        f.aim_cam_total_angle = static_cast<float>(aim_cam_total_angle);
       } else {
         // the geometry says the selected face is behind the camera. mark the
         // target invalid so FireGate emits INVALID_TARGET instead of the
         // current frame silently dropping fire.
         aim.target_valid = false;
+        f.aim_target_valid = false;
       }
     }
 
@@ -700,25 +824,7 @@ private:
       publishMarkers(header, aim);
     }
 
-    // latency: process end and publish stamp.
-    rclcpp::Time t_proc_end = this->now();
-    f.latency_process_s = (t_proc_end - t_proc_start).seconds();
-    f.latency_total_s = (t_proc_end - rclcpp::Time(header.stamp)).seconds();
-    f.latency_process_to_publish_s =
-      f.latency_total_s - f.latency_capture_to_process_s - f.latency_process_s;
-
-    // P7: update the EMA used as the prediction lead in the next frame.
-    if (!latency_estimate_initialized_) {
-      latency_estimate_s_ = f.latency_total_s;
-      latency_estimate_initialized_ = true;
-    } else {
-      latency_estimate_s_ =
-        (1.0 - latency_ema_alpha_) * latency_estimate_s_ +
-        latency_ema_alpha_ * f.latency_total_s;
-    }
-    f.latency_estimate_ema_s = latency_estimate_s_;
-
-    debug_pub_->publish(header, f);
+    finishDebugFrame(header, f, t_proc_start);
   }
 
   // Gimbal command contract (full description in docs/gimbal_command_contract.md):
@@ -740,27 +846,74 @@ private:
     double aim_cam_total_angle,
     DebugFrame & f)
   {
-    // absolute target commands.
-    // these are final destinations in the startup IMU/odom frame, not increments.
-    double yaw_target = aim.abs_yaw;
-    double pitch_target = aim.abs_pitch;
+    const auto tracker_state = tracker_->state();
+    const bool tracker_tracking = tracker_state == Tracker::TRACKING;
+    const bool tracker_temp_lost = tracker_state == Tracker::TEMP_LOST;
+    const bool has_valid_prediction = aim.tracking && aim.target_valid;
+    const double coast_age_s = std::max(0.0, static_cast<double>(f.ekf_measurement_age_s));
+    const bool temp_lost_coast_allowed =
+      tracker_temp_lost && has_valid_prediction && coast_age_s <= temp_lost_coast_max_s_;
+    const bool command_valid =
+      has_valid_prediction && (tracker_tracking || temp_lost_coast_allowed);
+    const double planner_relative_error_angle = has_valid_prediction
+      ? std::sqrt(aim.rel_yaw * aim.rel_yaw + aim.rel_pitch * aim.rel_pitch)
+      : 0.0;
+    f.cmd_coast_active = temp_lost_coast_allowed;
+    f.cmd_hold_active = !command_valid;
+    f.tracker_fresh_enough_for_command = tracker_tracking || temp_lost_coast_allowed;
+    f.coast_age_s = tracker_temp_lost ? static_cast<float>(coast_age_s) : 0.0f;
 
-    // static bore-sight correction, camera to barrel angular offset. The
-    // calibration guide (docs/calibration_guide.md) explains why these should
-    // be left at zero in any new deployment.
-    pitch_target -= pitch_offset_;
-    yaw_target = angles::normalize_angle(yaw_target - yaw_offset_);
+    // Absolute target commands. These are final destinations in the startup
+    // IMU/odom frame, not increments. Without a valid target, publish a safe
+    // hold destination: the fresh current pose when available, otherwise the
+    // last command. If neither exists, suppress the command instead of sending
+    // absolute zero (zero is a real gimbal destination).
+    bool have_hold_command = false;
+    double hold_yaw_micro = 0.0;
+    double hold_pitch_micro = 0.0;
+    if (!command_valid) {
+      if (f.pose_present && f.pose_fresh) {
+        hold_yaw_micro = micro_yaw_raw_;
+        hold_pitch_micro = micro_pitch_raw_;
+        have_hold_command = true;
+      } else if (last_cmd_initialized_) {
+        hold_yaw_micro = last_cmd_yaw_micro_;
+        hold_pitch_micro = last_cmd_pitch_micro_;
+        have_hold_command = true;
+      } else if (f.pose_present) {
+        hold_yaw_micro = micro_yaw_raw_;
+        hold_pitch_micro = micro_pitch_raw_;
+        have_hold_command = true;
+      }
+    }
+
+    double yaw_target = command_valid ? aim.abs_yaw : yaw_sign_ * hold_yaw_micro;
+    double pitch_target = command_valid ? aim.abs_pitch : pitch_sign_ * hold_pitch_micro;
+
+    if (command_valid) {
+      // static bore-sight correction, camera to barrel angular offset. The
+      // calibration guide (docs/calibration_guide.md) explains why these should
+      // be left at zero in any new deployment.
+      pitch_target -= pitch_offset_;
+      yaw_target = angles::normalize_angle(yaw_target - yaw_offset_);
+    }
 
     // capture the pre-smoothing target so FireGate can compute smoothing lag.
     const double yaw_target_pre_smooth = yaw_target;
     const double pitch_target_pre_smooth = pitch_target;
 
     // pre-smoothing values are useful for diagnosing EMA lag in /auto_aim/debug.
-    f.cmd_yaw_pre_smooth = (float)(yaw_sign_ * yaw_target_pre_smooth);
-    f.cmd_pitch_pre_smooth = (float)(pitch_sign_ * pitch_target_pre_smooth);
+    f.cmd_yaw_pre_smooth = command_valid ?
+      (float)(yaw_sign_ * yaw_target_pre_smooth) : (float)hold_yaw_micro;
+    f.cmd_pitch_pre_smooth = command_valid ?
+      (float)(pitch_sign_ * pitch_target_pre_smooth) : (float)hold_pitch_micro;
+    f.aim_rel_yaw = command_valid ?
+      (float)angles::shortest_angular_distance(imu_yaw_, yaw_target_pre_smooth) : 0.0f;
+    f.aim_rel_pitch = command_valid ?
+      (float)(pitch_target_pre_smooth - imu_pitch_) : 0.0f;
 
     // EMA smoothing on the absolute destination, with yaw wrap handling.
-    if (!aim.tracking) {
+    if (!command_valid) {
       smooth_init_ = false;
     } else if (!smooth_init_) {
       sm_y_ = yaw_target; sm_p_ = pitch_target; smooth_init_ = true;
@@ -775,9 +928,9 @@ private:
     // the target the planner asked for. Yaw uses shortest_angular_distance to
     // handle wrap. The lag is also published on /auto_aim/debug regardless of
     // whether the smoothing gate is enabled — it is a useful diagnostic.
-    const double yaw_lag = aim.tracking ?
+    const double yaw_lag = command_valid ?
       angles::shortest_angular_distance(yaw_target, yaw_target_pre_smooth) : 0.0;
-    const double pitch_lag = aim.tracking ?
+    const double pitch_lag = command_valid ?
       (pitch_target_pre_smooth - pitch_target) : 0.0;
     const double smoothing_lag_rad = std::sqrt(yaw_lag*yaw_lag + pitch_lag*pitch_lag);
     f.smoothing_lag_rad = (float)smoothing_lag_rad;
@@ -786,12 +939,16 @@ private:
     // three-way split (Tracker geometry, callback off-axis check, publish
     // hysteresis) is now one call.
     FireGate::Inputs in;
-    in.tracking            = aim.tracking;
+    in.tracking            = tracker_tracking || tracker_temp_lost;
+    in.temp_lost           = tracker_temp_lost;
     in.target_valid        = aim.target_valid;
     in.ballistic_valid     = aim.target_valid;
-    in.planner_margin_ok   = aim.fire;
+    in.pose_available      = f.pose_present;
+    in.pose_fresh          = f.pose_fresh;
+    in.planner_margin_ok   = aim.fire_margin >= 0.0;
     in.distance            = aim.distance;
     in.aim_cam_total_angle = aim_cam_total_angle;
+    in.relative_error_angle = planner_relative_error_angle;
     in.smoothing_lag_rad   = smoothing_lag_rad;
     in.stale_seconds       = 0.0;  // P7 wires the latency tracker
     in.anti_gyro_residual  = aim.anti_gyro_residual;
@@ -799,37 +956,57 @@ private:
     bool fire_decision = fd.fire;
 
     // convert back to the micro convention before publishing.
-    const double yaw_target_micro   = yaw_sign_   * yaw_target;
-    const double pitch_target_micro = pitch_sign_ * pitch_target;
+    const double yaw_target_micro =
+      command_valid ? yaw_sign_ * yaw_target : hold_yaw_micro;
+    const double pitch_target_micro =
+      command_valid ? pitch_sign_ * pitch_target : hold_pitch_micro;
 
     // command as Twist on /tracker/cmd_gimbal.
     // angular.z = absolute yaw target in micro convention [rad]
     // angular.y = absolute pitch target in micro convention [rad]
     // angular.x = fire (1.0 = fire, 0.0 = hold)
     // linear.x = distance [m]
+    f.cmd_fire = false;
+    f.cmd_published = command_valid || have_hold_command;
     geometry_msgs::msg::Twist cmd;
-    cmd.angular.z = aim.tracking ? yaw_target_micro : 0.0;
-    cmd.angular.y = aim.tracking ? pitch_target_micro : 0.0;
-    cmd.angular.x = fire_decision ? 1.0 : 0.0;
-    cmd.linear.x  = aim.distance;
-    cmd_pub_->publish(cmd);
+    if (f.cmd_published) {
+      cmd.angular.z = yaw_target_micro;
+      cmd.angular.y = pitch_target_micro;
+      cmd.angular.x = fire_decision ? 1.0 : 0.0;
+      cmd.linear.x  = command_valid ? aim.distance : 0.0;
+      cmd_pub_->publish(cmd);
 
-    f.cmd_yaw_published = (float)cmd.angular.z;
-    f.cmd_pitch_published = (float)cmd.angular.y;
-    f.cmd_fire = fire_decision;
+      last_cmd_yaw_micro_ = cmd.angular.z;
+      last_cmd_pitch_micro_ = cmd.angular.y;
+      last_cmd_initialized_ = true;
+
+      f.cmd_fire = fire_decision;
+      f.cmd_yaw_published = (float)cmd.angular.z;
+      f.cmd_pitch_published = (float)cmd.angular.y;
+    } else {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "Suppressing gimbal command: no /micro_imu pose and no previous safe hold command");
+      f.cmd_yaw_published = 0.0f;
+      f.cmd_pitch_published = 0.0f;
+    }
     f.fire_blocker = (uint8_t)fd.blocker;
+    f.fire_blocker_mask = fd.blocker_mask;
     f.fire_blocker_reason = fd.reason;
+    f.fire_alignment_source = fire_alignment_source_name_;
+    f.fire_alignment_error = static_cast<float>(fd.alignment_error);
 
     // same command on /cmd_vel_AI for the legacy interface.
-    geometry_msgs::msg::Twist twist;
-    twist.angular.x = fire_decision ? 1.0 : 0.0;
-    twist.angular.y = cmd.angular.y;
-    twist.angular.z = cmd.angular.z;
-    twist_pub_->publish(twist);
+    if (f.cmd_published) {
+      geometry_msgs::msg::Twist twist;
+      twist.angular.x = fire_decision ? 1.0 : 0.0;
+      twist.angular.y = cmd.angular.y;
+      twist.angular.z = cmd.angular.z;
+      twist_pub_->publish(twist);
+    }
 
     // publish aim and impact as 2d pixels for the viewer.
     // aim is the commanded ballistic ray, impact is the selected armor center.
-    if (aim.tracking && aim.target_valid && pnp_.ready()) {
+    if (command_valid && pnp_.ready()) {
       // Convert the absolute commanded ray back into the current camera
       // optical frame. Keep this on the same TF path as impact projection;
       // scalar yaw/pitch subtraction is wrong once pitch is nonzero.
@@ -986,15 +1163,19 @@ private:
   std::set<std::string> target_classes_;
 
   double imu_yaw_ = 0, imu_pitch_ = 0;
+  double micro_yaw_raw_ = 0, micro_pitch_raw_ = 0;
   bool imu_valid_ = false;
+  double imu_stale_threshold_s_ = 0.25;
   double yaw_sign_ = 1.0, pitch_sign_ = 1.0;
   tf2::Quaternion imu_rotation_{0, 0, 0, 1};
   tf2::Vector3 imu_translation_{0, 0, 0};
   FrameTransformer frame_transformer_;
+  rclcpp::Time last_imu_time_{0, 0, RCL_ROS_TIME};
 
   rclcpp::Time last_time_{0, 0, RCL_ROS_TIME};
 
   double smooth_alpha_ = 0.4;
+  double temp_lost_coast_max_s_ = 0.08;
   double pitch_offset_ = 0.0;  // bore-sight pitch correction [rad]
   double yaw_offset_ = 0.0;    // bore-sight yaw correction [rad]
 
@@ -1022,7 +1203,10 @@ private:
   double pnp_max_reproj_err_norm_  = 0.10;
   double pnp_min_depth_m_          = 0.10;
   double pnp_max_depth_m_          = 12.0;
+  double pnp_size_switch_margin_px_ = 0.50;
   PnPSolver::ArmorSizeMode pnp_force_size_mode_ = PnPSolver::ArmorSizeMode::AUTO;
+  bool   pnp_size_initialized_ = false;
+  bool   pnp_last_is_large_ = false;
 
   // YOLO-pose keypoint input
   std::string keypoint_topic_ = "/detector/armors_keypoints";
@@ -1031,8 +1215,11 @@ private:
   bool   enable_keypoint_geometry_check_ = true;
 
   std::unique_ptr<FireGate> fire_gate_;
+  std::string fire_alignment_source_name_ = "camera_angle";
   double last_aim_yaw_ = 0, last_aim_pitch_ = 0;   // camera-frame ballistic command angles
   double last_imp_yaw_ = 0, last_imp_pitch_ = 0;   // camera-frame selected plate/impact angles
+  double last_cmd_yaw_micro_ = 0, last_cmd_pitch_micro_ = 0;
+  bool last_cmd_initialized_ = false;
   double sm_y_ = 0, sm_p_ = 0;
   bool smooth_init_ = false;
 

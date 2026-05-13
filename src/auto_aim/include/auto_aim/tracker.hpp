@@ -47,6 +47,7 @@ struct AimResult
   int    face_index   = -1;   // 0..3, or -1 if no aim
   double flight_time  = 0.0;  // ballistic flight time [s]
   double pred_t       = 0.0;  // prediction lead used by the planner [s]
+  double fire_margin  = -1e9; // angular margin [rad], >=0 means planner permits fire
 
   // P9 anti-gyro residual: signed seconds between bullet impact time and the
   // moment the selected face is normal-aligned with the bullet line. Zero
@@ -120,6 +121,13 @@ struct TrackerConfig
   double max_match_dist    = 0.5;
   double yaw_jump_thresh   = M_PI / 3.0;
   double maha_threshold    = 13.3;
+  // Face-jump fallback. A different armor face can appear with a 60-90 deg yaw
+  // jump; the full yaw-inclusive Mahalanobis gate may reject it before the
+  // armor-jump handler gets a chance. Keep this as a structural association
+  // fallback, not a loose global maha_threshold.
+  double face_jump_max_match_dist_ratio = 1.5;
+  double face_jump_min_yaw = M_PI / 4.0;
+  double face_jump_max_yaw = 3.0 * M_PI / 4.0;
 
   // target switching.
   // 0.85 means switch if the new target is closer than 85% of current range.
@@ -258,7 +266,8 @@ private:
   Eigen::Vector3d armorFromState(const Eigen::VectorXd & x) const;
   void initFromDetection(const ArmorDetection & det);
   void handleArmorJump(const ArmorDetection & det);
-  double unwrapYaw(double raw_yaw);
+  double previewUnwrapYaw(double raw_yaw, double reference_yaw) const;
+  void commitYaw(double yaw);
 
   struct BallisticResult { double pitch, flight_time; bool valid; };
   BallisticResult solveBallistic(double ground_dist, double dz) const;

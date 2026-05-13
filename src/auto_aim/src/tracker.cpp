@@ -226,8 +226,19 @@ double Tracker::ekfMahalanobis(const Eigen::Vector4d & z) const
   double d = std::sqrt(z(0)*z(0)+z(1)*z(1)+z(2)*z(2));
   double ps = cfg_.r_pos_base + cfg_.r_pos_slope*d;
   double ys = cfg_.r_yaw_base + cfg_.r_yaw_slope*d;
+  double xyz_f = 1.0, yaw_f = 1.0;
+  if (z(0)*z(0) + z(1)*z(1) > 0.01) {
+    const double bearing = std::atan2(z(1), z(0));
+    const double face_a = std::abs(angles::shortest_angular_distance(z(3), bearing));
+    const double cf = std::cos(face_a);
+    xyz_f = 1.0 / std::max(cf*cf, 0.04);
+    yaw_f = 1.0 / std::max(std::pow(std::abs(cf), 4.0), 1e-4);
+    if (face_a > cfg_.max_oblique_deg * M_PI / 180.0) {
+      yaw_f = 1e6;
+    }
+  }
   Eigen::Matrix4d R = Eigen::Matrix4d::Zero();
-  R(0,0)=R(1,1)=R(2,2)=ps*ps; R(3,3)=ys*ys;
+  R(0,0)=R(1,1)=R(2,2)=ps*ps*xyz_f; R(3,3)=ys*ys*yaw_f;
   Eigen::Vector4d zp; zp << x_(0)-r*cos(yaw), x_(2)-r*sin(yaw), x_(4), yaw;
   Eigen::Vector4d y = z - zp;
   Eigen::Matrix4d S = H*P_*H.transpose()+R;
@@ -241,11 +252,14 @@ Eigen::Vector3d Tracker::armorFromState(const Eigen::VectorXd & x) const
   return {x(0)-x(8)*cos(x(6)), x(2)-x(8)*sin(x(6)), x(4)};
 }
 
-double Tracker::unwrapYaw(double raw_yaw)
+double Tracker::previewUnwrapYaw(double raw_yaw, double reference_yaw) const
 {
-  double yaw = last_yaw_ + angles::shortest_angular_distance(last_yaw_, raw_yaw);
+  return reference_yaw + angles::shortest_angular_distance(reference_yaw, raw_yaw);
+}
+
+void Tracker::commitYaw(double yaw)
+{
   last_yaw_ = yaw;
-  return yaw;
 }
 
 double Tracker::targetRange() const
@@ -255,8 +269,8 @@ double Tracker::targetRange() const
 
 void Tracker::initFromDetection(const ArmorDetection & det)
 {
-  last_yaw_ = 0;
-  double yaw = unwrapYaw(det.yaw);
+  double yaw = previewUnwrapYaw(det.yaw, 0.0);
+  commitYaw(yaw);
   double r = cfg_.initial_radius;
   radius_ = r;  other_radius_ = r;
   dz_ = 0;  dz_initialized_ = false;
@@ -297,7 +311,8 @@ bool Tracker::shouldSwitch(const ArmorDetection & candidate) const
 // snap yaw first, then let the EKF update from a reasonable linearization point.
 void Tracker::handleArmorJump(const ArmorDetection & det)
 {
-  double yaw = unwrapYaw(det.yaw);
+  double yaw = previewUnwrapYaw(det.yaw, x_(6));
+  commitYaw(yaw);
   double jump = angles::shortest_angular_distance(x_(6), yaw);
 
   // spin reversal: jump direction opposes estimated spin.
@@ -380,6 +395,10 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
       }
       last_assigned_count_ = 1;
       last_match_reject_reason_ = "accepted_switch";
+      last_meas_quality_ = MQ_ACCEPTED;
+      match_count_ = 1;
+      miss_count_ = 0;
+      if (now_s > 0.0) last_match_time_s_ = now_s;
       return;
     }
   }
@@ -400,6 +419,10 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
       state_ = DETECTING;
     }
     last_assigned_count_ = 1;
+    last_meas_quality_ = MQ_ACCEPTED;
+    match_count_ = 1;
+    miss_count_ = 0;
+    if (now_s > 0.0) last_match_time_s_ = now_s;
     return;
   }
 
@@ -411,25 +434,59 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
   // associate with Mahalanobis gating.
   auto pred_armor = armorFromState(x_);
   bool matched = false;
+  bool face_jump_forced = false;
   ArmorDetection best_det{};
   double best_maha = cfg_.maha_threshold;
   double best_seen_maha = 1e9;
   bool saw_same_class = false;
+  bool has_face_jump_candidate = false;
+  ArmorDetection face_jump_det{};
+  double best_face_jump_pd = 1e9;
+  double best_face_jump_yd = 0.0;
 
   for (const auto & det : detections) {
     if (det.class_id != target_id_) continue;
     saw_same_class = true;
-    double pred_yaw = x_(6);
-    double uw = pred_yaw + angles::shortest_angular_distance(pred_yaw, det.yaw);
+    // Preview unwrap has no side effect. Rejected candidates must not mutate
+    // last_yaw_, otherwise a bad detection corrupts yaw continuity for the next
+    // frame. We commit yaw only after accepting a measurement.
+    double uw = previewUnwrapYaw(det.yaw, x_(6));
     Eigen::Vector4d z(det.x, det.y, det.z, uw);
     double m = ekfMahalanobis(z);
+    Eigen::Vector3d dp(det.x, det.y, det.z);
+    double pd = (pred_armor - dp).norm();
+    double yd = std::abs(angles::shortest_angular_distance(x_(6), uw));
     if (m < best_seen_maha) {
       best_seen_maha = m;
       last_best_match_mahalanobis_ = m;
     }
     if (m < best_maha) { best_maha = m; best_det = det; matched = true; }
+    const double face_jump_max_dist =
+      cfg_.max_match_dist * std::max(1.0, cfg_.face_jump_max_match_dist_ratio);
+    if (pd < face_jump_max_dist &&
+        yd >= cfg_.face_jump_min_yaw &&
+        yd <= cfg_.face_jump_max_yaw &&
+        std::isfinite(det.x) && std::isfinite(det.y) &&
+        std::isfinite(det.z) && std::isfinite(det.yaw)) {
+      if (!has_face_jump_candidate || pd < best_face_jump_pd) {
+        has_face_jump_candidate = true;
+        face_jump_det = det;
+        best_face_jump_pd = pd;
+        best_face_jump_yd = yd;
+      }
+    }
   }
-  last_mahalanobis_ = matched ? best_maha : 0.0;
+  if (!matched && has_face_jump_candidate) {
+    matched = true;
+    face_jump_forced = true;
+    best_det = face_jump_det;
+    last_best_match_position_diff_ = best_face_jump_pd;
+    last_best_match_yaw_diff_ = best_face_jump_yd;
+    last_match_reject_reason_ = "rejected_maha_but_face_jump_candidate";
+    last_association_reject_count_ = 1;
+  }
+  last_mahalanobis_ = (matched && !face_jump_forced) ? best_maha :
+    (std::isfinite(best_seen_maha) && best_seen_maha < 1e8 ? best_seen_maha : 0.0);
   if (!matched) {
     if (detections.empty()) {
       last_match_reject_reason_ = "no_detections";
@@ -443,7 +500,7 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
 
   // update or coast.
   if (matched) {
-    double meas_yaw = unwrapYaw(best_det.yaw);
+    double meas_yaw = previewUnwrapYaw(best_det.yaw, x_(6));
     double yd = std::abs(angles::shortest_angular_distance(x_(6), meas_yaw));
     Eigen::Vector3d dp(best_det.x, best_det.y, best_det.z);
     double pd = (pred_armor - dp).norm();
@@ -455,10 +512,16 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
     double fa = std::abs(angles::shortest_angular_distance(meas_yaw, bearing));
     bool oblique = fa > cfg_.max_oblique_deg * M_PI/180.0;
 
-    if (pd < cfg_.max_match_dist && (yd < cfg_.yaw_jump_thresh || oblique)) {
+    if (face_jump_forced) {
+      handleArmorJump(best_det);
+      last_meas_quality_ = MQ_ACCEPTED;
+      last_assigned_count_ = 1;
+      last_match_reject_reason_ = "accepted_face_jump_after_maha";
+    } else if (pd < cfg_.max_match_dist && (yd < cfg_.yaw_jump_thresh || oblique)) {
       // normal EKF update.
       Eigen::Vector4d z(best_det.x, best_det.y, best_det.z, meas_yaw);
       x_ = ekfUpdate(z, best_det);
+      commitYaw(meas_yaw);
       last_assigned_count_ = 1;
       last_match_reject_reason_ = "accepted";
       // Quality classification: oblique view means the yaw measurement was
@@ -498,7 +561,7 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
   radius_ = x_(8);
   if (std::abs(x_(7)) > 25.0) { x_(7) = std::copysign(25.0, x_(7)); P_ = P0_; }
   double wy = angles::normalize_angle(x_(6));
-  if (wy != x_(6)) { x_(6) = wy; last_yaw_ = wy; }
+  if (wy != x_(6)) { x_(6) = wy; }
 
   // state machine.
   if (state_ == DETECTING) {
@@ -710,6 +773,7 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
   aim.face_index = best.idx;
   aim.flight_time = best.flight_time;
   aim.pred_t = pred_t;
+  aim.fire_margin = best.margin;
   aim.anti_gyro_residual = best.residual;
   aim.anti_gyro_active = anti_gyro_mode;
 

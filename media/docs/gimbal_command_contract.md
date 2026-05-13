@@ -32,8 +32,20 @@ or consumed by the current node.
 
 These are **absolute destinations**, not deltas. The microcontroller is
 expected to drive its gimbal to the commanded yaw/pitch in its own frame.
-When the tracker is not locked (`tracking == false`), the node publishes
-`angular.z = 0`, `angular.y = 0`, `angular.x = 0`.
+Command policy:
+
+* `TRACKING`: publish the normal absolute target yaw/pitch.
+* `TEMP_LOST`: fire is blocked. The node may publish a short bounded coast
+  command for at most `cmd.temp_lost_coast_max_s`, then it falls back to hold.
+* `DETECTING`, `LOST`, invalid target, or expired coast: publish a hold
+  destination when one is safe.
+
+Hold means the latest fresh `/micro_imu` yaw/pitch, or the previous command if
+pose feedback has gone stale. It must not publish yaw/pitch zero as a generic
+hold command, because zero is a real absolute gimbal destination. If no pose
+sample and no previous command exist yet, the node suppresses the gimbal command
+until a safe absolute hold destination is known. `/auto_aim/debug` reports this
+with `cmd_published`, `cmd_hold_active`, and `cmd_coast_active`.
 
 ### Sign convention
 
@@ -58,6 +70,15 @@ so the microcontroller does not need to flip again.
   for the list of fire blocker reasons.
 * `angular.x == 0.0` means **do not fire**. The microcontroller must treat
   the absence of a `1.0` as "no fire", not as "keep last".
+
+The fire alignment gate is configured by `fire.alignment_source`:
+
+* `camera_angle`: gate on the camera-frame selected-target angle. This is the
+  safe real-robot default when camera pose follows fresh gimbal feedback.
+* `relative_error`: gate on `sqrt(aim.rel_yaw^2 + aim.rel_pitch^2)`, which
+  still depends on fresh pose feedback.
+* `disabled`: do not use an alignment gate. This is useful for static fake-IMU
+  video tests only; it does not prove physical gimbal convergence.
 
 ## Legacy / compatibility command topic
 

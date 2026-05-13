@@ -31,6 +31,7 @@ struct DebugFrame
   // PnP
   bool pnp_ok = false;
   bool pnp_is_large = false;
+  bool pnp_size_hysteresis_kept = false;
   float pnp_reproj_err = 0;       // mean pixel error
   float pnp_reproj_err_norm = 0;  // / keypoint AABB diagonal
   float pnp_small_reproj_err = 0;
@@ -54,6 +55,12 @@ struct DebugFrame
   uint8_t kp_reject_reason = 0;   // 0=OK 1=NONFINITE 2=LOW_SCORE 3=INVALID_GEOMETRY 4=OUT_OF_IMAGE
 
   // Frame transform
+  std::string pose_source = "micro_imu";
+  bool pose_present = false;
+  bool pose_fresh = false;
+  float pose_age_s = 0;
+  float imu_yaw = 0;
+  float imu_pitch = 0;
   float odom_x = 0, odom_y = 0, odom_z = 0, odom_yaw = 0;
 
   // EKF
@@ -92,6 +99,14 @@ struct DebugFrame
   float aim_target_x = 0, aim_target_y = 0, aim_target_z = 0;
   float aim_flight_time = 0;
   float aim_pred_t = 0;
+  float aim_rel_yaw = 0;
+  float aim_rel_pitch = 0;
+  float aim_fire_margin = 0;
+  bool aim_anti_gyro_active = false;
+  float aim_anti_gyro_residual = 0;
+  float aim_cam_yaw = 0;
+  float aim_cam_pitch = 0;
+  float aim_cam_total_angle = 0;
 
   // Command
   float cmd_yaw_pre_smooth = 0;
@@ -99,10 +114,19 @@ struct DebugFrame
   float cmd_yaw_published = 0;
   float cmd_pitch_published = 0;
   bool cmd_fire = false;
+  bool cmd_published = false;
+  bool cmd_hold_active = false;
+  bool cmd_coast_active = false;
+  bool tracker_fresh_enough_for_command = false;
+  float coast_age_s = 0;
 
   // Fire gate
   uint8_t fire_blocker = 0;
+  uint32_t fire_blocker_mask = 0;
+  std::string fire_blockers_active;
   std::string fire_blocker_reason;
+  std::string fire_alignment_source;
+  float fire_alignment_error = 0;
 
   // Latency (P7+)
   double latency_capture_to_process_s = 0;

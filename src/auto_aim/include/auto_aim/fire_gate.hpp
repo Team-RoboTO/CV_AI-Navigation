@@ -32,23 +32,46 @@ public:
     SMOOTHING_LAG        = 7,
     STALE_MEASUREMENT    = 8,
     ANTI_GYRO_TIMING     = 9,
+    TEMP_LOST            = 10,
+    STALE_POSE           = 11,
+    NO_POSE_SOURCE       = 12,
+  };
+
+  enum AlignmentSource : uint8_t
+  {
+    ALIGN_CAMERA_ANGLE = 0,
+    ALIGN_RELATIVE_ERROR = 1,
+    ALIGN_DISABLED = 2,
   };
 
   struct Decision
   {
     bool fire = false;
     Blocker blocker = NOT_TRACKING;
+    uint32_t blocker_mask = 0;
+    double alignment_error = 0.0;
     std::string reason;  // human-readable, used by /auto_aim/debug
   };
 
   struct Inputs
   {
     bool   tracking            = false;
+    bool   temp_lost           = false;
     bool   target_valid        = false;
     bool   ballistic_valid     = true;
+    bool   pose_available      = true;
+    bool   pose_fresh          = true;
     bool   planner_margin_ok   = false;  // best.margin >= 0 from AimPlanner
     double distance            = 0.0;
+    // Camera-frame centering metric. This is a good real-robot alignment gate
+    // only when camera pose follows fresh gimbal feedback. In static fake-IMU
+    // bench mode it is still useful debug, but it does not prove physical
+    // convergence.
     double aim_cam_total_angle = 0.0;    // sqrt(yaw_cam^2 + pitch_cam^2)
+    // Command-relative error from current pose feedback to requested aim. This
+    // still depends on pose feedback; with a static fake IMU it is a bench-only
+    // geometric error, not physical gimbal convergence.
+    double relative_error_angle = 0.0;   // sqrt(rel_yaw^2 + rel_pitch^2)
     double smoothing_lag_rad   = 0.0;    // |published - target_pre_smooth|
     double stale_seconds       = 0.0;    // time since last detection
     double anti_gyro_residual  = 0.0;    // |t_impact - t_face_aligned| (P9)
@@ -58,7 +81,7 @@ public:
   {
     double min_fire_dist          = 0.3;
     double max_fire_dist          = 8.0;
-    double angular_window         = 0.09;  // camera frame, rad
+    double angular_window         = 0.09;  // alignment-source angle, rad
     double smoothing_lag_max      = 0.05;  // rad, allow fire when smooth catches up
     double stale_threshold_s      = 0.20;  // s
     double hysteresis_max_drift   = 0.05;  // rad, keep firing if smaller
@@ -72,6 +95,8 @@ public:
     bool   enable_smoothing_gate  = false; // diagnostic only, see fire_gate.cpp
     bool   enable_stale_gate      = false; // P7 enables when latency wired
     bool   enable_anti_gyro_gate  = false; // P9 enables
+    bool   enable_pose_gate       = true;
+    AlignmentSource alignment_source = ALIGN_CAMERA_ANGLE;
   };
 
   explicit FireGate(const Config & cfg);
@@ -81,6 +106,8 @@ public:
   // Evaluate the decision for one frame. Updates the internal hysteresis
   // state.
   Decision evaluate(const Inputs & in);
+
+  static uint32_t blockerBit(Blocker b) { return 1u << static_cast<uint8_t>(b); }
 
   // Reset hysteresis (e.g. when the tracker is forced to LOST).
   void reset();

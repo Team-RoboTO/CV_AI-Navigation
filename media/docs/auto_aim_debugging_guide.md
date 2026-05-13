@@ -162,6 +162,11 @@ is the same data **as received from the detector** for cross-check.
 * If `pnp_is_large` flips frame-to-frame and `pnp_size_margin` is small,
   test `pnp.force_armor_size:=small` or `large` on a bag to prove whether
   size selection is causing pose jumps. Return it to `auto` afterward.
+* In `auto` size mode, `pnp_size_hysteresis_kept=true` means the solver kept
+  the previous small/large choice because `pnp_size_margin` was below
+  `pnp.size_switch_margin_px`. This is intentional: lower reprojection error
+  alone is not a reliable planar PnP size classifier when the two errors are
+  nearly tied.
 * `pnp_reject_reason` enumerates why a frame was dropped: `DEGEN_BBOX`
   here means the keypoint AABB is below 4 px, `REPROJ_ABS` means
   `pnp_reproj_err` exceeded `keypoint_max_reproj_error` (default 15 px),
@@ -188,6 +193,10 @@ After P1: `/auto_aim/debug` includes `ekf.state`, `ekf.innovation`,
   `best_match_yaw_diff`, and `match_reject_reason` identify whether the
   EKF rejected association by Mahalanobis, position, yaw jump, class
   mismatch, or no measurement.
+* `accepted_face_jump_after_maha` means the yaw-inclusive Mahalanobis gate
+  rejected a candidate, but the position was close and the yaw jump was
+  plausible for a different visible armor face. This is a structural
+  association fallback, not a global threshold loosen.
 * If innovation is large but maha is small, the measurement noise model
   (`r_pos_*`, `r_yaw_*`) may be over-confident: increase the slope.
 * If maha is large persistently, the tracker is drifting from the target
@@ -216,6 +225,11 @@ After P1: `/auto_aim/debug` includes `cmd.yaw_pre_smooth`,
   low for the target's motion or the rate is too low.
 * On a static target, `cmd.yaw_published` should converge to
   `cmd.yaw_pre_smooth` within a few frames.
+* `cmd_coast_active=true` means the node is briefly commanding a `TEMP_LOST`
+  prediction. This should last no more than `cmd.temp_lost_coast_max_s`.
+  After that, `cmd_hold_active=true` should take over.
+* `cmd_published=false` means no safe absolute command exists yet; this should
+  happen only at startup before any pose sample or previous command.
 
 ## Fire blocker reasons (P6+)
 
@@ -226,16 +240,32 @@ When `/auto_aim/debug.fire_allowed == false`, `fire_blocker` is one of:
 | `NOT_TRACKING`     | Tracker not in `TRACKING` state                          |
 | `OUT_OF_RANGE`     | Range is below `min_fire_dist` or above `max_fire_dist`  |
 | `MARGIN_NEGATIVE`  | Selected face is outside the angular window              |
-| `OFF_AXIS`         | Camera-frame angle to face exceeds `angular_window`      |
+| `OFF_AXIS`         | Configured alignment error exceeds `angular_window`      |
 | `INVALID_TARGET`   | Aim planner returned `target_valid == false`             |
 | `INVALID_BALLISTIC`| Ballistic solver failed (range too small or bad geometry)|
 | `SMOOTHING_LAG`    | Smoothed cmd not yet close to ballistic ray (diagnostic, off by default) |
 | `STALE_MEASUREMENT`| Last detection too old                                   |
 | `ANTI_GYRO_TIMING` | Anti-gyro impact-time residual outside tolerance (P9+)   |
+| `TEMP_LOST`        | Tracker is coasting prediction-only after a missed match |
+| `STALE_POSE`       | `/micro_imu` is older than `micro_imu.stale_threshold_s` |
+| `NO_POSE_SOURCE`   | No gimbal pose sample has been received                  |
 
-A blocker histogram printed every 10 s gives an at-a-glance view of why
-fire is being denied. If `MARGIN_NEGATIVE` dominates, the issue is
-geometry or planning.
+A blocker histogram printed every 10 s gives an at-a-glance view of the primary
+reason fire is being denied. `fire_blocker_mask` and `fire_blockers_active`
+show secondary blockers in the same frame, so `NOT_TRACKING` no longer hides
+whether the target was also off-axis, stale, out of range, or margin-negative.
+
+`fire.alignment_source` controls the `OFF_AXIS` gate:
+
+* `camera_angle`: uses `aim_cam_total_angle`, the selected target ray in the
+  camera optical frame. This is the real-robot default when the camera is
+  rigidly mounted to the gimbal and `/micro_imu` is fresh.
+* `relative_error`: uses `sqrt(aim_rel_yaw^2 + aim_rel_pitch^2)`. This still
+  depends on pose feedback and is not proof of convergence with a static fake
+  IMU.
+* `disabled`: disables only the alignment gate. Keep `aim_cam_*` debug fields;
+  use this for static fake-IMU video/bench tests where physical gimbal
+  convergence cannot be observed.
 
 ### When (not) to enable `SMOOTHING_LAG`
 
