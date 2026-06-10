@@ -1,4 +1,4 @@
-# auto_aim_2 — Field Manual
+# auto_aim_2 — Field Manual tyr
 
 This document covers everything you need to operate, tune, and debug the auto-aim
 package on your own. It is organized in three parts:
