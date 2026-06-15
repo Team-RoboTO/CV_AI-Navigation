@@ -12,7 +12,7 @@ media/jetson_notes.md
 video_publisher.py
 ```
 
-`src/autoaim` is the only ROS package in `src/`. It contains the ZED detector, auto-aim C++ node, serial bridge, viewer, launch files, and messages. TensorRT and source model assets live in the workspace-level `models/` directory.
+`src/autoaim` is the only ROS package in `src/`. It contains the ZED detector, auto-aim C++ node, C++ serial bridge, viewer, launch files, and messages. Source and archived TensorRT assets live in the workspace-level `models/` directory; runtime launch defaults to `/workspaces/isaac_ros-dev/AI-models/yolov26_keypoints.engine`.
 
 ## Build
 

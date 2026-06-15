@@ -74,6 +74,17 @@ rclcpp_components_register_node(${PROJECT_NAME}_component
   EXECUTABLE ${PROJECT_NAME}_node
 )
 
+# Serial bridge. This is the only microcontroller transport implementation.
+add_executable(serial_bridge src/serial_bridge.cpp)
+ament_target_dependencies(serial_bridge
+  rclcpp
+  geometry_msgs
+  std_msgs
+)
+install(TARGETS serial_bridge
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 #############
 ## Install ##
 #############
@@ -92,15 +103,14 @@ install(DIRECTORY launch/
   DESTINATION share/${PROJECT_NAME}/launch
 )
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/models")
-  install(DIRECTORY models/
-    DESTINATION share/${PROJECT_NAME}/models
-  )
-endif()
+# NOTE: the TensorRT engine is intentionally NOT installed with the package.
+# It lives outside the workspace (default:
+# /workspaces/isaac_ros-dev/AI-models/yolov26_keypoints.engine) so colcon does
+# not copy a large binary on every build. Point to it with the engine_path
+# launch arg or the AUTOAIM_ENGINE_PATH env var.
 
 install(PROGRAMS
   viewer_node.py
-  serial_bridge.py
   zed_detector.py
   DESTINATION lib/${PROJECT_NAME}
 )

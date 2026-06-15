@@ -31,6 +31,13 @@ ros2 launch autoaim sentry.launch.py serial_port:=/dev/ttyACM1
 ros2 launch autoaim sentry.launch.py engine_path:=/absolute/path/to/model.engine
 ```
 
+All launch profiles use the C++ `serial_bridge` executable. It is the only
+installed serial transport.
+
+The prediction horizon uses measured capture-to-aim latency plus
+`actuation_latency`. Set `use_measured_latency:=false` in a launch profile only
+for fixed-`time_bias` comparison tests.
+
 ## Sanity checks
 
 ```bash

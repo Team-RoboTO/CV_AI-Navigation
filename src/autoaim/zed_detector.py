@@ -50,6 +50,7 @@ import pycuda.driver as cuda
 import pyzed.sl as sl
 import rclpy
 import tensorrt as trt
+from rclpy.time import Time as RclpyTime
 from cv_bridge import CvBridge
 from pycuda.compiler import SourceModule
 from rclpy.node import Node
@@ -67,25 +68,14 @@ except ImportError:
 # -----------------------------------------------------------------------------
 # CONFIG
 # -----------------------------------------------------------------------------
-def find_models_dir(start: Path) -> Path:
-    for path in (start, *start.parents):
-        candidate = path / "models"
-        if candidate.is_dir():
-            return candidate
-    return start / "models"
+# Default TensorRT engine path. The model is kept OUTSIDE the package (e.g.
+# on the Isaac ROS dev volume), so it is not installed by colcon. Resolution
+# order: ROS param engine_path  >  env AUTOAIM_ENGINE_PATH  >  this default.
+ENGINE_DEFAULT = "/workspaces/isaac_ros-dev/AI-models/yolov26_keypoints.engine"
 
 
 def default_engine_path() -> str:
-    env_path = os.environ.get("AUTOAIM_ENGINE_PATH")
-    if env_path:
-        return env_path
-    if get_package_share_directory is not None:
-        try:
-            share_dir = Path(get_package_share_directory("autoaim"))
-            return str(find_models_dir(share_dir) / "jetson64" / "yolov26_keypoints.engine")
-        except Exception:
-            pass
-    return str(find_models_dir(Path(__file__).resolve().parent) / "jetson64" / "yolov26_keypoints.engine")
+    return os.environ.get("AUTOAIM_ENGINE_PATH", ENGINE_DEFAULT)
 
 
 ENGINE_PATH = default_engine_path()
@@ -267,8 +257,8 @@ class Yolo26PoseKeypointsNode(Node):
 
         # Exposure settings for dark arenas. Tune on the real field.
         self.zed.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 0)
-        self.zed.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE, 30)
-        self.zed.set_camera_settings(sl.VIDEO_SETTINGS.GAIN, 20)
+        self.zed.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE, 60)
+        self.zed.set_camera_settings(sl.VIDEO_SETTINGS.GAIN, 50)
         self.zed.set_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO, 1)
 
         # Camera intrinsics for /camera_info.
@@ -282,6 +272,20 @@ class Yolo26PoseKeypointsNode(Node):
             [[calib.fx, 0, calib.cx], [0, calib.fy, calib.cy], [0, 0, 1]],
             dtype=np.float64,
         )
+
+        # Cache the CameraInfo message: intrinsics never change at runtime, and
+        # the old code called zed.get_camera_information() EVERY FRAME at 120 Hz.
+        self.cam_info_msg = CameraInfo()
+        self.cam_info_msg.header.frame_id = FRAME_ID
+        self.cam_info_msg.width = NATIVE_W
+        self.cam_info_msg.height = NATIVE_H
+        self.cam_info_msg.k = [
+            calib.fx, 0.0, calib.cx,
+            0.0, calib.fy, calib.cy,
+            0.0, 0.0, 1.0,
+        ]
+        self.cam_info_msg.d = [0.0, 0.0, 0.0, 0.0]
+        self.cam_info_msg.distortion_model = "plumb_bob"
 
         self.initial_orientation = None
         self.mat_cpu = sl.Mat()
@@ -472,7 +476,17 @@ class Yolo26PoseKeypointsNode(Node):
             if self.zed.grab(sl.RuntimeParameters()) != sl.ERROR_CODE.SUCCESS:
                 continue
 
-            now_msg = self.get_clock().now().to_msg()
+            # CAPTURE timestamp from the ZED SDK, not "now": the autoaim node
+            # interpolates the gimbal angles at this stamp for the camera->odom
+            # projection. sl.TIME_REFERENCE.IMAGE is the moment the frame was
+            # captured (epoch ns, same clock domain as the node clock when
+            # use_sim_time is off). Using get_clock().now() here would hide the
+            # capture->grab latency from the angle sync.
+            t_img_ns = self.zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds()
+            if t_img_ns > 0:
+                now_msg = RclpyTime(nanoseconds=t_img_ns).to_msg()
+            else:
+                now_msg = self.get_clock().now().to_msg()
             self.zed.retrieve_image(self.mat_cpu, sl.VIEW.LEFT, sl.MEM.CPU)
 
             # TensorRT inference.
@@ -648,15 +662,17 @@ class Yolo26PoseKeypointsNode(Node):
     # IMU publisher: same logic as your bbox-only node.
     # ------------------------------------------------------------------
     def _publish_imu(self, now_msg):
+        # BUGFIX: the get_sensors_data() call was commented out, so accel/gyro/
+        # orientation were read from a default-constructed (EMPTY) SensorsData —
+        # /zed/imu_data was publishing garbage. Restored with silent early-return
+        # guards (no log spam at 120 Hz).
         sensors_data = sl.SensorsData()
-        # if self.zed.get_sensors_data(sensors_data, sl.TIME_REFERENCE.CURRENT) != sl.ERROR_CODE.SUCCESS:
-            # self.get_logger().warn("Failed to get sensors data", throttle_duration_sec=5.0)
-            # return
+        if self.zed.get_sensors_data(sensors_data, sl.TIME_REFERENCE.CURRENT) != sl.ERROR_CODE.SUCCESS:
+            return
 
         imu_data = sensors_data.get_imu_data()
-        # if not imu_data.is_available:
-            # self.get_logger().warn("IMU not available on this ZED model", throttle_duration_sec=5.0)
-            # return
+        if not imu_data.is_available:
+            return
 
         accel = np.array(imu_data.get_linear_acceleration())
         gyro = np.array(imu_data.get_angular_velocity())
@@ -664,12 +680,8 @@ class Yolo26PoseKeypointsNode(Node):
 
         q_curr = np.array(imu_data.get_pose().get_orientation().get())
         norm = float(np.linalg.norm(q_curr))
-        # if abs(norm - 1.0) > 0.1:
-            # self.get_logger().warn(
-                # f"IMU orientation not yet valid (norm={norm:.3f}), waiting...",
-                # throttle_duration_sec=2.0,
-            # )
-            # return
+        if abs(norm - 1.0) > 0.1:
+            return  # orientation not yet valid
 
         if self.initial_orientation is None:
             self.initial_orientation = q_curr.copy()
@@ -720,25 +732,9 @@ class Yolo26PoseKeypointsNode(Node):
     # Camera info publisher
     # ------------------------------------------------------------------
     def _publish_camera_info(self, now_msg):
-        calib = (
-            self.zed.get_camera_information()
-            .camera_configuration
-            .calibration_parameters
-            .left_cam
-        )
-        msg = CameraInfo()
-        msg.header.stamp = now_msg
-        msg.header.frame_id = FRAME_ID
-        msg.width = NATIVE_W
-        msg.height = NATIVE_H
-        msg.k = [
-            calib.fx, 0.0, calib.cx,
-            0.0, calib.fy, calib.cy,
-            0.0, 0.0, 1.0,
-        ]
-        msg.d = [0.0, 0.0, 0.0, 0.0]
-        msg.distortion_model = "plumb_bob"
-        self.cam_info_pub.publish(msg)
+        # Cached at init — intrinsics don't change; avoids an SDK call per frame.
+        self.cam_info_msg.header.stamp = now_msg
+        self.cam_info_pub.publish(self.cam_info_msg)
 
     def destroy_node(self):
         self.running = False

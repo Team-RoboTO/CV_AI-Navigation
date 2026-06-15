@@ -31,7 +31,7 @@ All three launch files start the same runtime graph:
 
 - `zed_detector`: ZED X Mini frames, TensorRT inference, keypoints, camera info, IMU.
 - `autoaim`: keypoint PnP, target tracking, ballistic lead, command generation.
-- `serial_bridge.py`: microcontroller link on `/dev/ttyACM0`.
+- `serial_bridge`: C++ microcontroller link on `/dev/ttyACM0`.
 - `autoaim_viewer`: debug image on `/tracker/debug_image`.
 
 ## Armor class

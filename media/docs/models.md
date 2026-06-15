@@ -13,15 +13,20 @@ models/jetson16/hero/
 
 The RT-DETR `.pt` and `.onnx` source files from the Jetson archive are larger than 100 MB, so they stay out of the package tree unless the repository is moved to Git LFS.
 
-Default engines:
+Runtime default:
 
 ```text
-standard.launch.py -> models/jetson16/standard/yolov26_keypoints.engine
-hero.launch.py     -> models/jetson16/hero/yolov26_keypoints.engine
-sentry.launch.py   -> models/jetson64/yolov26_keypoints.engine
+/workspaces/isaac_ros-dev/AI-models/yolov26_keypoints.engine
 ```
 
-TensorRT engines can be rejected when JetPack, TensorRT, CUDA, or GPU architecture differs from the device that built them. Rebuild on the target Jetson if TensorRT fails to deserialize an engine.
+All three launch profiles use this external path by default. The package does
+not install TensorRT engines, so `colcon build` does not copy large binaries.
+Workspace-level model files remain source/archive assets and explicit override
+options.
+
+TensorRT engines can be rejected when JetPack, TensorRT, CUDA, or GPU
+architecture differs from the device that built them. Rebuild on the target
+Jetson if TensorRT fails to deserialize an engine.
 
 Launch override:
 

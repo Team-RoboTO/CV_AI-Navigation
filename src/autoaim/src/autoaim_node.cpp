@@ -14,6 +14,8 @@
 #include <opencv2/calib3d.hpp>
 #include <cmath>
 #include <algorithm>
+#include <deque>
+#include <iterator>
 #include <set>
 #include <string>
 #include <array>
@@ -62,6 +64,12 @@ public:
     cfg.min_fire_dist    = declare_parameter("min_fire_dist", 0.3);
     cfg.max_fire_dist    = declare_parameter("max_fire_dist", 6.0);
     cfg.time_bias        = declare_parameter("time_bias", 0.10);
+    // Measured-latency prediction horizon: the node measures
+    // (now − capture stamp) per frame and the tracker adds actuation_latency
+    // (serial TX + gimbal settle + muzzle exit). time_bias is only the
+    // fallback for use_measured_latency = false.
+    cfg.use_measured_latency = declare_parameter("use_measured_latency", true);
+    cfg.actuation_latency    = declare_parameter("actuation_latency", 0.020);
     cfg.ref_freq         = declare_parameter("ref_freq", 100.0);
     cfg.max_match_dist   = declare_parameter("max_match_dist", 0.5);
     cfg.yaw_jump_thresh  = declare_parameter("yaw_jump_thresh", 0.50);
@@ -145,6 +153,20 @@ public:
     keypoint_topic_ = declare_parameter("keypoint_topic", std::string("/detector/armors_keypoints"));
     min_keypoint_score_ = declare_parameter("min_keypoint_score", 0.05);
     max_reproj_error_ = declare_parameter("max_reproj_error", 25.0);
+
+    // Image <-> gimbal-angle time synchronization.
+    // The image was captured 30-100 ms before the detection arrives here
+    // (ZED capture + inference + transport). Projecting the armor into odom
+    // with the LATEST gimbal angles is wrong by (gimbal slew rate x latency)
+    // whenever the head is moving — at 3 rad/s and 80 ms that's 0.24 rad of
+    // pure projection error, smeared in the direction of motion. The EKF then
+    // chases an artifact of our own gimbal movement, which looks exactly like
+    // "the tracker is slow / lags behind the robot".
+    // When enabled, a ring buffer of time-stamped gimbal angles is kept and
+    // the camera->odom transform uses the angles interpolated AT THE IMAGE
+    // TIMESTAMP. Requires the detector to forward the camera frame stamp in
+    // header.stamp (zed_detector.py now does — sl.TIME_REFERENCE.IMAGE).
+    angle_sync_enable_ = declare_parameter("angle_sync_enable", true);
 
     // ── Subscribers ──
     if (use_keypoints_) {
@@ -242,6 +264,15 @@ private:
     imu_yaw_   = yaw_sign_ * micro_yaw_rad;
     imu_pitch_ = pitch_sign_ * micro_pitch_internal;
     imu_valid_ = true;
+
+    // Ring buffer of time-stamped gimbal angles for image-time lookup.
+    // Stamped at receipt time: the residual error is only the serial latency
+    // (a few ms at 100 Hz / 500 kbaud), instead of the full vision-pipeline
+    // latency we had before.
+    angle_buffer_.push_back({this->now(), imu_yaw_, imu_pitch_});
+    if (angle_buffer_.size() > kMaxAngleBuffer) {
+      angle_buffer_.pop_front();
+    }
 
     updateEgoPoseFromMicroVelocity(raw_vx, raw_vy);
 
@@ -355,6 +386,89 @@ private:
     }
   }
 
+  // ── Image <-> gimbal-angle time synchronization ────────────────────────
+  struct AngleSample
+  {
+    rclcpp::Time t;
+    double yaw;
+    double pitch;
+  };
+
+  static constexpr size_t kMaxAngleBuffer = 500;  // ~5 s of history at 100 Hz
+
+  /// Interpolate the gimbal angles at time t from the ring buffer.
+  /// Clamps to the nearest sample when t is outside the buffered range.
+  bool lookupAngles(const rclcpp::Time & t, double & yaw, double & pitch) const
+  {
+    if (angle_buffer_.empty()) {
+      return false;
+    }
+
+    if (t <= angle_buffer_.front().t) {
+      yaw = angle_buffer_.front().yaw;
+      pitch = angle_buffer_.front().pitch;
+      return true;
+    }
+
+    if (t >= angle_buffer_.back().t) {
+      yaw = angle_buffer_.back().yaw;
+      pitch = angle_buffer_.back().pitch;
+      return true;
+    }
+
+    // Walk from the back: image stamps are normally close to the newest sample.
+    for (auto it = angle_buffer_.rbegin(); std::next(it) != angle_buffer_.rend(); ++it) {
+      const AngleSample & nb = *it;             // newer
+      const AngleSample & ob = *std::next(it);  // older
+      if (t >= ob.t && t <= nb.t) {
+        const double span = (nb.t - ob.t).seconds();
+        const double u = span > 1e-6 ? (t - ob.t).seconds() / span : 1.0;
+        yaw = angles::normalize_angle(
+          ob.yaw + u * angles::shortest_angular_distance(ob.yaw, nb.yaw));
+        pitch = ob.pitch + u * (nb.pitch - ob.pitch);
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /// Build the camera->odom transform for THIS image frame, using the gimbal
+  /// angles at the image timestamp (when angle_sync_enable and the stamp are
+  /// valid) instead of the latest angles. Falls back to the latest angles when
+  /// sync is disabled, the stamp is zero, or the buffer is empty.
+  void computeFrameTransform(const std_msgs::msg::Header & header)
+  {
+    double yaw = imu_yaw_;
+    double pitch = imu_pitch_;
+
+    if (angle_sync_enable_) {
+      const rclcpp::Time t(header.stamp);
+      if (t.nanoseconds() > 0) {
+        double by = 0.0;
+        double bp = 0.0;
+        if (lookupAngles(t, by, bp)) {
+          yaw = by;
+          pitch = bp;
+        }
+      } else {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 5000,
+          "angle_sync enabled but detection header.stamp is zero — the detector "
+          "must forward the camera frame timestamp. Falling back to latest angles.");
+      }
+    }
+
+    tf2::Quaternion q_gimbal;
+    q_gimbal.setRPY(0.0, pitch, yaw);
+
+    tf2::Quaternion q_conv;
+    q_conv.setRPY(-M_PI / 2, 0, -M_PI / 2);
+
+    frame_rotation_ = q_gimbal * q_conv;
+    frame_translation_ = tf2::Vector3(robot_x_, robot_y_, cfg_.gimbal_height);
+  }
+
   bool appendArmorFromPnP(
     const cv::Mat & rvec, const cv::Mat & tvec,
     const std::string & cid, double confidence,
@@ -394,8 +508,10 @@ private:
     }
     q_armor.normalize();
 
-    tf2::Vector3 p_odom = tf2::quatRotate(imu_rotation_, p_cam) + imu_translation_;
-    tf2::Quaternion q_odom = imu_rotation_ * q_armor;
+    // Use the transform built for THIS image frame (gimbal angles at the image
+    // timestamp), not the latest angles — see computeFrameTransform().
+    tf2::Vector3 p_odom = tf2::quatRotate(frame_rotation_, p_cam) + frame_translation_;
+    tf2::Quaternion q_odom = frame_rotation_ * q_armor;
 
     double r, p, y;
     tf2::Matrix3x3(q_odom).getRPY(r, p, y);
@@ -474,7 +590,14 @@ private:
     // with the detection's rel_range (both camera-relative).
     tracker_->setEgoPose(robot_x_, robot_y_);
 
-    tracker_->update(armors, dt, this->now());
+    // Use the MEASUREMENT time for the tracker (capture stamp, fallback to now):
+    // the vyaw-from-jump-timing estimator measures intervals between face jumps,
+    // and capture intervals are jitter-free compared to processing time.
+    rclcpp::Time meas_t = now;
+    if (meas_t.nanoseconds() == 0) {
+      meas_t = this->now();
+    }
+    tracker_->update(armors, dt, meas_t);
 
     // Detect target switch: if the tracker switched to a new target, reset
     // the node-side EMA and rate-limiter so the gimbal doesn't blend the
@@ -487,6 +610,22 @@ private:
       fire_hysteresis_active_ = false;
       last_target_generation_ = gen;
     }
+
+    // Measured pipeline latency: age of the EKF state (capture stamp) at the
+    // moment the command is computed. The tracker adds actuation_latency on
+    // top; setPipelineLatency clamps to [0, 0.25] so a zero or foreign-clock
+    // stamp can never blow up the prediction horizon.
+    double pipeline_latency = 0.0;
+    if (now.nanoseconds() > 0) {
+      pipeline_latency = (this->now() - now).seconds();
+    }
+    tracker_->setPipelineLatency(pipeline_latency);
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "pipeline latency (capture->aim) = %.1f ms, + actuation_latency = %.0f ms "
+      "(use_measured_latency=%d)",
+      pipeline_latency * 1e3, cfg_.actuation_latency * 1e3,
+      cfg_.use_measured_latency ? 1 : 0);
 
     auto aim = tracker_->computeAim(imu_yaw_, imu_pitch_,
                                     robot_x_, robot_y_,
@@ -542,6 +681,9 @@ private:
         "Waiting for /micro_status: Float32MultiArray [yaw_rad, pitch_rad, vx, vy, ...]");
       return;
     }
+
+    // Build the camera->odom transform for this image frame (time-synced angles).
+    computeFrameTransform(msg->header);
 
     std::vector<ArmorDetection> armors;
 
@@ -609,6 +751,9 @@ private:
         "Waiting for /micro_status: Float32MultiArray [yaw_rad, pitch_rad, vx, vy, ...]");
       return;
     }
+
+    // Build the camera->odom transform for this image frame (time-synced angles).
+    computeFrameTransform(msg->header);
 
     std::vector<ArmorDetection> armors;
 
@@ -1091,6 +1236,13 @@ private:
 
   tf2::Quaternion imu_rotation_{0, 0, 0, 1};
   tf2::Vector3 imu_translation_{0, 0, 0};
+
+  // Image <-> gimbal-angle time sync.
+  bool angle_sync_enable_ = true;
+  std::deque<AngleSample> angle_buffer_;
+  // Camera->odom transform for the CURRENT image frame (angles at image stamp).
+  tf2::Quaternion frame_rotation_{0, 0, 0, 1};
+  tf2::Vector3 frame_translation_{0, 0, 0};
 
   rclcpp::Time last_time_{0, 0, RCL_ROS_TIME};
 

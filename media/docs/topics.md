@@ -46,4 +46,6 @@ data[2] chassis vx [m/s]
 data[3] chassis vy [m/s]
 ```
 
-The serial bridge may append transmit echo values after the first four fields.
+The serial bridge publishes ten received floats, then appends six transmit echo
+values. Topic names, layouts, and the `autoaim` generated-message namespace
+remain compatible with the previous package.

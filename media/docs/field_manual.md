@@ -23,10 +23,10 @@ source install/setup.bash
 ```
 
 `--symlink-install` is mandatory. Without it, every change to the launch file or any
-Python script (viewer, serial bridge) requires a full rebuild before taking effect.
+Python script (viewer or detector) requires a full rebuild before taking effect.
 With it, edits to those files are live as soon as you re-launch.
 
-C++ files (`tracker.cpp`, `autoaim_node.cpp`, `pnp_solver.cpp`) still require
+C++ files (`tracker.cpp`, `autoaim_node.cpp`, `pnp_solver.cpp`, `serial_bridge.cpp`) still require
 a rebuild after each change.
 
 ## Launch
@@ -41,8 +41,9 @@ Each launch starts four nodes:
 
 - `zed_detector` — ZED X Mini capture, TensorRT inference, keypoints,
   camera info, and IMU.
-- `micro_communications_node` — serial bridge to the micro (publishes `/micro_status`,
-  subscribes `/cmd_vel_AI`). Auto-reconnects on cable unplug or micro reflash.
+- `micro_communications_node` — C++ serial bridge to the micro (publishes
+  `/micro_status`, subscribes `/cmd_vel_AI`). Auto-reconnects on cable unplug
+  or micro reflash.
 - `autoaim` — main C++ node (subscribes to detector, publishes `/cmd_vel_AI`).
 - `autoaim_viewer` — debug overlay (publishes `/tracker/debug_image`).
 
@@ -53,7 +54,7 @@ After launching, in another terminal run each of these and verify what you see:
 ```bash
 # Detector is publishing keypoints?
 ros2 topic hz /detector/armors_keypoints
-# Should show ~70 Hz (or whatever your detector runs at).
+# Should show a stable rate. Set ref_freq to the measured result.
 
 # Serial bridge is alive?
 ros2 topic echo /micro_status --once
@@ -128,15 +129,17 @@ If any of these fails, jump to Part 3 ("Symptom: no commands published" or
 - `data[2]` = chassis vx [m/s] (when ego-motion enabled)
 - `data[3]` = chassis vy [m/s] (when ego-motion enabled)
 - `data[N]` = chassis yaw [rad] (optional; set `chassis_heading_index` to N to use it)
-- The serial bridge appends a TX echo after these: ai_yaw, ai_pitch, shoot, ...
+- The serial bridge publishes ten RX floats and appends six TX echo values:
+  ai_yaw, ai_pitch, shoot, and the remaining command fields.
 
 ## Coordinate frames
 
 - **camera frame**: X right, Y down, Z forward (OpenCV convention).
 - **odom (world) frame**: X forward of robot at startup, Y left, Z up (REP-103).
 - **gimbal body frame**: barrel forward (X), left (Y), up (Z).
-- The TF chain converts armor pose from camera → odom using the gimbal's current
-  yaw/pitch (from `/micro_status[0..1]`). When ego-motion is enabled, the chain also
+- The TF chain converts armor pose from camera → odom using interpolated gimbal
+  yaw/pitch at the image capture timestamp (from `/micro_status[0..1]`). When
+  ego-motion is enabled, the chain also
   adds the integrated robot position `robot_x_/robot_y_` so `imu_translation_` is the
   current camera location in world coordinates.
 
@@ -177,8 +180,9 @@ position of the *currently-visible* face in odom.
 
 ## Parameter index
 
-Every tunable parameter is listed below, grouped by what it controls. Where it
-lives in the launch file is shown so you can find it fast.
+Every tunable parameter is listed below, grouped by what it controls. Values
+describe the standard/hero launch baseline; sentry contains robot-specific
+calibration and tuning differences.
 
 ### Detector input
 
@@ -187,7 +191,7 @@ lives in the launch file is shown so you can find it fast.
 | `target_classes` | `['0']` | Which class IDs the auto-aim attacks. Current YOLO26 labels: `0`=blue, `1`=grey, `2`=red. Grey is ignored by the tracker. Set to YOUR ENEMIES' color. |
 | `use_keypoints` | `true` | If true, subscribe to `/detector/armors_keypoints`. If false, fall back to bbox-only PnP. |
 | `keypoint_topic` | `/detector/armors_keypoints` | Where to read keypoint detections. |
-| `min_keypoint_score` | `0.0` | Reject keypoints with score below this. Raise to 0.3–0.5 if walls/floor cause false dets. |
+| `min_keypoint_score` | `0.3` | Reject keypoints with score below this. Sentry currently uses `0.15`. |
 | `max_reproj_error` | `25.0` | PnP solutions with average reprojection error above this many pixels are rejected. |
 | `light_ratio` | `0.85` | Shrink factor for the bbox PnP fallback. |
 | `max_armor_distance` | `6.0` | Armors farther than this [m] from the camera are dropped. |
@@ -197,15 +201,15 @@ lives in the launch file is shown so you can find it fast.
 
 | Param | Default | What it does |
 |---|---|---|
-| `confirm_frames` | `3` | Consecutive detections needed to confirm DETECTING → TRACKING. |
-| `lost_timeout` | `0.30` | Seconds to coast in TEMP_LOST before giving up → LOST. |
+| `confirm_frames` | `2` | Consecutive detections needed to confirm DETECTING → TRACKING. |
+| `lost_timeout` | `0.50` | Seconds to coast in TEMP_LOST before giving up → LOST. |
 
 ### EKF process noise (how fast can the target change?)
 
 | Param | Default | What it does |
 |---|---|---|
-| `q_pos` | `5.0` | XY position process noise. Higher = target can accelerate harder. |
-| `q_yaw` | `10.0` | Spin rate process noise. Higher = target can change RPM more quickly. |
+| `q_pos` | `10.0` | XY position process noise. Higher = target can accelerate harder. Sentry uses a profile-specific value. |
+| `q_yaw` | `20.0` | Spin rate process noise. Higher = target can change RPM more quickly. |
 | `q_r` | `1e-6` | Radius process noise. Should stay near zero (radius is constant per robot). |
 
 ### EKF measurement noise (how much do we trust each detection?)
@@ -222,10 +226,10 @@ lives in the launch file is shown so you can find it fast.
 
 | Param | Default | What it does |
 |---|---|---|
-| `alpha_pos` | `0.99` | Damping on XY velocity per frame at `ref_freq`. Closer to 1.0 = velocity persists longer. |
+| `alpha_pos` | `0.995` | Damping on XY velocity per frame at `ref_freq`. Closer to 1.0 = velocity persists longer. |
 | `alpha_yaw` | `1.00` | Damping on spin rate. Keep at 1.0 for spinning enemies. |
-| `alpha_coast` | `0.95` | Damping while coasting in TEMP_LOST. |
-| `ref_freq` | `70.0` | Damping reference frequency. MUST match your detector rate. |
+| `alpha_coast` | `0.98` | Damping while coasting in TEMP_LOST. |
+| `ref_freq` | `60.0` | Damping reference frequency. MUST match your measured detector rate. |
 
 ### Armor geometry
 
@@ -241,32 +245,35 @@ lives in the launch file is shown so you can find it fast.
 |---|---|---|
 | `bullet_speed` | `25.0` | Bullet muzzle velocity [m/s]. MEASURE THIS — wrong value = vertical miss. |
 | `gravity` | `9.8` | Gravitational acceleration [m/s²]. |
-| `gimbal_height` | `0.325` | Height of camera/gimbal pivot above ground [m]. |
+| `gimbal_height` | `0.420` | Height of camera/gimbal pivot above ground [m]. |
 | `barrel_offset_x` | `0.0` | Offset from camera to barrel exit (forward) [m]. |
-| `barrel_offset_y` | `0.0` | Offset from camera to barrel exit (left) [m]. |
-| `barrel_offset_z` | `-0.05` | Offset from camera to barrel exit (up). NEGATIVE = barrel below camera. |
+| `barrel_offset_y` | `0.0` | Offset from active camera lens to barrel exit (left) [m]. Measure per robot. |
+| `barrel_offset_z` | `0.03` | Offset from active camera lens to barrel exit (up). Positive means barrel above lens. |
 
 ### Fire gate
 
 | Param | Default | What it does |
 |---|---|---|
-| `angular_window` | `0.13` | Max angle [rad] between face normal and barrel-target line for fire. ~7.5°. |
-| `window_ref_dist` | `3.0` | Reference distance for the angular window. |
-| `min_fire_dist` | `0.5` | Don't fire closer than this [m]. |
+| `angular_window` | `1.0` | Max angle [rad] between face normal and barrel-target line for fire. Current profiles keep this loose for tuning. |
+| `window_ref_dist` | `1.0` | Reference distance for the angular window. Sentry uses `3.0`. |
+| `min_fire_dist` | `0.2` | Don't fire closer than this [m]. |
 | `max_fire_dist` | `6.0` | Don't fire farther than this [m]. |
 
 ### Timing and prediction
 
 | Param | Default | What it does |
 |---|---|---|
-| `time_bias` | `0.025` | Total system latency [s] added to bullet flight time prediction. |
+| `angle_sync_enable` | `true` | Interpolate gimbal angles at the image capture timestamp. |
+| `use_measured_latency` | `true` | Use measured capture-to-aim pipeline latency. |
+| `actuation_latency` | `0.020` | Constant serial, gimbal-settle, and muzzle-exit latency [s]. Tune this on moving targets. |
+| `time_bias` | `0.045` | Fixed latency fallback used only when `use_measured_latency` is false. |
 
 ### EKF data association
 
 | Param | Default | What it does |
 |---|---|---|
-| `max_match_dist` | `0.5` | Max position gap [m] between prediction and detection for a match. |
-| `maha_threshold` | `13.3` | Mahalanobis gate. 9.49=strict (95%), 13.3=loose (99%), 16.3=very loose. |
+| `max_match_dist` | `0.8` | Max position gap [m] between prediction and detection for a match. |
+| `maha_threshold` | `16.9` | Mahalanobis gate. Lower only after validating stable association. |
 
 ### Target switching
 
@@ -280,7 +287,7 @@ lives in the launch file is shown so you can find it fast.
 
 | Param | Default | What it does |
 |---|---|---|
-| `cmd_smooth_alpha` | `0.85` | EMA on the gimbal target. 1.0 = no smoothing. |
+| `cmd_smooth_alpha` | `1.0` | EMA on the gimbal target. 1.0 = no smoothing. |
 | `cmd_deadband_yaw` | `0.005` | Below this yaw error [rad], don't update yaw command. |
 | `cmd_deadband_pitch` | `0.005` | Same for pitch. |
 | `cmd_rate_limit_yaw` | `0.0` | Max yaw command change per second [rad/s]. 0 = disabled. |
@@ -289,9 +296,10 @@ lives in the launch file is shown so you can find it fast.
 | `fire_lock_pitch` | `0.04` | Same for pitch. |
 | `cmd_hold_time` | `0.25` | After target lost, hold last command for this long [s] before relaxing. |
 | `cmd_max_delta_yaw` | `0.80` | Max one-frame yaw command jump [rad]. |
-| `cmd_max_delta_pitch` | `0.35` | Same for pitch. |
+| `cmd_max_delta_pitch` | `0.80` | Same for pitch. |
 | `require_aim_inside_frame` | `false` | If true, never fire when predicted aim is outside the camera frame. |
 | `micro_pitch_feedback_opposite_sign` | `true` | If micro reports pitch with opposite sign from command. **PHYSICAL CHECK REQUIRED.** |
+| `micro_pitch_lock_opposite_sign` | `true` | Must equal `micro_pitch_feedback_opposite_sign`; verify feedback against command echo. |
 
 ### Ego-motion compensation
 
@@ -311,7 +319,7 @@ lives in the launch file is shown so you can find it fast.
 | Param | Default | What it does |
 |---|---|---|
 | `gimbal.yaw_sign` | `1.0` | Flip to -1.0 if gimbal moves the wrong way in yaw. |
-| `gimbal.pitch_sign` | `1.0` | Flip to -1.0 if gimbal moves the wrong way in pitch. |
+| `gimbal.pitch_sign` | `-1.0` | Flip only if gimbal moves the wrong way in pitch. |
 
 ### Serial bridge
 
@@ -322,6 +330,11 @@ lives in the launch file is shown so you can find it fast.
 | `serial_tx_hz` | `100.0` | TX rate. Lower if the micro can't keep up. |
 | `serial_reconnect_interval` | `2.0` | Retry period when port is closed [s]. |
 | `serial_rx_timeout` | `3.0` | No-RX timeout before forcing reconnect [s]. |
+| `cmd_timeout` | `0.3` | Force shoot to zero when `/cmd_vel_AI` becomes stale [s]. |
+| `use_framed_protocol` | `false` | Enable header + CRC8 packets only with matching micro firmware. |
+| `serial_parity` | `even` | Serial parity; use `none` only when firmware is configured for 8N1. |
+| `low_latency` | `false` | Request the Linux low-latency tty flag when supported. |
+| `thread_priority` | `0` | Request SCHED_FIFO priority when greater than zero and permitted. |
 
 ---
 
@@ -389,11 +402,12 @@ Possible causes, in order:
 3. **`min_fire_dist` too large.** If you tested at 0.4m but `min_fire_dist=0.5`,
    no fire. Lower to 0.3.
 
-4. **Pitch sign wrong → permanent pitch error.** If `micro_pitch_feedback_opposite_sign`
-   is wrong, the geometry believes the gimbal is pointing in the wrong direction.
-   The pitch fire-lock error will be large and constant. Test: tilt the gimbal
-   up manually and watch RViz — the detected armor should appear higher in odom.
-   If it appears lower, flip `micro_pitch_feedback_opposite_sign` in the launch file.
+4. **Pitch sign flags wrong → permanent pitch error.**
+   `micro_pitch_feedback_opposite_sign` and
+   `micro_pitch_lock_opposite_sign` must be equal. Compare `/micro_status[1]`
+   feedback with command echo field `[11]`: opposite signs require both `true`;
+   matching signs require both `false`. Then tilt the gimbal up and verify the
+   detected armor rises in odom.
 
 5. **`cmd_deadband_yaw` >= `fire_lock_yaw`.** The deadband freezes correction
    before the lock can be satisfied. Always keep deadband < lock threshold.
@@ -406,9 +420,10 @@ Possible causes, in order:
 
 The aim is correct on a static target but lags behind a moving one.
 
-1. **`time_bias` too small.** This is the most common cause. Increase by 0.010 s
-   per test until the aim leads the target correctly. Typical good value:
-   0.030–0.045 s.
+1. **`actuation_latency` too small.** With `use_measured_latency: true`, increase
+   it by 0.005 s per moving-target test. Check that the node's reported measured
+   pipeline latency is plausible first. Tune `time_bias` only when measured
+   latency is disabled.
 
 2. **`ref_freq` wrong.** Run `ros2 topic hz /detector/armors_keypoints`. If it
    reports 65 Hz but `ref_freq: 100`, the damping formula multiplies dt × 100
@@ -429,7 +444,8 @@ The aim is correct on a static target but lags behind a moving one.
 
 Aim leads too much. The bullet arrives where the target was going to be but isn't.
 
-1. **`time_bias` too large.** Reduce by 0.005 s steps.
+1. **`actuation_latency` too large.** Reduce by 0.005 s steps when measured
+   latency is enabled. Otherwise reduce fallback `time_bias`.
 
 2. **`alpha_pos` at 1.0 with a decelerating target.** No damping means a target
    that just stopped is still predicted as moving. Try 0.98.
@@ -439,8 +455,9 @@ Aim leads too much. The bullet arrives where the target was going to be but isn'
 
 ## SYMPTOM: shots land left or right of center
 
-1. **`barrel_offset_y` wrong.** Measure with a ruler from camera centre to
-   barrel centre. Positive = barrel left of camera. Typical RoboMaster: a few cm.
+1. **`barrel_offset_y` wrong.** Measure from the active ZED lens to the barrel
+   center. Positive = barrel left of lens. The upside-down camera configuration
+   changes which physical lens supplies the active image.
 
 2. **`yaw_offset_deg`** (if you have it in the launch file as a static yaw bias).
    Adjust in 0.3° steps if there is a residual lateral bias after other tuning.
@@ -454,15 +471,14 @@ Aim leads too much. The bullet arrives where the target was going to be but isn'
    MEASURE with a chronograph. A 10% error in bullet speed causes ~2 cm vertical
    miss at 3 m.
 
-2. **`barrel_offset_z` wrong.** Measure camera-to-barrel offset with a ruler.
-   Standard RoboMaster: -0.05 to -0.15 (barrel below camera). If shots land
-   below aim, make this less negative.
+2. **`barrel_offset_z` wrong.** Measure active-lens-to-barrel offset with a
+   ruler. Positive means the barrel is above the lens.
 
 3. **`gimbal_height` wrong.** Measure from ground to camera center. Affects
    gravity drop compensation.
 
-4. **`micro_pitch_feedback_opposite_sign` wrong.** See the section on "never
-   fires" above.
+4. **Pitch sign flags wrong.** Keep `micro_pitch_feedback_opposite_sign` and
+   `micro_pitch_lock_opposite_sign` equal; see the "never fires" section.
 
 ## SYMPTOM: gimbal slow / sluggish, never catches a fast target
 
@@ -525,8 +541,8 @@ Opposite of the above.
 3. **Baudrate mismatch.** Verify the micro firmware uses the same baud
    (default 500000).
 
-4. **Parity mismatch.** The Python bridge uses `PARITY_EVEN`. If your micro
-   uses none, edit the serial bridge file (line near `parity=serial.PARITY_EVEN`).
+4. **Parity mismatch.** The C++ bridge defaults to `serial_parity: even`. Set
+   `serial_parity: none` in launch when the micro uses 8N1.
 
 ## SYMPTOM: ego-motion makes everything worse
 
@@ -637,7 +653,7 @@ If a match is starting in 5 minutes and you have to get something working:
 
 # DETECTOR
 {'target_classes': ['0']},      # blue=0, red=2 — match enemy color
-{'min_keypoint_score': 0.0},
+{'min_keypoint_score': 0.15},
 {'max_reproj_error': 40.0},     # permissive — accept noisy keypoints
 
 # EGO-MOTION — keep disabled for first match unless thoroughly validated
@@ -652,25 +668,29 @@ If a match is starting in 5 minutes and you have to get something working:
 {'cmd_deadband_yaw': 0.005},
 {'cmd_deadband_pitch': 0.005},
 
-# PREDICTION — start conservative
-{'time_bias': 0.030},
-{'ref_freq': 70.0},             # set to your detector rate
-{'cmd_smooth_alpha': 0.90},
+# PREDICTION — measured pipeline + calibrated actuation
+{'angle_sync_enable': True},
+{'use_measured_latency': True},
+{'actuation_latency': 0.020},    # tune in 5 ms steps on a moving target
+{'time_bias': 0.045},            # fallback only
+{'ref_freq': 60.0},              # set to your detector rate
+{'cmd_smooth_alpha': 1.0},
 
 # BALLISTICS — measure these
 {'bullet_speed': 25.0},         # ← chronograph
-{'barrel_offset_z': -0.05},     # ← ruler
+{'barrel_offset_z': 0.03},      # ← measure from active lens
 
 # TRACKER — forgiving
-{'maha_threshold': 13.3},
+{'maha_threshold': 16.9},
 {'lost_timeout': 0.50},
 {'max_match_dist': 0.7},
 {'same_target_identity_dist': 1.0},
 
 # GIMBAL SIGNS — verify with manual gimbal command
 {'gimbal.yaw_sign': 1.0},
-{'gimbal.pitch_sign': 1.0},
+{'gimbal.pitch_sign': -1.0},
 {'micro_pitch_feedback_opposite_sign': True},   # ← physically verify
+{'micro_pitch_lock_opposite_sign': True},       # ← must match feedback flag
 ```
 
 After the first match, tighten step by step (see Part 3) based on what you saw.

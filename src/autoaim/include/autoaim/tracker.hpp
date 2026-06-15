@@ -2,6 +2,7 @@
 #define AUTOAIM__TRACKER_HPP_
 
 #include <Eigen/Dense>
+#include <algorithm>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -126,6 +127,16 @@ struct TrackerConfig
   double max_fire_dist     = 6.0;
 
   // Timing
+  // ── PREDICTION HORIZON (measured-latency split) ──
+  // When use_measured_latency is true, the horizon between the EKF state time
+  // (capture stamp) and bullet exit is:
+  //     measured pipeline latency (set per frame by the node, = now − capture)
+  //   + actuation_latency (constant: serial TX + gimbal settle + muzzle exit).
+  // time_bias is then IGNORED — it remains only as the fixed-bias fallback for
+  // use_measured_latency = false. Rationale: a fixed bias is wrong whenever
+  // detector load varies; at 150 RPM every 10 ms of error ≈ 4 cm at the plate.
+  bool   use_measured_latency = true;
+  double actuation_latency    = 0.020;
   double time_bias         = 0.10;
   double ref_freq          = 100.0;
 
@@ -241,6 +252,15 @@ public:
                        double robot_x = 0.0, double robot_y = 0.0,
                        double robot_vx = 0.0, double robot_vy = 0.0) const;
 
+  /// Per-frame measured pipeline latency [s]: (now − capture stamp) computed
+  /// by the node at aim time. Clamped to [0, 0.25] so a missing/foreign-clock
+  /// stamp can never blow up the prediction horizon. Call before computeAim().
+  void setPipelineLatency(double s)
+  {
+    pipeline_latency_ = std::clamp(s, 0.0, 0.25);
+  }
+  double pipelineLatency() const { return pipeline_latency_; }
+
   enum State { LOST, DETECTING, TRACKING, TEMP_LOST };
   State state() const { return state_; }
   const Eigen::VectorXd & ekfState() const { return x_; }
@@ -266,6 +286,13 @@ private:
   struct BallisticResult { double pitch, flight_time; bool valid; };
   BallisticResult solveBallistic(double ground_dist, double dz) const;
 
+  /// Non-flight part of the prediction horizon (EKF state time → bullet exit).
+  double predictionBias() const
+  {
+    return cfg_.use_measured_latency ? (pipeline_latency_ + cfg_.actuation_latency)
+                                     : cfg_.time_bias;
+  }
+
   /// Check if we should switch to a closer target
   bool shouldSwitch(const ArmorDetection & candidate) const;
 
@@ -285,6 +312,9 @@ private:
   // has moved the robot.
   double ego_x_ = 0.0;
   double ego_y_ = 0.0;
+
+  // Measured pipeline latency for the current frame (set by the node).
+  double pipeline_latency_ = 0.0;
 
   double radius_ = 0.24;
   double other_radius_ = 0.28;
