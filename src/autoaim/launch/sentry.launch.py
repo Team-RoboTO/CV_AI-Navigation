@@ -7,7 +7,8 @@ from pathlib import Path
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
+from launch.conditions import IfCondition
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
 
@@ -174,17 +175,26 @@ def generate_launch_description():
         {"micro_pitch_feedback_opposite_sign": True},
     ]
 
-    detector_params = [
-        {"engine_path": engine_path},
-        {"threshold": 0.15},
-        {"nms_iou": 0.2},
-        {"publish_debug_every": 4},
-        {"debug_scores": True},
-    ]
+    # Camera selection: camera:=realsense (default) or camera:=zed. The detector
+    # is the ONLY camera-specific node — autoaim/tracker/serial/viewer are
+    # unchanged and never learn which camera is active (same topics either way).
+    camera = LaunchConfiguration("camera")
+    pkg_share = get_package_share_directory("autoaim")
+    zed_config = os.path.join(pkg_share, "config", "sensors", "zed.yaml")
+    realsense_config = os.path.join(pkg_share, "config", "sensors", "realsense.yaml")
+    # The engine_path launch arg/env overrides whatever the sensor YAML sets.
+    engine_override = {"engine_path": engine_path}
+
+    use_zed = IfCondition(PythonExpression(["'", camera, "' == 'zed'"]))
+    use_realsense = IfCondition(PythonExpression(["'", camera, "' == 'realsense'"]))
 
     return LaunchDescription([
         DeclareLaunchArgument("engine_path", default_value=str(default_engine)),
         DeclareLaunchArgument("serial_port", default_value="/dev/ttyACM0"),
+        # Defaults to the RealSense competition path; camera:=zed selects ZED.
+        DeclareLaunchArgument(
+            "camera", default_value="realsense",
+            description="Active camera detector: 'realsense' (default) or 'zed'"),
         Node(
             package="autoaim",
             executable="serial_bridge",
@@ -206,11 +216,23 @@ def generate_launch_description():
             parameters=viewer_params,
             output="screen",
         ),
+        # ZED detector (camera:=zed). Camera/runtime config in config/sensors/zed.yaml.
         Node(
             package="autoaim",
             executable="zed_detector.py",
             name="zed_detector",
-            parameters=detector_params,
+            parameters=[zed_config, engine_override],
             output="screen",
+            condition=use_zed,
+        ),
+        # RealSense detector (camera:=realsense, DEFAULT). Config in
+        # config/sensors/realsense.yaml. Same topics/messages as the ZED path.
+        Node(
+            package="autoaim",
+            executable="realsense_detector",
+            name="realsense_detector",
+            parameters=[realsense_config, engine_override],
+            output="screen",
+            condition=use_realsense,
         ),
     ])

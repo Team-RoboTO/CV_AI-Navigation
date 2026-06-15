@@ -24,9 +24,16 @@ not install TensorRT engines, so `colcon build` does not copy large binaries.
 Workspace-level model files remain source/archive assets and explicit override
 options.
 
+Both detector paths (RealSense C++ and ZED Python) load the **same** keypoint
+engine via the same `engine_path` resolution order, so only one engine is
+needed per device.
+
 TensorRT engines can be rejected when JetPack, TensorRT, CUDA, or GPU
 architecture differs from the device that built them. Rebuild on the target
-Jetson if TensorRT fails to deserialize an engine.
+Jetson if TensorRT fails to deserialize an engine. (Observed during this work:
+the device runs TensorRT 10.7; an engine built with a newer TensorRT fails to
+deserialize with "old deserialization call on a newer plan file" — rebuild it
+on the target.)
 
 Launch override:
 

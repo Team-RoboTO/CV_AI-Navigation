@@ -24,11 +24,31 @@ src/autoaim/launch/hero.launch.py
 src/autoaim/launch/sentry.launch.py
 ```
 
+## Camera selection
+
+All three profiles default to the **RealSense** C++ detector. Override with
+`camera:=zed` to use the ZED detector instead:
+
+```bash
+ros2 launch autoaim standard.launch.py                 # RealSense (default)
+ros2 launch autoaim hero.launch.py                     # RealSense (default)
+ros2 launch autoaim standard.launch.py camera:=zed     # ZED path
+```
+
+Per-camera parameters live in YAML (camera/detector only — robot calibration
+stays in the autoaim node params inside the launch files):
+
+```text
+src/autoaim/config/sensors/realsense.yaml
+src/autoaim/config/sensors/zed.yaml
+```
+
 ## Overrides
 
 ```bash
 ros2 launch autoaim sentry.launch.py serial_port:=/dev/ttyACM1
 ros2 launch autoaim sentry.launch.py engine_path:=/absolute/path/to/model.engine
+ros2 launch autoaim sentry.launch.py camera:=zed
 ```
 
 All launch profiles use the C++ `serial_bridge` executable. It is the only

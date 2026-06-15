@@ -274,3 +274,123 @@ So a per-Jetson or per-robot engine still overrides without editing code, e.g.:
 
 Note: the detector deserializes the engine at startup and aborts if the file
 is missing — make sure the path exists on the target before launching.
+
+---
+
+## 10. RealSense C++ detector path + ZED config refactor (2026-06-15)
+
+### Goal
+Add a high-performance C++ RealSense detector for the competition while keeping
+the ZED path working, selectable at launch (`camera:=realsense|zed`). The
+autoaim/tracker/serial/viewer nodes are **unchanged** and never learn which
+camera is active — both detectors publish the identical topics/messages
+(`/detector/armors_keypoints`, `/detector/armors`, `/detector/armors_keypoints_json`,
+`/camera_info`, `/yolo/debug_image`) with the same class-id convention
+(0 blue, 1 grey, 2 red) and keypoint order (TL,TR,BR,BL).
+
+### New RealSense detector — `src/realsense_detector.cpp` (+ `src/realsense_preprocess.cu`, `include/autoaim/realsense_preprocess.h`)
+- **librealsense2 used directly** (no `realsense2_camera` node, no image-topic
+  round trip). **Color stream only** by default — this is the competition path,
+  so the extra latency/copies of a ROS image hop are avoided.
+- **Reuses the existing pipeline logic.** The CUDA letterbox/normalize kernel is
+  the same math as the one baked into `zed_detector.py` (only the source stride
+  differs: BGR8 vs BGRA), and the YOLO-pose decode (raw `[1,C,A]`/`[1,A,C]` and
+  post-NMS `[1,max_det,6+K*3]` layouts, auto-detected from the engine) is a
+  faithful C++ port of the Python `_parse_output_shape`/`_decode_*` functions.
+  Raw-mode NMS reuses `cv::dnn::NMSBoxes`.
+- **CameraInfo from the live color intrinsics** (`rs2_intrinsics`: fx/fy/ppx/ppy,
+  5 distortion coeffs, model→`plumb_bob`/`equidistant`). Cached once; intrinsics
+  do not change at runtime.
+- **No per-frame allocations / minimal CPU copies.** Device input/output/color
+  buffers, a pinned host output buffer, the CUDA stream, and the decode scratch
+  vectors are all preallocated; tensor addresses are set once. Per frame: one
+  H2D color copy, kernel, `enqueueV3`, one D2H copy, decode, publish.
+- **Debug image throttled** (`publish_debug_every`, default every 4 frames), not
+  full rate. CameraInfo also throttled (`camera_info_every`).
+- **Capture-time stamping** like the ZED path: uses the RealSense frame
+  timestamp when the domain is host-epoch aligned (SYSTEM/GLOBAL), else `now()`,
+  so the autoaim image↔gimbal-angle sync (§3) keeps working.
+- TensorRT 10 API (`enqueueV3`/`setTensorAddress`); `initLibNvInferPlugins` is
+  called so end2end/NMS-plugin engines deserialize.
+
+### ZED detector refactor — `zed_detector.py`
+All camera/runtime values that were **hard-coded constants** are now ROS
+parameters (declared with the old values as defaults, so behavior is unchanged
+unless overridden): `resolution`, `fps`, `image_flip`, `auto_exposure`,
+`exposure`, `gain`, `auto_white_balance`, `threshold`, `nms_iou`,
+`publish_debug_every`, `camera_info_every`, `frame_id`, `imu_frame_id`,
+`engine_path`. **Why:** these are competition-tuning values; baking them into
+source forced a rebuild/edit to retune. The native left-image size now comes
+from a `resolution`-name table (SVGA→960×600 default) instead of the
+`NATIVE_W/NATIVE_H` constants, so it tracks the selected resolution.
+`/camera_info` is now throttled (`camera_info_every`, default 1 = unchanged).
+The model/dataset invariants (class ids, keypoint order, decode array sizing)
+are intentionally **kept** as constants — they are not field-tunable.
+
+### Config files (new)
+- `config/sensors/zed.yaml` and `config/sensors/realsense.yaml` — one file per
+  camera, same parameter style. **Camera/detector params only.** Robot
+  calibration (barrel offsets, gimbal signs, bullet speed, fire window, EKF
+  gains) stays in the autoaim-node params inside the launch files — it was never
+  moved here, to keep calibration separate from camera config.
+- ROS YAML uses the `/**` node wildcard so the file applies regardless of the
+  detector's remapped node name.
+
+### Launch (all three profiles)
+- New arg `camera` (default **`realsense`** for standard/hero/sentry). `camera:=zed`
+  restores the ZED node. Exactly one detector is started via `IfCondition`.
+- The matching `config/sensors/*.yaml` is passed to the chosen detector; the
+  `engine_path` launch arg/env still overrides the YAML value (resolution order
+  unchanged — see §9).
+- The old inline `detector_params` dict was removed (its values live in YAML now).
+
+### Build — `CMakeLists.txt` / `package.xml`
+- `find_package(realsense2)`, `find_package(CUDAToolkit)`, manual TensorRT
+  find (`NvInfer.h` + `libnvinfer`/`libnvinfer_plugin`, no CMake config on Jetson).
+- The CUDA kernel is built as an **isolated static lib** (`realsense_preprocess`)
+  so `nvcc` never sees ROS compile flags; the node itself is plain C++ linking
+  only the CUDA runtime + TensorRT + realsense2 + OpenCV + the autoaim message
+  typesupport. `CMAKE_CUDA_ARCHITECTURES` defaults to `72;87` (Xavier/Orin),
+  overridable with `-DCMAKE_CUDA_ARCHITECTURES=`.
+- Installs the `realsense_detector` executable and `config/` into the package
+  share. `package.xml` gains `<depend>librealsense2</depend>`.
+
+### Verification done on this machine
+Built clean (`colcon build --packages-select autoaim --symlink-install`). With a
+RealSense attached, the node opened the color stream, read 640×480 intrinsics,
+and built CameraInfo; it then failed **only** at engine deserialize because the
+on-disk engine was built with a newer TensorRT than the device's 10.7 (same
+constraint the ZED path has — see §9 / models.md). Full inference + topic-rate
+checks require an engine built with the target's TensorRT version.
+
+### Fix: Python entrypoints needed the execute bit
+`ros2 launch ... hero.launch.py` failed with `executable 'viewer_node.py' not
+found on the libexec directory`. Cause: `viewer_node.py` and `zed_detector.py`
+were committed `0644` (no execute bit). With `colcon build --symlink-install`,
+the libexec entry is a symlink to the **source** file, and launch_ros only
+accepts an executable file — so the non-`+x` source made both Python nodes
+"not found". Fixed with `chmod +x src/autoaim/{viewer_node.py,zed_detector.py}`
+(symlink reflects it immediately; no rebuild). `install(PROGRAMS ...)` already
+sets `+x` on non-symlink installs, so this only bites in `--symlink-install`
+mode — keep the source files executable.
+
+### Fix: RealSense `exposure`/`gain` param type
+`realsense_detector` aborted at startup with `parameter 'exposure' has invalid
+type: ... {double} ... setting it to {integer} is not allowed`. The node
+declared `exposure`/`gain` as `double` but `realsense.yaml` writes them as
+integers (`6000`, `64`), and ROS refuses to load an int onto a double param.
+These are integer-valued RealSense options, so they are now declared `int`
+(cast to float at `set_option`). The natural YAML form `exposure: 6000` loads
+correctly; rebuild required.
+
+### Fix: RealSense default exposure overexposed (white image)
+`/yolo/debug_image` came through as a valid `bgr8` 640×480 frame (correct stride
+and length) but ~70% of pixels were saturated (mean 232/255) → pure white in
+RViz. Cause: the default `auto_exposure: false` + fixed `exposure: 6000` (6 ms)
+overexposes a normally-lit room. Default changed to `auto_exposure: true` so the
+camera adapts and produces a usable image out of the box; the manual
+`exposure`/`gain` remain for arena tuning (lowered the manual fallback to 1500
+us). **Why:** white image was a config default, not a data-path bug — the
+detector→viewer→RViz image chain is correct. Note: the low framerate seen
+alongside this is unrelated — it is the `net=960` engine running on a Jetson it
+was not built for (TRT cross-device tactic penalty), not the RealSense code.

@@ -13,6 +13,12 @@
 
 `/detector/armors_keypoints` is the tracking input. The bbox topic is kept for legacy visualization and quick checks.
 
+Both detectors publish this identical set, so autoaim does not know which camera
+is active (selected with `camera:=realsense|zed`, see runtime.md). Difference:
+`/zed/imu_data` is **ZED-only** — the RealSense path uses the color stream only
+and does not publish an IMU. Nothing in the C++ tracker subscribes to that
+topic, so the RealSense path is unaffected.
+
 ## Auto aim output
 
 ```text

@@ -1,0 +1,37 @@
+# RealSense detector — camera + runtime configuration.
+#
+# Loaded by the C++ realsense_detector executable. The launch files pass this
+# file to the detector node via `parameters=[...]`. The `/**` wildcard applies
+# these values to the detector node regardless of its remapped node name.
+#
+# SCOPE: camera capture + detector/inference only. Robot calibration
+# (barrel_offset_*, gimbal signs, bullet_speed, fire window, EKF gains) lives in
+# the autoaim node parameters inside the launch files — NOT here.
+#
+# The detector uses librealsense2 directly (no realsense2_camera ROS node) and
+# the COLOR stream only. CameraInfo is published from the live color intrinsics.
+/**:
+  ros__parameters:
+    # ── Inference ──
+    # Same external engine as the ZED path. Override order:
+    # launch arg engine_path > env AUTOAIM_ENGINE_PATH > this.
+    engine_path: "/workspaces/isaac_ros-dev/AI-models/yolov26_keypoints.engine"
+    threshold: 0.15          # detection confidence threshold
+    nms_iou: 0.2             # NMS IoU (raw-output engines only; post-NMS engines skip it)
+
+    # ── Camera capture (librealsense2) ──
+    serial_no: ""            # "" = first connected device; else a specific RealSense serial
+    width: 640               # color stream width
+    height: 480              # color stream height
+    fps: 60                  # color stream FPS
+    # auto_exposure true = camera adapts (usable image anywhere; default).
+    # Set false + tune exposure/gain for the arena. Fixed 6000 us overexposes a
+    # normally-lit room to pure white — only use manual once you measure on field.
+    auto_exposure: false      # false -> manual exposure/gain below
+    exposure: 30             # RS2_OPTION_EXPOSURE (microseconds), manual mode only
+    gain: 64                  # RS2_OPTION_GAIN, manual mode only
+
+    # ── Publishing ──
+    publish_debug_every: 4   # /yolo/debug_image: publish every N frames (0 = never)
+    camera_info_every: 1     # /camera_info: publish every N frames (0 = never)
+    frame_id: "camera_color_optical_frame"
