@@ -23,13 +23,31 @@
     serial_no: ""            # "" = first connected device; else a specific RealSense serial
     width: 640               # color stream width
     height: 480              # color stream height
-    fps: 60                  # color stream FPS
+    fps: 60                  # color stream FPS (D455 color @640x480 maxes at 60; 90 needs height<=360)
     # auto_exposure true = camera adapts (usable image anywhere; default).
     # Set false + tune exposure/gain for the arena. Fixed 6000 us overexposes a
     # normally-lit room to pure white — only use manual once you measure on field.
-    auto_exposure: false      # false -> manual exposure/gain below
+    auto_exposure: true      # false -> manual exposure/gain below
     exposure: 30             # RS2_OPTION_EXPOSURE (microseconds), manual mode only
     gain: 64                  # RS2_OPTION_GAIN, manual mode only
+
+    # ── Extra sensors (all OFF by default — detector uses the RGB sensor only) ──
+    # The RealSense is run as a single COLOR (RGB) camera: no stereo IR pair, no
+    # IMU. These flags only OPEN the corresponding stream; nothing downstream
+    # consumes them yet. Leave false to keep USB bandwidth + power minimal.
+    #
+    # depth   = Z16 depth (built from the stereo IR pair internally)
+    # infrared= the two raw IR/stereo images (Y8, indices 1 & 2)
+    # imu     = accel + gyro motion streams (only on IMU-equipped models, e.g. D435i/D455)
+    enable_depth: false
+    enable_infrared: false
+    enable_imu: false
+
+    # ── Orientation ──
+    # Rotate the color image 180° (flip both axes) for an upside-down camera
+    # mount. Applied to the network input, debug image, and CameraInfo principal
+    # point together, so detections stay consistent. Default false.
+    flip_180: true
 
     # ── Publishing ──
     publish_debug_every: 4   # /yolo/debug_image: publish every N frames (0 = never)

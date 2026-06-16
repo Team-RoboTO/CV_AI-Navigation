@@ -126,6 +126,13 @@ class RealSenseDetector : public rclcpp::Node {
     // declared int so the natural YAML form (e.g. exposure: 6000) loads.
     exposure_ = declare_parameter<int>("exposure", 6000);
     gain_ = declare_parameter<int>("gain", 64);
+    // Detector consumes the COLOR (RGB) sensor only. These gate opening the
+    // extra streams; all default false (no stereo IR, no IMU, no depth).
+    enable_depth_ = declare_parameter<bool>("enable_depth", false);
+    enable_infrared_ = declare_parameter<bool>("enable_infrared", false);
+    enable_imu_ = declare_parameter<bool>("enable_imu", false);
+    // Rotate the color image 180 deg for an upside-down camera mount.
+    flip_180_ = declare_parameter<bool>("flip_180", false);
     publish_debug_every_ = declare_parameter<int>("publish_debug_every", 4);
     camera_info_every_ = declare_parameter<int>("camera_info_every", 1);
     frame_id_ = declare_parameter<std::string>("frame_id", "camera_color_optical_frame");
@@ -165,6 +172,21 @@ class RealSenseDetector : public rclcpp::Node {
     rs2::config cfg;
     if (!serial_no_.empty()) cfg.enable_device(serial_no_);
     cfg.enable_stream(RS2_STREAM_COLOR, req_width_, req_height_, RS2_FORMAT_BGR8, req_fps_);
+    // Extra streams are opened only when requested; the detector never reads
+    // them. Default OFF -> the camera runs as a single RGB sensor.
+    if (enable_depth_) {
+      cfg.enable_stream(RS2_STREAM_DEPTH, req_width_, req_height_, RS2_FORMAT_Z16, req_fps_);
+    }
+    if (enable_infrared_) {
+      // Stereo IR pair (left=1, right=2).
+      cfg.enable_stream(RS2_STREAM_INFRARED, 1, req_width_, req_height_, RS2_FORMAT_Y8, req_fps_);
+      cfg.enable_stream(RS2_STREAM_INFRARED, 2, req_width_, req_height_, RS2_FORMAT_Y8, req_fps_);
+    }
+    if (enable_imu_) {
+      // Motion streams run at their own native rates (not req_fps_).
+      cfg.enable_stream(RS2_STREAM_ACCEL, RS2_FORMAT_MOTION_XYZ32F);
+      cfg.enable_stream(RS2_STREAM_GYRO, RS2_FORMAT_MOTION_XYZ32F);
+    }
     rs2::pipeline_profile profile = pipe_.start(cfg);
 
     // Apply exposure/gain on the color sensor (best-effort; options may be
@@ -173,6 +195,12 @@ class RealSenseDetector : public rclcpp::Node {
       rs2::color_sensor cs = profile.get_device().first<rs2::color_sensor>();
       if (cs.supports(RS2_OPTION_ENABLE_AUTO_EXPOSURE)) {
         cs.set_option(RS2_OPTION_ENABLE_AUTO_EXPOSURE, auto_exposure_ ? 1.f : 0.f);
+      }
+      // Lock the framerate: with priority OFF the auto-exposure algorithm may
+      // not lengthen exposure past the frame interval, so the color stream
+      // holds the requested fps (e.g. 90) instead of dropping in dim light.
+      if (cs.supports(RS2_OPTION_AUTO_EXPOSURE_PRIORITY)) {
+        cs.set_option(RS2_OPTION_AUTO_EXPOSURE_PRIORITY, 0.f);
       }
       if (!auto_exposure_) {
         if (cs.supports(RS2_OPTION_EXPOSURE)) {
@@ -192,11 +220,19 @@ class RealSenseDetector : public rclcpp::Node {
     native_w_ = intr.width;
     native_h_ = intr.height;
 
+    // A 180 deg image flip moves the principal point to (W-1-cx, H-1-cy);
+    // focal lengths are unchanged. Keeps CameraInfo consistent with flip_180_.
+    double cx = intr.ppx, cy = intr.ppy;
+    if (flip_180_) {
+      cx = (native_w_ - 1) - intr.ppx;
+      cy = (native_h_ - 1) - intr.ppy;
+    }
+
     cam_info_msg_.header.frame_id = frame_id_;
     cam_info_msg_.width = static_cast<uint32_t>(native_w_);
     cam_info_msg_.height = static_cast<uint32_t>(native_h_);
-    cam_info_msg_.k = {intr.fx, 0.0, intr.ppx,
-                       0.0, intr.fy, intr.ppy,
+    cam_info_msg_.k = {intr.fx, 0.0, cx,
+                       0.0, intr.fy, cy,
                        0.0, 0.0, 1.0};
     cam_info_msg_.d.assign(intr.coeffs, intr.coeffs + 5);
     switch (intr.model) {
@@ -373,8 +409,18 @@ class RealSenseDetector : public rclcpp::Node {
   }
 
   void processFrame(const rs2::video_frame& color, const rclcpp::Time& stamp) {
+    // Pick the source buffer: native frame, or a 180-rotated copy for an
+    // upside-down mount. Flipping here keeps the network input, debug image and
+    // detection pixel coords mutually consistent (one flip feeds them all).
+    const uint8_t* src = static_cast<const uint8_t*>(color.get_data());
+    if (flip_180_) {
+      cv::Mat in_mat(native_h_, native_w_, CV_8UC3, const_cast<void*>(color.get_data()));
+      cv::flip(in_mat, flip_buf_, -1);  // flipCode -1 = both axes = 180 deg
+      src = flip_buf_.data;
+    }
+
     // H2D color, preprocess, inference, D2H — all on one reused stream.
-    CUDA_CHECK(cudaMemcpyAsync(d_color_, color.get_data(),
+    CUDA_CHECK(cudaMemcpyAsync(d_color_, src,
                                static_cast<size_t>(native_w_) * native_h_ * 3,
                                cudaMemcpyHostToDevice, stream_));
     launch_preprocess_bgr8(d_color_, d_in_, native_w_, native_h_, img_size_, img_size_,
@@ -401,7 +447,7 @@ class RealSenseDetector : public rclcpp::Node {
       cam_info_pub_->publish(cam_info_msg_);
     }
     if (publish_debug_every_ > 0 && (frame_count_ % publish_debug_every_) == 0) {
-      publishDebugImage(color, stamp);
+      publishDebugImage(src, stamp);
     }
   }
 
@@ -570,7 +616,7 @@ class RealSenseDetector : public rclcpp::Node {
     json_pub_->publish(js);
   }
 
-  void publishDebugImage(const rs2::video_frame& color, const rclcpp::Time& stamp) {
+  void publishDebugImage(const uint8_t* data, const rclcpp::Time& stamp) {
     sensor_msgs::msg::Image img;
     img.header.stamp = stamp;
     img.header.frame_id = frame_id_;
@@ -580,8 +626,7 @@ class RealSenseDetector : public rclcpp::Node {
     img.is_bigendian = 0;
     img.step = static_cast<uint32_t>(native_w_ * 3);
     const size_t n = static_cast<size_t>(img.step) * native_h_;
-    const auto* p = static_cast<const uint8_t*>(color.get_data());
-    img.data.assign(p, p + n);
+    img.data.assign(data, data + n);
     img_pub_->publish(img);
   }
 
@@ -591,6 +636,9 @@ class RealSenseDetector : public rclcpp::Node {
   int req_width_{640}, req_height_{480}, req_fps_{60};
   bool auto_exposure_{false};
   int exposure_{6000}, gain_{64};
+  bool enable_depth_{false}, enable_infrared_{false}, enable_imu_{false};
+  bool flip_180_{false};
+  cv::Mat flip_buf_;  // reused 180-rotated color buffer (flip_180_ only)
   int publish_debug_every_{4}, camera_info_every_{1};
 
   // ── RealSense ──

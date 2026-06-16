@@ -18,7 +18,7 @@ ENGINE_DEFAULT = "/workspaces/isaac_ros-dev/AI-models/yolov26_keypoints.engine"
 def autoaim_params():
     return [
         # YOLO26 labels: "0" blue, "1" grey, "2" red. Grey is ignored by autoaim_node.
-        {"target_classes": ["0"]},
+        {"target_classes": ["2"]},
         {"use_keypoints": True},
         {"keypoint_topic": "/detector/armors_keypoints"},
         # 0.0 accepted garbage keypoints -> PnP jitter -> fire-lock dropouts.
