@@ -1,0 +1,19 @@
+[Unit]
+Description=Auto Aim ROS2 Docker Launch
+Requires=docker.service
+After=docker.service containerd.service network-online.target nvargus-daemon.service
+Wants=network-online.target nvargus-daemon.service
+
+[Service]
+Type=simple
+User=root
+Restart=always
+RestartSec=5
+
+ExecStart=/usr/local/bin/autoaim_autostart.sh
+
+ExecStop=/usr/bin/docker exec isaac_ros_dev-aarch64-container bash -lc "pkill -INT -f 'ros2 launch autoaim sentry.launch.py' || true"
+ExecStopPost=/usr/bin/docker stop -t 3 isaac_ros_dev-aarch64-container
+
+[Install]
+WantedBy=multi-user.target
