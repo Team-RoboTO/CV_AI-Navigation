@@ -1,0 +1,19 @@
+# ROS / ISAAC ROS general folders
+build/
+install/
+log/
+
+# Keep only the model trained and not the conversion made on the specific jetson
+AI-models/*.engine
+AI-models/*.onnx
+
+#old folders
+
+old/
+
+#container folders
+src/isaac_ros_common
+
+# ZED folders
+src/zed-ros2-interfaces
+src/zed-ros2-wrapper
