@@ -37,6 +37,7 @@
 #include <librealsense2/rs.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/dnn.hpp>
+#include <opencv2/imgproc.hpp>  // cvtColor (YUYV->BGR debug image)
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
@@ -126,6 +127,12 @@ class RealSenseDetector : public rclcpp::Node {
     // declared int so the natural YAML form (e.g. exposure: 6000) loads.
     exposure_ = declare_parameter<int>("exposure", 6000);
     gain_ = declare_parameter<int>("gain", 64);
+    // Color pixel format: "bgr8" (default; librealsense converts YUYV->BGR on
+    // the host CPU) or "yuyv" (raw sensor format; this node converts YUYV->RGB
+    // on the GPU instead, saving CPU). USB bandwidth is identical either way.
+    pixel_format_ = declare_parameter<std::string>("pixel_format", "bgr8");
+    use_yuyv_ = (pixel_format_ == "yuyv" || pixel_format_ == "YUYV");
+    color_bpp_ = use_yuyv_ ? 2 : 3;
     // Detector consumes the COLOR (RGB) sensor only. These gate opening the
     // extra streams; all default false (no stereo IR, no IMU, no depth).
     enable_depth_ = declare_parameter<bool>("enable_depth", false);
@@ -171,7 +178,8 @@ class RealSenseDetector : public rclcpp::Node {
   void initRealSense() {
     rs2::config cfg;
     if (!serial_no_.empty()) cfg.enable_device(serial_no_);
-    cfg.enable_stream(RS2_STREAM_COLOR, req_width_, req_height_, RS2_FORMAT_BGR8, req_fps_);
+    const rs2_format color_fmt = use_yuyv_ ? RS2_FORMAT_YUYV : RS2_FORMAT_BGR8;
+    cfg.enable_stream(RS2_STREAM_COLOR, req_width_, req_height_, color_fmt, req_fps_);
     // Extra streams are opened only when requested; the detector never reads
     // them. Default OFF -> the camera runs as a single RGB sensor.
     if (enable_depth_) {
@@ -354,7 +362,7 @@ class RealSenseDetector : public rclcpp::Node {
 
     CUDA_CHECK(cudaMalloc(&d_in_, static_cast<size_t>(input_channels_) * channel_stride_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_out_, out_count_ * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_color_, static_cast<size_t>(native_w_) * native_h_ * 3));
+    CUDA_CHECK(cudaMalloc(&d_color_, static_cast<size_t>(native_w_) * native_h_ * color_bpp_));
     CUDA_CHECK(cudaMallocHost(&h_out_, out_count_ * sizeof(float)));
     CUDA_CHECK(cudaStreamCreate(&stream_));
 
@@ -409,22 +417,35 @@ class RealSenseDetector : public rclcpp::Node {
   }
 
   void processFrame(const rs2::video_frame& color, const rclcpp::Time& stamp) {
-    // Pick the source buffer: native frame, or a 180-rotated copy for an
-    // upside-down mount. Flipping here keeps the network input, debug image and
-    // detection pixel coords mutually consistent (one flip feeds them all).
+    // src points at the native color data; for BGR8 it may be redirected to a
+    // CPU-flipped copy. For YUYV the flip is folded into the kernel instead.
     const uint8_t* src = static_cast<const uint8_t*>(color.get_data());
-    if (flip_180_) {
-      cv::Mat in_mat(native_h_, native_w_, CV_8UC3, const_cast<void*>(color.get_data()));
-      cv::flip(in_mat, flip_buf_, -1);  // flipCode -1 = both axes = 180 deg
-      src = flip_buf_.data;
-    }
 
     // H2D color, preprocess, inference, D2H — all on one reused stream.
-    CUDA_CHECK(cudaMemcpyAsync(d_color_, src,
-                               static_cast<size_t>(native_w_) * native_h_ * 3,
-                               cudaMemcpyHostToDevice, stream_));
-    launch_preprocess_bgr8(d_color_, d_in_, native_w_, native_h_, img_size_, img_size_,
-                           pad_y_net_, unscaled_h_net_, scale_net_to_native_, stream_);
+    if (use_yuyv_) {
+      // Raw YUY2 cannot be flipped with cv::flip (it scrambles the U/Y/V
+      // macropixel order), so upload as-is and let the kernel fold the 180 flip
+      // into its source sampling.
+      CUDA_CHECK(cudaMemcpyAsync(d_color_, src,
+                                 static_cast<size_t>(native_w_) * native_h_ * 2,
+                                 cudaMemcpyHostToDevice, stream_));
+      launch_preprocess_yuyv(d_color_, d_in_, native_w_, native_h_, img_size_, img_size_,
+                             pad_y_net_, unscaled_h_net_, scale_net_to_native_,
+                             flip_180_, stream_);
+    } else {
+      // BGR8: flip on the CPU so the network input, debug image and detection
+      // pixel coords stay mutually consistent (one flip feeds them all).
+      if (flip_180_) {
+        cv::Mat in_mat(native_h_, native_w_, CV_8UC3, const_cast<void*>(color.get_data()));
+        cv::flip(in_mat, flip_buf_, -1);  // flipCode -1 = both axes = 180 deg
+        src = flip_buf_.data;
+      }
+      CUDA_CHECK(cudaMemcpyAsync(d_color_, src,
+                                 static_cast<size_t>(native_w_) * native_h_ * 3,
+                                 cudaMemcpyHostToDevice, stream_));
+      launch_preprocess_bgr8(d_color_, d_in_, native_w_, native_h_, img_size_, img_size_,
+                             pad_y_net_, unscaled_h_net_, scale_net_to_native_, stream_);
+    }
     if (!context_->enqueueV3(stream_)) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "enqueueV3 failed");
       return;
@@ -447,7 +468,17 @@ class RealSenseDetector : public rclcpp::Node {
       cam_info_pub_->publish(cam_info_msg_);
     }
     if (publish_debug_every_ > 0 && (frame_count_ % publish_debug_every_) == 0) {
-      publishDebugImage(src, stamp);
+      if (use_yuyv_) {
+        // Build a BGR debug image from the raw YUY2 frame (throttled, so this
+        // CPU conversion is cheap), matching the network input orientation.
+        cv::Mat yuyv(native_h_, native_w_, CV_8UC2,
+                     const_cast<void*>(color.get_data()));
+        cv::cvtColor(yuyv, debug_bgr_, cv::COLOR_YUV2BGR_YUYV);
+        if (flip_180_) cv::flip(debug_bgr_, debug_bgr_, -1);
+        publishDebugImage(debug_bgr_.data, stamp);
+      } else {
+        publishDebugImage(src, stamp);
+      }
     }
   }
 
@@ -638,7 +669,11 @@ class RealSenseDetector : public rclcpp::Node {
   int exposure_{6000}, gain_{64};
   bool enable_depth_{false}, enable_infrared_{false}, enable_imu_{false};
   bool flip_180_{false};
-  cv::Mat flip_buf_;  // reused 180-rotated color buffer (flip_180_ only)
+  std::string pixel_format_{"bgr8"};
+  bool use_yuyv_{false};
+  int color_bpp_{3};  // bytes/px of the color stream: 3 (BGR8) or 2 (YUYV)
+  cv::Mat flip_buf_;   // reused 180-rotated color buffer (BGR8 + flip_180_ only)
+  cv::Mat debug_bgr_;  // reused BGR debug image built from YUYV (yuyv only)
   int publish_debug_every_{4}, camera_info_every_{1};
 
   // ── RealSense ──

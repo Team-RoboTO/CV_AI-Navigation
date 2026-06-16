@@ -21,7 +21,7 @@ DEFAULT_CAMERA = "realsense"
 def autoaim_params():
     return [
         # YOLO26 labels: "0" blue, "1" grey, "2" red. Grey is ignored by autoaim_node.
-        {"target_classes": ["2"]},
+        {"target_classes": ["0"]},
         {"use_keypoints": True},
         {"keypoint_topic": "/detector/armors_keypoints"},
 
