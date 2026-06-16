@@ -1,19 +1,19 @@
 [Unit]
 Description=Auto Aim ROS2 Docker Launch
 Requires=docker.service
-After=docker.service containerd.service network-online.target nvargus-daemon.service
-Wants=network-online.target nvargus-daemon.service
+After=docker.service containerd.service network-online.target graphical.target nvargus-daemon.service
+Wants=network-online.target graphical.target nvargus-daemon.service
 
 [Service]
 Type=simple
 User=root
 Restart=always
 RestartSec=5
+KillMode=process
 
 ExecStart=/usr/local/bin/autoaim_autostart.sh
 
-ExecStop=/usr/bin/docker exec isaac_ros_dev-aarch64-container bash -lc "pkill -INT -f 'ros2 launch autoaim sentry.launch.py' || true"
-ExecStopPost=/usr/bin/docker stop -t 3 isaac_ros_dev-aarch64-container
+ExecStop=-/usr/bin/docker exec autoaim_headless bash -lc 'if [ -f /tmp/autoaim_launch.pid ]; then PID="$(cat /tmp/autoaim_launch.pid)"; echo "[autoaim] stopping launch process group $PID"; kill -INT "-$PID" 2>/dev/null || kill -INT "$PID" 2>/dev/null || true; sleep 3; kill -TERM "-$PID" 2>/dev/null || true; rm -f /tmp/autoaim_launch.pid; else echo "[autoaim] no launch PID file"; fi'
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=graphical.target
