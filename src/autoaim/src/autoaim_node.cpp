@@ -19,6 +19,7 @@
 #include <set>
 #include <string>
 #include <array>
+#include <vector>
 
 #include "autoaim/pnp_solver.hpp"
 #include "autoaim/tracker.hpp"
@@ -85,12 +86,27 @@ public:
     tracker_ = std::make_unique<Tracker>(cfg);
     cfg_ = cfg;
 
-    // Target classes for the current YOLO26 keypoint model:
-    // "0" = blue armor, "1" = grey armor, "2" = red armor.
+    // YOLO26 keypoint model class IDs: "0"=blue armor, "1"=grey (ignored), "2"=red armor.
+    // micro_color_target_classes[i] = YOLO class to shoot when micro sends color i:
+    //   index 0 (micro: we are RED)  → shoot blue → "0"
+    //   index 1 (micro: we are BLUE) → shoot red  → "2"
     auto tc = declare_parameter<std::vector<std::string>>(
       "target_classes", std::vector<std::string>{"0"});
     target_classes_ = std::set<std::string>(tc.begin(), tc.end());
     target_classes_.erase("1");  // never track grey
+    target_classes_from_micro_status_ =
+      declare_parameter("target_classes_from_micro_status", false);
+    target_color_status_index_ = declare_parameter("target_color_status_index", 4);
+    micro_color_target_classes_ = declare_parameter<std::vector<std::string>>(
+      "micro_color_target_classes", std::vector<std::string>{"0", "2"});
+
+    if (target_classes_from_micro_status_) {
+      target_classes_.clear();
+      RCLCPP_INFO(
+        get_logger(),
+        "Target class will be selected from /micro_status[%d]",
+        target_color_status_index_);
+    }
 
     smooth_alpha_ = declare_parameter("cmd_smooth_alpha", 0.85);
 
@@ -250,6 +266,8 @@ private:
     micro_yaw_raw_ = micro_yaw_rad;
     micro_pitch_raw_ = micro_pitch_rad;
 
+    updateTargetClassesFromMicroStatus(*msg);
+
     // Internal ROS/gimbal convention used by PnP/tracker.
     // CRITICAL: if the micro reports pitch with opposite sign to the command
     // (e.g. commanded -0.10 → feedback +0.10), the GEOMETRY pitch used for
@@ -284,6 +302,118 @@ private:
 
     imu_rotation_ = q_gimbal * q_conv;
     imu_translation_ = tf2::Vector3(robot_x_, robot_y_, cfg_.gimbal_height);
+  }
+
+  std::string targetClassesString() const
+  {
+    std::string out = "[";
+    bool first = true;
+    for (const auto & cls : target_classes_) {
+      if (!first) {
+        out += ", ";
+      }
+      out += cls;
+      first = false;
+    }
+    out += "]";
+    return out;
+  }
+
+  void resetTrackingForTargetClassChange()
+  {
+    tracker_ = std::make_unique<Tracker>(cfg_);
+    last_target_generation_ = tracker_->targetGeneration();
+    last_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+    smooth_init_ = false;
+    rate_init_ = false;
+    has_safe_cmd_ = false;
+    fire_hysteresis_active_ = false;
+
+    if (twist_pub_) {
+      geometry_msgs::msg::Twist twist;
+      twist.angular.x = 0.0;
+      twist.angular.y = micro_pitch_raw_;
+      twist.angular.z = micro_yaw_raw_;
+      twist_pub_->publish(twist);
+    }
+  }
+
+  void updateTargetClassesFromMicroStatus(const std_msgs::msg::Float32MultiArray & msg)
+  {
+    if (!target_classes_from_micro_status_) {
+      return;
+    }
+
+    if (target_color_status_index_ < 0 ||
+        static_cast<size_t>(target_color_status_index_) >= msg.data.size())
+    {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "target_color_status_index=%d is not available in /micro_status "
+        "(size=%zu); not selecting a target color yet",
+        target_color_status_index_, msg.data.size());
+      return;
+    }
+
+    const double raw_color =
+      static_cast<double>(msg.data[static_cast<size_t>(target_color_status_index_)]);
+
+    if (!std::isfinite(raw_color)) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "/micro_status[%d] target color is not finite: %.3f",
+        target_color_status_index_, raw_color);
+      return;
+    }
+
+    const int micro_color = static_cast<int>(std::lround(raw_color));
+    if (std::abs(raw_color - static_cast<double>(micro_color)) > 0.25) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "/micro_status[%d] target color should be near an integer, got %.3f",
+        target_color_status_index_, raw_color);
+      return;
+    }
+
+    if (micro_color < 0 ||
+        static_cast<size_t>(micro_color) >= micro_color_target_classes_.size())
+    {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "/micro_status[%d]=%d has no entry in micro_color_target_classes "
+        "(size=%zu)",
+        target_color_status_index_, micro_color, micro_color_target_classes_.size());
+      return;
+    }
+
+    const std::string & target_class =
+      micro_color_target_classes_[static_cast<size_t>(micro_color)];
+    if (target_class.empty()) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "micro_color_target_classes[%d] is empty; not selecting a target color",
+        micro_color);
+      return;
+    }
+
+    const std::set<std::string> next_classes{target_class};
+    if (next_classes == target_classes_ && have_micro_target_color_ &&
+        micro_color == last_micro_target_color_)
+    {
+      return;
+    }
+
+    target_classes_ = next_classes;
+    have_micro_target_color_ = true;
+    last_micro_target_color_ = micro_color;
+    resetTrackingForTargetClassChange();
+
+    RCLCPP_INFO(
+      get_logger(),
+      "Target class from /micro_status[%d]=%d -> %s",
+      target_color_status_index_,
+      micro_color,
+      targetClassesString().c_str());
   }
 
   void updateEgoPoseFromMicroVelocity(double raw_vx, double raw_vy)
@@ -1222,6 +1352,11 @@ private:
   std::unique_ptr<Tracker> tracker_;
   PnPSolver pnp_;
   std::set<std::string> target_classes_;
+  bool target_classes_from_micro_status_ = false;
+  int target_color_status_index_ = 4;
+  std::vector<std::string> micro_color_target_classes_;
+  bool have_micro_target_color_ = false;
+  int last_micro_target_color_ = -1;
 
   double imu_yaw_ = 0.0;
   double imu_pitch_ = 0.0;

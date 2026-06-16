@@ -17,11 +17,20 @@ DEFAULT_ENGINE = "/workspaces/isaac_ros-dev/AI-models/yolov26_keypoints.engine"
 # Change this to "zed" or "realsense" when this robot's default camera changes.
 DEFAULT_CAMERA = "realsense"
 
-
 def autoaim_params():
     return [
-        # YOLO26 labels: "0" blue, "1" grey, "2" red. Grey is ignored by autoaim_node.
-        {"target_classes": ["0"]},
+        # YOLO26 labels: 0=blue armor, 1=grey armor (ignored), 2=red armor.
+        # True: read our team color from /micro_status[target_color_status_index]
+        #       and pick the enemy class automatically via micro_color_target_classes.
+        # False: always shoot the fixed class list in target_classes below.
+        {"target_classes_from_micro_status": False},  # ON/OFF auto color from micro
+
+        # micro_color_target_classes[i] = YOLO class to shoot when micro sends i.
+        #   i=0 (we are red)  -> shoot blue -> "0"
+        #   i=1 (we are blue) -> shoot red  -> "2"
+        {"target_classes": ["0"]},  # used only if target_classes_from_micro_status=False
+        {"target_color_status_index": 4},
+        {"micro_color_target_classes": ["0", "2"]},
         {"use_keypoints": True},
         {"keypoint_topic": "/detector/armors_keypoints"},
 

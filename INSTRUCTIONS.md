@@ -63,6 +63,79 @@ ros2 launch autoaim standard.launch.py \
 TensorRT engines are tied to the JetPack, TensorRT, CUDA, and GPU architecture
 that built them. Rebuild on the target Jetson if deserialization fails.
 
+If you only have the `.pt` files, build the TensorRT engines on the target
+Jetson. The current launch files use the keypoint model by default:
+
+```bash
+cd /workspaces/isaac_ros-dev
+
+python3 -m pip install -U ultralytics onnx onnxslim
+
+yolo export model=AI-models/yolov26_keypoints.pt \
+  format=engine imgsz=640 batch=1 dynamic=False half=True nms=True \
+  workspace=4 device=0
+```
+
+Build the bbox YOLO26 engine only if you are testing a bbox-only detector path;
+the ZED and RealSense detector nodes in this repo expect the keypoint engine.
+
+```bash
+yolo export model=AI-models/yolo26_bbox.pt \
+  format=engine imgsz=640 batch=1 dynamic=False half=True nms=True \
+  end2end=False workspace=4 device=0
+```
+
+If TensorRT export through Ultralytics fails, use the explicit ONNX plus
+`trtexec` path instead:
+
+```bash
+cd /workspaces/isaac_ros-dev
+
+yolo export model=AI-models/yolov26_keypoints.pt \
+  format=onnx imgsz=640 batch=1 dynamic=False simplify=True nms=True
+
+/usr/src/tensorrt/bin/trtexec \
+  --onnx=AI-models/yolov26_keypoints.onnx \
+  --saveEngine=AI-models/yolov26_keypoints.engine \
+  --fp16 --memPoolSize=workspace:4096
+
+yolo export model=AI-models/yolo26_bbox.pt \
+  format=onnx imgsz=640 batch=1 dynamic=False simplify=True nms=True \
+  end2end=False
+
+/usr/src/tensorrt/bin/trtexec \
+  --onnx=AI-models/yolo26_bbox.onnx \
+  --saveEngine=AI-models/yolo26_bbox.engine \
+  --fp16 --memPoolSize=workspace:4096
+```
+
+The ONNX export is normally reusable across Jetsons if the model, input size,
+and export flags are the same. The TensorRT engine is not reusable across all
+Jetsons; rebuild it on the target device.
+
+## Git Notes
+
+Useful Git commands from the repo workflow notes:
+
+To see all commits:
+
+```bash
+git log --oneline --graph --decorate --all
+```
+
+To come back, temporarily, to a commit committed before the latest one:
+
+```bash
+git switch --detached <commit>
+```
+
+To come to the previous commit and remove the latest if it is not working:
+
+```bash
+git revert HEAD
+git push origin main
+```
+
 ## Armor Classes
 
 Current YOLO26 labels:
