@@ -24,12 +24,12 @@
 //   - Separate trajectory solver node → eliminates inter-node bugs
 // =========================================================================
 
-#include "auto_aim/tracker.hpp"
+#include "autoaim/tracker.hpp"
 #include <angles/angles.h>
 #include <algorithm>
 #include <cmath>
 
-namespace auto_aim
+namespace autoaim
 {
 
 Tracker::Tracker(const TrackerConfig & cfg) : cfg_(cfg)
@@ -188,8 +188,26 @@ double Tracker::ekfMahalanobis(const Eigen::Vector4d & z) const
   double d = std::sqrt(zdx*zdx + zdy*zdy + zdz*zdz);
   double ps = cfg_.r_pos_base + cfg_.r_pos_slope*d;
   double ys = cfg_.r_yaw_base + cfg_.r_yaw_slope*d;
+  // CRITICAL FIX: the gate must use the SAME obliquity-inflated R as ekfUpdate.
+  // Without the inflation, a slightly oblique plate (very common: a stationary
+  // enemy rarely faces you perfectly) has its noisy yaw measurement judged
+  // against an unrealistically small variance -> Mahalanobis blows past the
+  // threshold -> detection rejected -> TRACKING flickers to TEMP_LOST ->
+  // aim.fire (which requires TRACKING) stutters on a perfectly visible target.
+  // (Raising maha_threshold to 16.9 only papered over this; the gate noise
+  // model itself was inconsistent with the update.)
+  double xyz_f = 1.0, yaw_f = 1.0;
+  if (zdx*zdx + zdy*zdy > 0.01) {
+    double bearing = std::atan2(zdy, zdx);
+    double face_a = std::abs(angles::shortest_angular_distance(z(3), bearing));
+    double cf = std::cos(face_a);
+    xyz_f = 1.0 / std::max(cf*cf, 0.04);
+    yaw_f = 1.0 / std::max(std::pow(std::abs(cf), 4.0), 1e-4);
+    if (face_a > cfg_.max_oblique_deg * M_PI / 180.0)
+      yaw_f = 1e6;
+  }
   Eigen::Matrix4d R = Eigen::Matrix4d::Zero();
-  R(0,0)=R(1,1)=R(2,2)=ps*ps; R(3,3)=ys*ys;
+  R(0,0)=R(1,1)=R(2,2)=ps*ps*xyz_f; R(3,3)=ys*ys*yaw_f;
   Eigen::Vector4d zp; zp << x_(0)-r*cos(yaw), x_(2)-r*sin(yaw), x_(4), yaw;
   Eigen::Vector4d y = z - zp;
   Eigen::Matrix4d S = H*P_*H.transpose()+R;
@@ -272,7 +290,7 @@ void Tracker::initFromDetection(const ArmorDetection & det)
 // TARGET SWITCHING — should we drop the current target for this closer one?
 //
 // PHYSICAL IDENTITY VIA SPATIAL PROXIMITY
-// class_id from the YOLO detector identifies COLOR (0=blue, 3=red), not the
+// class_id from the YOLO detector identifies COLOR (0=blue, 2=red), not the
 // individual robot. In a match there are multiple enemy robots of the same
 // color. We cannot use class_id to decide "is this the same physical target".
 //
@@ -350,13 +368,19 @@ void Tracker::handleArmorJump(const ArmorDetection & det, const rclcpp::Time & n
   double yaw = unwrapYaw(det.yaw);
   double jump = angles::shortest_angular_distance(x_(6), yaw);
   double jump_dir = (jump > 0) ? 1.0 : -1.0;
+  const double jump_abs = std::abs(jump);
+  // The timing formula below assumes this is a ONE-face (~90°) jump. A ~180°
+  // wrap (a face was skipped: occlusion, missed frames) would make
+  // (π/2)/dt_jump report HALF the true spin rate and corrupt x_(7) with an
+  // 80-100% blend. Only feed the timing estimator with 90°-ish jumps.
+  const bool one_face_jump = (jump_abs > M_PI/4 && jump_abs < 3*M_PI/4);
 
   // ── Spin rate from timing ────────────────────────────────────────────────
   // The most reliable way to estimate vyaw is from the time between consecutive
   // 90° face jumps. At 300 RPM a 90° jump takes exactly π/(2*vyaw) = 50ms.
   // This converges in 2 jumps (~100ms) vs 10-20 EKF frames for normal estimation.
   // Only activate after 2 same-direction jumps to avoid noise and spin reversals.
-  if (cfg_.use_vyaw_from_timing && last_jump_time_valid_) {
+  if (cfg_.use_vyaw_from_timing && last_jump_time_valid_ && one_face_jump) {
     double dt_jump = (now - last_jump_time_).seconds();
     bool same_dir = (jump_dir * last_jump_dir_ > 0);
 
@@ -696,8 +720,13 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
   // any range other than 1.5 m.
   double tx_dx = x_(0) - robot_x;
   double tx_dy = x_(2) - robot_y;
-  double dist_now = std::sqrt(tx_dx*tx_dx + tx_dy*tx_dy + x_(4)*x_(4));
-  double pred_t = cfg_.time_bias + dist_now / std::max(cfg_.bullet_speed, 1.0);
+  // FIX: vertical term must be the height difference armor-vs-gimbal, not the
+  // armor height above ground. Only affects the first iteration (loop refines).
+  double tx_dz = x_(4) - cfg_.gimbal_height;
+  double dist_now = std::sqrt(tx_dx*tx_dx + tx_dy*tx_dy + tx_dz*tx_dz);
+  // predictionBias() = measured pipeline latency + actuation_latency
+  // (or the fixed time_bias fallback). See TrackerConfig.
+  double pred_t = predictionBias() + dist_now / std::max(cfg_.bullet_speed, 1.0);
   constexpr int FACES = 4;
 
   // Single-face vs four-face mode.
@@ -721,7 +750,7 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
   // Three iterations converge tightly for ranges 0.5–6 m with any bullet speed.
   for (int iter = 0; iter < 3; iter++) {
     // ── Barrel position at IMPACT TIME (account for our own motion) ──
-    // During (flight_time + time_bias), our robot is also moving. The bullet
+    // During (flight_time + latency bias), our robot is also moving. The bullet
     // exits from where the barrel will be in the FUTURE, not where it is now.
     // At 1 m/s over 0.1 s that's 10 cm — significant vs armor half-width.
     // When stationary or ego_velocity_available=false, robot_vx/vy are zero
@@ -784,7 +813,7 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
         best = c; found = true;
       }
     }
-    if (found) pred_t = best.flight_time + cfg_.time_bias;
+    if (found) pred_t = best.flight_time + predictionBias();
   }
 
   if (!found) return aim;
@@ -820,4 +849,4 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
   return aim;
 }
 
-}  // namespace auto_aim
+}  // namespace autoaim

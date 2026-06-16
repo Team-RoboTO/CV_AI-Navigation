@@ -183,7 +183,7 @@ def generate_launch_description():
         DeclareLaunchArgument("engine_path", default_value=str(default_engine)),
         DeclareLaunchArgument("serial_port", default_value="/dev/ttyACM0"),
         Node(
-            package="auto_aim_3",
+            package="autoaim",
             # C++ serial bridge (port of serial_bridge.py — same params/protocol).
             # To fall back to the Python version: executable="serial_bridge.py".
             executable="serial_bridge",
@@ -192,21 +192,21 @@ def generate_launch_description():
             output="screen",
         ),
         Node(
-            package="auto_aim_3",
-            executable="auto_aim_3_node",
+            package="autoaim",
+            executable="autoaim_node",
             name="autoaim",
             parameters=autoaim_params(),
             output="screen",
         ),
         Node(
-            package="auto_aim_3",
+            package="autoaim",
             executable="viewer_node.py",
             name="autoaim_viewer",
             parameters=viewer_params,
             output="screen",
         ),
         Node(
-            package="auto_aim_3",
+            package="autoaim",
             executable="zed_detector.py",
             name="zed_detector",
             parameters=detector_params,

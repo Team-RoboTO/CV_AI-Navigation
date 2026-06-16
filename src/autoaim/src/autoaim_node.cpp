@@ -1,7 +1,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <vision_msgs/msg/detection2_d_array.hpp>
-#include <auto_aim_3/msg/armor_keypoint_array.hpp>
+#include <autoaim/msg/armor_keypoint_array.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <std_msgs/msg/header.hpp>
@@ -20,8 +20,8 @@
 #include <string>
 #include <array>
 
-#include "auto_aim_3/pnp_solver.hpp"
-#include "auto_aim_3/tracker.hpp"
+#include "autoaim/pnp_solver.hpp"
+#include "autoaim/tracker.hpp"
 
 namespace autoaim
 {
@@ -170,7 +170,7 @@ public:
 
     // ── Subscribers ──
     if (use_keypoints_) {
-      kpt_sub_ = create_subscription<auto_aim_3::msg::ArmorKeypointArray>(
+      kpt_sub_ = create_subscription<autoaim::msg::ArmorKeypointArray>(
         keypoint_topic_, rclcpp::SensorDataQoS(),
         std::bind(&AutoAimNode::keypointCallback, this, std::placeholders::_1));
       RCLCPP_INFO(get_logger(), "Using YOLO-pose keypoint detections on %s", keypoint_topic_.c_str());
@@ -669,7 +669,7 @@ private:
     publishMarkers(header, aim);
   }
 
-  void keypointCallback(const auto_aim_3::msg::ArmorKeypointArray::ConstSharedPtr msg)
+  void keypointCallback(const autoaim::msg::ArmorKeypointArray::ConstSharedPtr msg)
   {
     if (!pnp_.ready()) {
       return;
@@ -1313,7 +1313,7 @@ private:
   double min_keypoint_score_ = 0.05;
   double max_reproj_error_ = 25.0;
 
-  rclcpp::Subscription<auto_aim_3::msg::ArmorKeypointArray>::SharedPtr kpt_sub_;
+  rclcpp::Subscription<autoaim::msg::ArmorKeypointArray>::SharedPtr kpt_sub_;
   rclcpp::Subscription<vision_msgs::msg::Detection2DArray>::SharedPtr det_sub_;
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr cam_sub_;
   rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr micro_status_sub_;

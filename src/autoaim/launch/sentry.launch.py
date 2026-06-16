@@ -1,3 +1,6 @@
+#sudo systemctl stop autoaim.service
+
+
 import os
 from pathlib import Path
 
@@ -21,7 +24,7 @@ def autoaim_params():
         {"use_keypoints": True},
         {"keypoint_topic": "/detector/armors_keypoints"},
         # 0.0 accepted garbage keypoints -> PnP jitter -> fire-lock dropouts.
-        {"min_keypoint_score": 0.3},
+        {"min_keypoint_score": 0.15},
         {"max_reproj_error": 25.0},
         # Use the gimbal angles AT THE IMAGE TIMESTAMP for the camera->odom
         # projection (ring buffer + interpolation) instead of the latest angles.
@@ -37,7 +40,7 @@ def autoaim_params():
         # missing image<->angle sync (now fixed). High q makes the state track
         # measurement noise -> jittery commands -> fire-lock dropouts.
         # Start lower; raise again only if tracking feels sluggish AFTER the fix.
-        {"q_pos": 10.0},
+        {"q_pos": 100.0},
         {"q_yaw": 20.0},
         {"q_r": 1e-6},
         {"r_pos_base": 0.05},
@@ -53,7 +56,7 @@ def autoaim_params():
         {"initial_radius": 0.24},
         {"radius_ema_alpha": 0.05},
         {"initial_dz": 0.05},
-        {"bullet_speed": 25.0},
+        {"bullet_speed": 20.0},
         {"gravity": 9.8},
         {"gimbal_height": 0.420},
         # MEASURE FROM THE ACTIVE LENS, NOT THE HOUSING CENTER — and note this
@@ -66,15 +69,15 @@ def autoaim_params():
         #   barrel_offset_y = (muzzle) - (active lens), along robot-LEFT [m]
         #                     (positive = muzzle left of lens)
         #   barrel_offset_z = (muzzle height) - (lens height) [m]
-        #                     camera 3 cm BELOW barrel -> +0.03 (was -0.03: wrong sign)
+        #                     camera 3 cm ABOVE barrel -> -0.03 
         {"barrel_offset_x": 0.0},
-        {"barrel_offset_y": 0.0},     # <- MEASURE (lens-cover trick, see CHANGES.md)
-        {"barrel_offset_z": 0.03},
+        {"barrel_offset_y": 0.08},     # <- MEASURE (lens-cover trick, see CHANGES.md), !!! WAS 0.15 FOR STANDARD SENTRY
+        {"barrel_offset_z": -0.15},
         # 1.0 rad @ ref 1 m -> ~0.33 rad window at 3 m: OK for tuning, loose for
         # a match. Against a fast spinner, timed shots need ~0.10-0.18 rad with
         # window_ref_dist ~3.0. Tighten once the static calibration is done.
         {"angular_window": 1.0},
-        {"window_ref_dist": 1.0},
+        {"window_ref_dist": 3.0},
         {"min_fire_dist": 0.2},
         {"max_fire_dist": 6.0},
         # 0.005 is essentially ZERO latency compensation. It must cover the FULL
@@ -108,8 +111,8 @@ def autoaim_params():
         {"cmd_deadband_pitch": 0.005},
         {"cmd_rate_limit_yaw": 0.0},
         {"cmd_rate_limit_pitch": 0.0},
-        {"fire_lock_yaw": 0.05},
-        {"fire_lock_pitch": 0.04},
+        {"fire_lock_yaw": 0.5},
+        {"fire_lock_pitch": 0.5},
         # ⚠ THESE TWO MUST BE EQUAL. Both describe the same physical fact —
         # whether the micro's pitch FEEDBACK has the opposite sign of its pitch
         # COMMAND. pitch_sign appears SQUARED in the loop, so it cannot absorb
@@ -125,7 +128,7 @@ def autoaim_params():
         {"micro_pitch_feedback_opposite_sign": True},
         {"micro_pitch_lock_opposite_sign": True},
         {"cmd_hold_time": 0.25},
-        {"cmd_max_delta_yaw": 0.80},
+        {"cmd_max_delta_yaw": 1.0},
         {"cmd_max_delta_pitch": 0.80},
         {"require_aim_inside_frame": False},
         {"use_ego_motion_compensation": True},
@@ -183,7 +186,7 @@ def generate_launch_description():
         DeclareLaunchArgument("engine_path", default_value=str(default_engine)),
         DeclareLaunchArgument("serial_port", default_value="/dev/ttyACM0"),
         Node(
-            package="auto_aim_3",
+            package="autoaim",
             # C++ serial bridge (port of serial_bridge.py — same params/protocol).
             # To fall back to the Python version: executable="serial_bridge.py".
             executable="serial_bridge",
@@ -192,21 +195,21 @@ def generate_launch_description():
             output="screen",
         ),
         Node(
-            package="auto_aim_3",
-            executable="auto_aim_3_node",
+            package="autoaim",
+            executable="autoaim_node",
             name="autoaim",
             parameters=autoaim_params(),
             output="screen",
         ),
         Node(
-            package="auto_aim_3",
+            package="autoaim",
             executable="viewer_node.py",
             name="autoaim_viewer",
             parameters=viewer_params,
             output="screen",
         ),
         Node(
-            package="auto_aim_3",
+            package="autoaim",
             executable="zed_detector.py",
             name="zed_detector",
             parameters=detector_params,
