@@ -11,7 +11,7 @@ message containing bbox + the 4 keypoints in this convention:
 
 Topics:
     /detector/armors                vision_msgs/Detection2DArray
-    /detector/armors_keypoints      auto_aim_3/ArmorKeypointArray
+    /detector/armors_keypoints      autoaim/ArmorKeypointArray
     /detector/armors_keypoints_json std_msgs/String
     /yolo/debug_image               sensor_msgs/Image
     /zed/imu_data                   sensor_msgs/Imu
@@ -57,7 +57,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import CameraInfo, Image, Imu
 from std_msgs.msg import String
-from auto_aim_3.msg import ArmorKeypoint, ArmorKeypointArray
+from autoaim.msg import ArmorKeypoint, ArmorKeypointArray
 from vision_msgs.msg import Detection2D, Detection2DArray, ObjectHypothesisWithPose
 
 try:

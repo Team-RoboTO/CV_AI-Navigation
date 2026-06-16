@@ -36,7 +36,7 @@ from cv_bridge import CvBridge
 
 # Optional import: only present once autoaim package is built.
 try:
-    from auto_aim_3.msg import ArmorKeypointArray
+    from autoaim.msg import ArmorKeypointArray
     HAVE_KEYPOINTS = True
 except ImportError:
     HAVE_KEYPOINTS = False
@@ -111,7 +111,7 @@ class ViewerNode(Node):
                 sensor_qos)
         else:
             self.get_logger().warn(
-                "auto_aim_3.msg.ArmorKeypointArray not available — keypoint overlay disabled.")
+                "autoaim.msg.ArmorKeypointArray not available — keypoint overlay disabled.")
 
         self.pub = self.create_publisher(Image, '/tracker/debug_image', 1)
         self.get_logger().info('Viewer started — view /tracker/debug_image in RViz2')

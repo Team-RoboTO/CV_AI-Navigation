@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>auto_aim_3</name>
+  <name>autoaim</name>
   <version>1.0.0</version>
   <description>RoboMaster auto aim: ZED detector, keypoint PnP, EKF tracker, ballistic solver, viewer, and serial bridge</description>
   <maintainer email="team@example.com">team</maintainer>
