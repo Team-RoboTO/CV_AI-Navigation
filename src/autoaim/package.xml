@@ -22,9 +22,6 @@
   <depend>tf2_geometry_msgs</depend>
   <depend>angles</depend>
   <depend>eigen</depend>
-  <!-- RealSense detector path. CUDA + TensorRT are system packages located by
-       CMakeLists.txt directly (no standard rosdep keys on Jetson). -->
-  <depend>librealsense2</depend>
 
   <exec_depend>rclpy</exec_depend>
   <exec_depend>cv_bridge</exec_depend>

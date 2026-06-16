@@ -46,7 +46,7 @@
 
 #include "autoaim/msg/armor_keypoint.hpp"
 #include "autoaim/msg/armor_keypoint_array.hpp"
-#include "autoaim/realsense_preprocess.h"
+#include "autoaim_realsense/realsense_preprocess.h"
 
 namespace {
 

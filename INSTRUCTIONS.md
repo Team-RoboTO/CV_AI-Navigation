@@ -9,6 +9,13 @@ colcon build --packages-select autoaim --symlink-install
 source install/setup.bash
 ```
 
+The RealSense detector lives in the optional `autoaim_realsense` package. Build
+it only on machines that have librealsense2, CUDA, and TensorRT available:
+
+```bash
+colcon build --packages-select autoaim autoaim_realsense --symlink-install
+```
+
 Use `--symlink-install` during development. Python and launch-file edits apply
 after relaunching; C++ edits still require a rebuild.
 
@@ -33,7 +40,8 @@ ros2 launch autoaim sentry.launch.py camera:=realsense
 To change a robot's normal camera, edit `DEFAULT_CAMERA` near the top of its
 launch file. Use `camera:=...` only for temporary overrides.
 
-The detector-specific YAML files contain camera/inference settings only.
+The detector-specific YAML files remain in `autoaim/config` and contain
+camera/inference settings only.
 Robot tuning, such as barrel offsets, fire windows, bullet speed, and EKF gains,
 stays in the launch files.
 

@@ -1,9 +1,9 @@
 // CUDA preprocess kernel for the RealSense detector path. See
-// include/autoaim/realsense_preprocess.h for the contract. Kept identical in
+// include/autoaim_realsense/realsense_preprocess.h for the contract. Kept identical in
 // math to the zed_detector.py kernel (only the input stride differs: BGR8 vs
 // BGRA), so both camera paths produce the same network input.
 
-#include "autoaim/realsense_preprocess.h"
+#include "autoaim_realsense/realsense_preprocess.h"
 
 namespace {
 

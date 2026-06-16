@@ -255,7 +255,7 @@ def generate_launch_description():
         # RealSense detector (camera:=realsense). Config in config/realsense.yaml.
         # Same topics/messages as the ZED path.
         Node(
-            package="autoaim",
+            package="autoaim_realsense",
             executable="realsense_detector",
             name="realsense_detector",
             parameters=[realsense_config, engine_override],
