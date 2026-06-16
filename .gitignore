@@ -2,6 +2,7 @@
 build/
 install/
 log/
+compile_commands.json
 
 # Keep only the model trained and not the conversion made on the specific jetson
 AI-models/*.engine
@@ -13,7 +14,25 @@ old/
 
 #container folders
 src/isaac_ros_common
+src/isaac_*
+src/realsense-ros
 
 # ZED folders
 src/zed-ros2-interfaces
 src/zed-ros2-wrapper
+
+# macOS
+.DS_Store
+**/.DS_Store
+._*
+.Trashes
+
+# Python
+__pycache__/
+*.pyc
+
+# AI assistant local files
+.agents/
+.claude/
+.codex/
+.codex-plugins/

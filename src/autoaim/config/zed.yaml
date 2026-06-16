@@ -1,0 +1,33 @@
+# ZED X Mini detector — camera + runtime configuration.
+#
+# Loaded by zed_detector.py. The launch files pass this file to the detector
+# node via `parameters=[...]`. The `/**` wildcard applies these values to the
+# detector node regardless of its remapped node name.
+#
+# SCOPE: camera capture + detector/inference only. Robot calibration
+# (barrel_offset_*, gimbal signs, bullet_speed, fire window, EKF gains) lives in
+# the autoaim node parameters inside the launch files — NOT here.
+/**:
+  ros__parameters:
+    # ── Inference ──
+    # The TensorRT engine lives OUTSIDE the package (not installed by colcon).
+    # Override order: launch arg engine_path > env AUTOAIM_ENGINE_PATH > this.
+    engine_path: "/workspaces/isaac_ros-dev/AI-models/yolov26_keypoints.engine"
+    threshold: 0.15          # detection confidence threshold
+    nms_iou: 0.2             # NMS IoU (raw-output engines only; post-NMS engines skip it)
+    debug_scores: true
+
+    # ── Camera capture (ZED SDK) ──
+    resolution: "SVGA"       # VGA | SVGA | HD720 | HD1080 | HD1200 (per-eye left image)
+    fps: 120
+    image_flip: true         # camera mounted upside-down (FLIP_MODE.ON)
+    auto_exposure: false     # false -> manual exposure/gain below (AEC_AGC off)
+    exposure: 60             # ZED EXPOSURE setting, manual mode only
+    gain: 50                 # ZED GAIN setting, manual mode only
+    auto_white_balance: true # WHITEBALANCE_AUTO
+
+    # ── Publishing ──
+    publish_debug_every: 4   # /yolo/debug_image: publish every N frames (0 = never)
+    camera_info_every: 1     # /camera_info: publish every N frames (0 = never)
+    frame_id: "camera_color_optical_frame"
+    imu_frame_id: "zed_imu_link"

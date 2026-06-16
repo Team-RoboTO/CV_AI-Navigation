@@ -71,21 +71,29 @@ except ImportError:
 # Default TensorRT engine path. The model is kept OUTSIDE the package (e.g.
 # on the Isaac ROS dev volume), so it is not installed by colcon. Resolution
 # order: ROS param engine_path  >  env AUTOAIM_ENGINE_PATH  >  this default.
-ENGINE_DEFAULT = "/workspaces/isaac_ros-dev/AI-models/yolov26_keypoints.engine"
+DEFAULT_ENGINE = "/workspaces/isaac_ros-dev/AI-models/yolov26_keypoints.engine"
 
 
 def default_engine_path() -> str:
-    return os.environ.get("AUTOAIM_ENGINE_PATH", ENGINE_DEFAULT)
+    return os.environ.get("AUTOAIM_ENGINE_PATH", DEFAULT_ENGINE)
 
 
 ENGINE_PATH = default_engine_path()
 
-# ZED X Mini SVGA @ 120 fps: left image is 960x600.
-NATIVE_W, NATIVE_H = 960, 600
-IMG_SIZE = 640
-GRAB_FPS = 120
+# ZED resolution name -> (per-eye left-image width, height). The left-image
+# size drives the letterbox geometry and the GPU buffers, so it must be known
+# before the CUDA kernel is compiled. SVGA = 960x600 is the value this detector
+# historically hard-coded. The sl.RESOLUTION enum is looked up by name.
+ZED_RESOLUTIONS = {
+    "VGA":    (672, 376),
+    "SVGA":   (960, 600),
+    "HD720":  (1280, 720),
+    "HD1080": (1920, 1080),
+    "HD1200": (1920, 1200),
+}
 
-# Model / dataset convention.
+# Model / dataset convention. These are TRUE invariants of the trained model
+# (class id order and keypoint order) and must NOT become tunable parameters.
 NUM_KEYPOINTS = 4
 KEYPOINT_NAMES = ["TL", "TR", "BR", "BL"]
 CLASS_NAMES = {
@@ -94,14 +102,28 @@ CLASS_NAMES = {
     2: "red_armor",
 }
 
-THRESHOLD = 0.15
-NMS_IOU = 0.2
+# Decode-stage array sizing. Algorithm invariants, not field-tuning values.
 MAX_CANDIDATES = 80
 MAX_DETECTIONS = 30
 KEYPOINT_SCORE_THRESHOLD = 0.05
 
-FRAME_ID = "camera_color_optical_frame"
-IMU_FRAME_ID = "zed_imu_link"
+# Defaults below preserve the original hard-coded behavior. Every one of them is
+# now a ROS parameter (see config/zed.yaml) so the camera/runtime can be
+# tuned from launch/YAML without editing this file.
+IMG_SIZE = 640  # fallback only; the real net size is read from the engine.
+DEFAULT_RESOLUTION = "SVGA"
+DEFAULT_FPS = 120
+DEFAULT_IMAGE_FLIP = True
+DEFAULT_AUTO_EXPOSURE = False
+DEFAULT_EXPOSURE = 60
+DEFAULT_GAIN = 50
+DEFAULT_AUTO_WHITE_BALANCE = True
+DEFAULT_THRESHOLD = 0.15
+DEFAULT_NMS_IOU = 0.2
+DEFAULT_PUBLISH_DEBUG_EVERY = 4
+DEFAULT_CAMERA_INFO_EVERY = 1
+DEFAULT_FRAME_ID = "camera_color_optical_frame"
+DEFAULT_IMU_FRAME_ID = "zed_imu_link"
 
 # Preprocess geometry is computed from the engine input shape at runtime.
 
@@ -110,18 +132,49 @@ class Yolo26PoseKeypointsNode(Node):
     def __init__(self):
         super().__init__("yolo26_pose_keypoints_node")
 
-        # Parameters let you override constants from launch/CLI without editing.
+        # Parameters let you override every camera/runtime value from launch or
+        # config/zed.yaml without editing this file. Defaults reproduce
+        # the original hard-coded behavior exactly.
+        # -- detector / inference --
         self.declare_parameter("engine_path", ENGINE_PATH)
-        self.declare_parameter("threshold", THRESHOLD)
-        self.declare_parameter("nms_iou", NMS_IOU)
-        self.declare_parameter("publish_debug_every", 4)
+        self.declare_parameter("threshold", DEFAULT_THRESHOLD)
+        self.declare_parameter("nms_iou", DEFAULT_NMS_IOU)
+        self.declare_parameter("publish_debug_every", DEFAULT_PUBLISH_DEBUG_EVERY)
         self.declare_parameter("debug_scores", True)
+        # -- camera capture / runtime (previously hard-coded constants) --
+        self.declare_parameter("resolution", DEFAULT_RESOLUTION)
+        self.declare_parameter("fps", DEFAULT_FPS)
+        self.declare_parameter("image_flip", DEFAULT_IMAGE_FLIP)
+        self.declare_parameter("auto_exposure", DEFAULT_AUTO_EXPOSURE)
+        self.declare_parameter("exposure", DEFAULT_EXPOSURE)
+        self.declare_parameter("gain", DEFAULT_GAIN)
+        self.declare_parameter("auto_white_balance", DEFAULT_AUTO_WHITE_BALANCE)
+        self.declare_parameter("camera_info_every", DEFAULT_CAMERA_INFO_EVERY)
+        self.declare_parameter("frame_id", DEFAULT_FRAME_ID)
+        self.declare_parameter("imu_frame_id", DEFAULT_IMU_FRAME_ID)
 
         self.engine_path = self.get_parameter("engine_path").value
         self.threshold = float(self.get_parameter("threshold").value)
         self.nms_iou = float(self.get_parameter("nms_iou").value)
         self.publish_debug_every = int(self.get_parameter("publish_debug_every").value)
         self.debug_scores = bool(self.get_parameter("debug_scores").value)
+
+        res_name = str(self.get_parameter("resolution").value).upper()
+        if res_name not in ZED_RESOLUTIONS:
+            raise RuntimeError(
+                f"Unknown ZED resolution '{res_name}'. Supported: {sorted(ZED_RESOLUTIONS)}"
+            )
+        self.resolution_name = res_name
+        self.native_w, self.native_h = ZED_RESOLUTIONS[res_name]
+        self.fps = int(self.get_parameter("fps").value)
+        self.image_flip = bool(self.get_parameter("image_flip").value)
+        self.auto_exposure = bool(self.get_parameter("auto_exposure").value)
+        self.exposure = int(self.get_parameter("exposure").value)
+        self.gain = int(self.get_parameter("gain").value)
+        self.auto_white_balance = bool(self.get_parameter("auto_white_balance").value)
+        self.camera_info_every = int(self.get_parameter("camera_info_every").value)
+        self.frame_id = str(self.get_parameter("frame_id").value)
+        self.imu_frame_id = str(self.get_parameter("imu_frame_id").value)
 
         # ── 1. CUDA & TensorRT ───────────────────────────────────────────────
         cuda.init()
@@ -152,13 +205,13 @@ class Yolo26PoseKeypointsNode(Node):
         self.img_size, self.input_channels = self._parse_input_shape(in_shape)
         self.channel_stride = self.img_size * self.img_size
 
-        # Letterbox geometry for native 960x600 -> square engine input.
-        self.scale_net_to_native = float(NATIVE_W) / float(self.img_size)
-        self.unscaled_h_net = int(round(float(NATIVE_H) / self.scale_net_to_native))
+        # Letterbox geometry for native (per-eye) -> square engine input.
+        self.scale_net_to_native = float(self.native_w) / float(self.img_size)
+        self.unscaled_h_net = int(round(float(self.native_h) / self.scale_net_to_native))
         self.pad_y_net = int((self.img_size - self.unscaled_h_net) // 2)
 
         # self.get_logger().info(
-        #     f"Preprocess: {NATIVE_W}x{NATIVE_H} -> {self.img_size}x{self.img_size}, "
+        #     f"Preprocess: {self.native_w}x{self.native_h} -> {self.img_size}x{self.img_size}, "
         #     f"content={self.img_size}x{self.unscaled_h_net}, pad_y={self.pad_y_net}, "
         #     f"net_to_native_scale={self.scale_net_to_native:.6f}"
         # )
@@ -187,7 +240,7 @@ class Yolo26PoseKeypointsNode(Node):
         self.h_out = cuda.pagelocked_empty(int(np.prod(out_shape)), dtype=np.float32)
         self.d_in = cuda.mem_alloc(self.input_channels * self.img_size * self.img_size * 4)
         self.d_out = cuda.mem_alloc(self.h_out.nbytes)
-        self.d_rgba = cuda.mem_alloc(NATIVE_W * NATIVE_H * 4)
+        self.d_rgba = cuda.mem_alloc(self.native_w * self.native_h * 4)
         self.stream = cuda.Stream()
 
         self.boxes_buf = np.empty((MAX_CANDIDATES, 4), dtype=np.float32)
@@ -244,22 +297,26 @@ class Yolo26PoseKeypointsNode(Node):
         # ── 5. ZED Camera ───────────────────────────────────────────────────
         self.zed = sl.Camera()
         params = sl.InitParameters()
-        params.camera_resolution = sl.RESOLUTION.SVGA
-        params.camera_fps = GRAB_FPS
+        params.camera_resolution = getattr(sl.RESOLUTION, self.resolution_name)
+        params.camera_fps = self.fps
         params.depth_mode = sl.DEPTH_MODE.NONE
         params.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Z_UP
-        # Uncomment if camera is physically mounted upside-down:
-        params.camera_image_flip = sl.FLIP_MODE.ON
+        # Image flip (camera mounted upside-down). FLIP_MODE.ON also swaps which
+        # physical sensor produces the "left image" (see INSTRUCTIONS.md).
+        params.camera_image_flip = sl.FLIP_MODE.ON if self.image_flip else sl.FLIP_MODE.OFF
 
         err = self.zed.open(params)
         if err != sl.ERROR_CODE.SUCCESS:
             raise RuntimeError(f"Could not open ZED camera: {err}")
 
-        # Exposure settings for dark arenas. Tune on the real field.
-        self.zed.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 0)
-        self.zed.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE, 60)
-        self.zed.set_camera_settings(sl.VIDEO_SETTINGS.GAIN, 50)
-        self.zed.set_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO, 1)
+        # Exposure / gain / white balance for dark arenas. Tune on the real field
+        # via config/zed.yaml. EXPOSURE/GAIN are only applied in manual
+        # mode (auto_exposure False); otherwise AEC_AGC drives them.
+        self.zed.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 1 if self.auto_exposure else 0)
+        if not self.auto_exposure:
+            self.zed.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE, self.exposure)
+            self.zed.set_camera_settings(sl.VIDEO_SETTINGS.GAIN, self.gain)
+        self.zed.set_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO, 1 if self.auto_white_balance else 0)
 
         # Camera intrinsics for /camera_info.
         calib = (
@@ -276,9 +333,9 @@ class Yolo26PoseKeypointsNode(Node):
         # Cache the CameraInfo message: intrinsics never change at runtime, and
         # the old code called zed.get_camera_information() EVERY FRAME at 120 Hz.
         self.cam_info_msg = CameraInfo()
-        self.cam_info_msg.header.frame_id = FRAME_ID
-        self.cam_info_msg.width = NATIVE_W
-        self.cam_info_msg.height = NATIVE_H
+        self.cam_info_msg.header.frame_id = self.frame_id
+        self.cam_info_msg.width = self.native_w
+        self.cam_info_msg.height = self.native_h
         self.cam_info_msg.k = [
             calib.fx, 0.0, calib.cx,
             0.0, calib.fy, calib.cy,
@@ -459,10 +516,10 @@ class Yolo26PoseKeypointsNode(Node):
         payload = {
             "header": {
                 "stamp": {"sec": int(now_msg.sec), "nanosec": int(now_msg.nanosec)},
-                "frame_id": FRAME_ID,
+                "frame_id": self.frame_id,
             },
-            "image_width": NATIVE_W,
-            "image_height": NATIVE_H,
+            "image_width": self.native_w,
+            "image_height": self.native_h,
             "keypoint_order": KEYPOINT_NAMES,
             "detections": detections,
         }
@@ -495,8 +552,8 @@ class Yolo26PoseKeypointsNode(Node):
             self.pre_fn(
                 self.d_rgba,
                 self.d_in,
-                np.int32(NATIVE_W),
-                np.int32(NATIVE_H),
+                np.int32(self.native_w),
+                np.int32(self.native_h),
                 np.int32(self.img_size),
                 np.int32(self.img_size),
                 block=(16, 16, 1),
@@ -514,13 +571,13 @@ class Yolo26PoseKeypointsNode(Node):
 
             det_array_msg = Detection2DArray()
             det_array_msg.header.stamp = now_msg
-            det_array_msg.header.frame_id = FRAME_ID
+            det_array_msg.header.frame_id = self.frame_id
 
             kpt_array_msg = ArmorKeypointArray()
             kpt_array_msg.header.stamp = now_msg
-            kpt_array_msg.header.frame_id = FRAME_ID
-            kpt_array_msg.image_width = NATIVE_W
-            kpt_array_msg.image_height = NATIVE_H
+            kpt_array_msg.header.frame_id = self.frame_id
+            kpt_array_msg.image_width = self.native_w
+            kpt_array_msg.image_height = self.native_h
             kpt_array_msg.keypoint_order = KEYPOINT_NAMES
 
             json_detections: List[Dict] = []
@@ -561,10 +618,10 @@ class Yolo26PoseKeypointsNode(Node):
             if boxes is not None and len(indices) > 0:
                 for raw_i in np.array(indices).flatten()[:MAX_DETECTIONS]:
                         L_r, T_r, W_r, H_r = boxes[raw_i]
-                        L = max(0.0, min(float(NATIVE_W), float(L_r)))
-                        T = max(0.0, min(float(NATIVE_H), float(T_r)))
-                        R = max(0.0, min(float(NATIVE_W), float(L_r + W_r)))
-                        B = max(0.0, min(float(NATIVE_H), float(T_r + H_r)))
+                        L = max(0.0, min(float(self.native_w), float(L_r)))
+                        T = max(0.0, min(float(self.native_h), float(T_r)))
+                        R = max(0.0, min(float(self.native_w), float(L_r + W_r)))
+                        B = max(0.0, min(float(self.native_h), float(T_r + H_r)))
                         W = R - L
                         H = B - T
                         if W <= 1.0 or H <= 1.0:
@@ -573,13 +630,13 @@ class Yolo26PoseKeypointsNode(Node):
                         cls = int(v_classes[raw_i])
                         conf = float(v_confs[raw_i])
                         kp = kpts[raw_i].copy()
-                        kp[:, 0] = np.clip(kp[:, 0], 0.0, float(NATIVE_W))
-                        kp[:, 1] = np.clip(kp[:, 1], 0.0, float(NATIVE_H))
+                        kp[:, 0] = np.clip(kp[:, 0], 0.0, float(self.native_w))
+                        kp[:, 1] = np.clip(kp[:, 1], 0.0, float(self.native_h))
 
                         # Legacy bbox topic for current autoaim compatibility.
                         det = Detection2D()
                         det.header.stamp = now_msg
-                        det.header.frame_id = FRAME_ID
+                        det.header.frame_id = self.frame_id
                         det.bbox.center.position.x = float(L + W * 0.5)
                         det.bbox.center.position.y = float(T + H * 0.5)
                         det.bbox.size_x = float(W)
@@ -594,7 +651,7 @@ class Yolo26PoseKeypointsNode(Node):
                         # New typed keypoint output for autoaim.
                         kmsg = ArmorKeypoint()
                         kmsg.header.stamp = now_msg
-                        kmsg.header.frame_id = FRAME_ID
+                        kmsg.header.frame_id = self.frame_id
                         kmsg.class_id = int(cls)
                         kmsg.class_name = CLASS_NAMES.get(cls, str(cls))
                         kmsg.confidence = float(conf)
@@ -646,16 +703,19 @@ class Yolo26PoseKeypointsNode(Node):
             self.kpt_pub.publish(kpt_array_msg)
             self.kpt_json_pub.publish(String(data=self._make_keypoint_json(now_msg, json_detections)))
 
-            # IMU and camera info.
+            # IMU every frame (ZED-only feature). CameraInfo throttled: the
+            # autoaim node latches intrinsics on the first message, so there is
+            # no need to resend at the full grab rate (camera_info_every).
             self._publish_imu(now_msg)
-            self._publish_camera_info(now_msg)
+            if self.camera_info_every > 0 and self.frame_count % self.camera_info_every == 0:
+                self._publish_camera_info(now_msg)
 
             # Raw image for the viewer node. Publish less often to reduce bandwidth.
             self.frame_count += 1
             if self.publish_debug_every > 0 and self.frame_count % self.publish_debug_every == 0:
                 img_msg = self.bridge.cv2_to_imgmsg(self.mat_cpu.get_data(), "bgra8")
                 img_msg.header.stamp = now_msg
-                img_msg.header.frame_id = FRAME_ID
+                img_msg.header.frame_id = self.frame_id
                 self.img_pub.publish(img_msg)
 
     # ------------------------------------------------------------------
@@ -711,7 +771,7 @@ class Yolo26PoseKeypointsNode(Node):
             dz /= nd
 
         imu_msg = Imu()
-        imu_msg.header.frame_id = IMU_FRAME_ID
+        imu_msg.header.frame_id = self.imu_frame_id
         imu_msg.header.stamp = now_msg
         imu_msg.orientation.w = float(dw)
         imu_msg.orientation.x = float(dx)

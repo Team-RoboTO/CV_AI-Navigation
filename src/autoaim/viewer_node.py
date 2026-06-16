@@ -52,7 +52,7 @@ def wrap_pi(a: float) -> float:
 
 class ViewerNode(Node):
     def __init__(self):
-        super().__init__('auto_aim_viewer')
+        super().__init__('autoaim_viewer')
         self.bridge = CvBridge()
 
         self.detections = []
