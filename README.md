@@ -1,6 +1,3 @@
-test push su git
-
-
 # CV_AI-Navigation
 Below the guide for setting up your git environment in your local machine and the instructions for the PR opening (Pull Request).
 This repository doesn't allow you to merge automatically your work on the main, you have to open a PR and wait for the review of them.
