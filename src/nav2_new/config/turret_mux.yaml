@@ -1,0 +1,31 @@
+# =============================================================================
+# turret_yaw_mux – yaw / pitch multiplexer for the turret micro
+# =============================================================================
+# When CV detects an enemy → forward CV yaw/pitch.
+# When no detection      → send chassis yaw so the barrel aligns with the
+#                          front of the robot.
+# =============================================================================
+turret_yaw_mux:
+  ros__parameters:
+    # How long we keep following the last CV detection after losing it (s).
+    # After this, the mux switches back to chassis-forward mode.
+    cv_timeout: 0.3
+
+    # Input topics
+    cv_target_topic: /cv/target         # geometry_msgs/Vector3Stamped  (x=yaw, y=pitch, z=confidence)
+    cv_detection_topic: /cv/detection   # std_msgs/Bool  (optional — if absent, timeout rules)
+    odom_topic: /odom                   # chassis heading
+
+    # Output topic to the micro
+    turret_cmd_topic: /turret/cmd       # geometry_msgs/Vector3Stamped  (x=yaw, y=pitch, z=mode)
+
+    # Publishing rate (Hz). The micro expects continuous commands.
+    publish_rate: 50.0
+
+    # Reference frame for CV yaw:
+    #   "chassis"  → CV yaw is relative to robot front  (recommended)
+    #   "world"    → CV yaw is absolute in the map frame
+    cv_yaw_frame: "chassis"
+
+    # Default pitch when no detection (radians). 0 = horizontal.
+    idle_pitch: 0.0

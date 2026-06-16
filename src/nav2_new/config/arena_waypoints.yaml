@@ -1,0 +1,114 @@
+# =============================================================================
+# RoboMaster arena — waypoints, strategies, and health thresholds
+# =============================================================================
+# Arena: 12.0 m (X) × 8.0 m (Y), origin = bottom-left corner.
+#
+# Coordinates are ESTIMATED from the reference images. You MUST verify them
+# against the actual SLAM map using `waypoint_editor`. To capture named
+# waypoints in RViz:
+#   1. In terminal A:  ros2 run nav2_new waypoint_editor
+#   2. In terminal B:  ./scripts/set_waypoint_name.sh blue_tunnel_entry
+#   3. In RViz:        click "2D Goal Pose" and drag at the desired location
+#   4. Repeat for each waypoint
+#   5. Copy entries from ~/waypoints_captured.yaml into this file
+# =============================================================================
+
+# --- Team spawn poses (approximate, verify on your map) ---------------------
+spawns:
+  red:  { x: 2.75, y: 6.19, yaw:  0.0 }    # left side, tools icon
+  blue: { x: 9.25, y: 6.19, yaw:  3.14 }   # right side, facing -X
+
+# --- Named waypoints ---------------------------------------------------------
+waypoints:
+  # Central objective (capture point) — 2×2 m green square
+  center:              { x: 6.0, y: 4.0, yaw: 0.0 }
+
+  # Corners of the capture point for diagonal patrol
+  center_ne:           { x: 6.7, y: 4.7, yaw: -2.36 }   # upper-right
+  center_sw:           { x: 5.3, y: 3.3, yaw:  0.79 }   # lower-left
+  center_nw:           { x: 5.3, y: 4.7, yaw: -0.79 }   # upper-left
+  center_se:           { x: 6.7, y: 3.3, yaw:  2.36 }   # lower-right
+
+  # ── BLUE team: tunnel path between the two walls ────────────────────────
+  # The tunnel is the narrow gap at the bottom of the arena.
+  # Path: spawn → tunnel_2 (approach) → tunnel_1 (inside) → center
+  blue_tunnel_2:       { x: 8.0, y: 3.0, yaw:  3.14 }   # approach from right
+  blue_tunnel_1:       { x: 7.0, y: 2.7, yaw:  3.14 }   # inside tunnel
+  blue_center_approach: { x: 6.5, y: 3.5, yaw:  1.57 }   # rise to center
+
+  # ── RED team: mirror path on the left side ─────────────────────────────
+  red_tunnel_1:        { x: 4.0, y: 3.0, yaw:  0.0 }
+  red_tunnel_2:        { x: 5.0, y: 2.7, yaw:  0.0 }
+  red_center_approach: { x: 5.5, y: 3.5, yaw:  1.57 }
+
+  # ── Spawn safe zones (for retreat) ─────────────────────────────────────
+  red_retreat:         { x: 2.75, y: 6.19, yaw:  0.0 }
+  blue_retreat:        { x: 9.25, y: 6.19, yaw:  3.14 }
+
+  fine_corridoio: { x: 3.444, y: 0.381, yaw: 0.000 }
+  centro_lab: { x: 3.508, y: 6.240, yaw: 0.000 }
+  scrivania_Leo: { x: 3.622, y: 2.375, yaw: 0.000 }
+
+
+# --- Strategies --------------------------------------------------------------
+# Each strategy is a list of waypoint names to visit in order, per team.
+# The game_state_manager switches between these based on /micro_status.
+strategies:
+
+  # Rush to the center using the team-specific tunnel path
+  rush_center:
+    red:  [red_tunnel_1, red_tunnel_2, red_center_approach, center]
+    blue: [blue_tunnel_2, blue_tunnel_1, blue_center_approach, center]
+
+  # Hold the center by patrolling its diagonal
+  hold_center_diagonal:
+    red:  [center, center_ne, center, center_sw]     # loops
+    blue: [center, center_nw, center, center_se]     # loops
+
+  # Retreat to spawn (uses the same tunnel for safety)
+  retreat_to_spawn:
+    red:  [red_center_approach, red_tunnel_2, red_tunnel_1, red_retreat]
+    blue: [blue_center_approach, blue_tunnel_1, blue_tunnel_2, blue_retreat]
+
+  # Just sit at spawn (match not started, or disabled)
+  wait_at_spawn:
+    red:  [red_retreat]
+    blue: [blue_retreat]
+
+  # Debug: go straight to center (ignores tunnel) — useful for lab tests
+  straight_to_center:
+    red:  [center]
+    blue: [center]
+  
+  centro_lab:
+    red: [centro_lab]
+    blue: [centro_lab]
+  percorso:
+    red: [fine_corridoio, centro_lab, scrivania_Leo]
+    blue: [fine_corridoio, centro_lab, scrivania_Leo]
+
+# --- Health thresholds (used by game_state_manager) -------------------------
+health:
+  retreat_threshold: 30      # % HP — below this, switch to retreat_to_spawn
+  safe_threshold: 70         # % HP — above this, resume offensive
+  low_hp_strategy: retreat_to_spawn
+  default_strategy: rush_center
+  hold_strategy: hold_center_diagonal
+
+# --- Arena metadata (for documentation only) --------------------------------
+arena:
+  width_m: 12.0
+  height_m: 8.0
+  capture_point:
+    size_m: 2.0
+    center: { x: 6.0, y: 4.0 }
+  notes: |
+    - The black textured areas at the BOTTOM of the arena are bumper pads.
+      They are soft and uneven — DO NOT drive over them. Map them as obstacles
+      during SLAM (drive around them, not onto them) and they will show up as
+      walls in the occupancy grid.
+    - The spawn squares are raised ~15 cm; the robot is dropped into them at
+      match start. Don't plan paths that re-enter the spawn square (the edge
+      may cause a step).
+    - The tunnel gap between the two central walls is estimated at ~0.7–1.0 m
+      wide. Tune `inflation_radius` in nav2_params_combat.yaml accordingly.
