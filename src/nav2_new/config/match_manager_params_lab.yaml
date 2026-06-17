@@ -1,0 +1,163 @@
+# match_manager_params_lab.yaml
+# Common params for the navigation-side match pipeline.
+# Lab version: uses arena_waypoints_lab.yaml.
+
+micro_status_adapter:
+  ros__parameters:
+    input_topic: /micro_status
+
+    # /micro_status = RX[0..9] from micro + TX echo[10..15].
+    # Layout:
+    # 0 yaw, 1 pitch, 2 vx, 3 vy, 4 color, 5 game_progress,
+    # 6 HP, 7 resupply status, 8 center status, 9 reserved/fake.
+    team_index: 4
+    game_progress_index: 5
+    match_started_index: 5
+    health_index: 6
+    resupply_status_index: 7
+    center_status_index: 8
+
+    # color: 0 RED, 1 BLUE
+    red_value: 0.0
+    blue_value: 1.0
+
+    # Referee game_progress convention:
+    # 1 preparation, 2 15-second initialization, 3 5-second countdown,
+    # 4 in match, 5 match settling/ended.
+    preparation_value: 1
+    init_15s_value: 2
+    countdown_5s_value: 3
+    in_match_value: 4
+    match_ended_value: 5
+
+    # Kept for compatibility if the adapter also publishes a simple Bool.
+    match_started_threshold: 0.5
+
+    # Center status convention:
+    # 0 = center free, 1 = ours, 2 = enemy.
+    center_free_value: 0
+    center_ours_value: 1
+    center_enemy_value: 2
+
+
+set_initial_pose:
+  ros__parameters:
+    team: red
+    use_team_topic: true
+    team_topic: /team
+
+    waypoints_file: /root/nav2_ws/src/nav2_new/config/arena_waypoints_lab.yaml
+
+    initialpose_topic: /initialpose
+    publish_count: 8
+    publish_period: 0.5
+    start_delay: 2.0
+
+    # If /team does not arrive from micro_status, use the fallback team.
+    fallback_team_after_sec: 8.0
+
+    cov_x: 0.25
+    cov_y: 0.25
+    cov_yaw: 0.068
+
+    republish_on_match_ended: true
+    republish_on_team_change: true
+    match_ended_topic: /match_ended
+
+
+waypoint_manager:
+  ros__parameters:
+    team: red
+
+    waypoints_file: /root/nav2_ws/src/nav2_new/config/arena_waypoints_lab.yaml
+
+    # Before match start, the robot stays at spawn_lab.
+    initial_strategy: wait_at_spawn
+    autostart_initial_strategy: true
+
+    # These strategies must exist in arena_waypoints_lab.yaml.
+    # Removed "patrol" because it is not defined in the lab YAML.
+    loop_strategies:
+      - center_free_strategy
+      - hold_center_diagonal
+      - enemy_center_strategy
+      - percorso
+
+    retry_failed_after_sec: 3.0
+
+
+game_state_manager:
+  ros__parameters:
+    waypoints_file: /root/nav2_ws/src/nav2_new/config/arena_waypoints_lab.yaml
+
+    default_team: red
+    use_team_topic: true
+
+    # Match not started / preparation.
+    wait_strategy: wait_at_spawn
+
+    # Match started.
+    rush_strategy: rush_center
+
+    # Low HP.
+    retreat_strategy: retreat_to_spawn
+
+    # Center state strategies.
+    center_free_strategy: center_free_strategy
+    center_ours_strategy: hold_center_diagonal
+    center_enemy_strategy: enemy_center_strategy
+
+    # -1.0 means: read health.retreat_threshold from arena_waypoints_lab.yaml.
+    retreat_health_threshold: -1.0
+
+    # Wait at spawn after retreat before resuming.
+    retreat_wait_sec: 4.0
+    allow_repeated_retreats: true
+    retreat_cooldown_sec: 8.0
+
+    strategy_republish_sec: 3.0
+    tick_hz: 5.0
+
+    # On match end, cancel/stop/reset strategy state.
+    reset_on_match_end: true
+
+    after_retreat_strategy: after_retreat
+
+
+nav_match_reset:
+  ros__parameters:
+    clear_local_service: /local_costmap/clear_entirely_local_costmap
+    clear_global_service: /global_costmap/clear_entirely_global_costmap
+    min_reset_interval_sec: 3.0
+    clear_on_match_ended: true
+
+
+game_status_reporter:
+  ros__parameters:
+    publish_rate: 2.0
+
+    map_frame: map
+    odom_frame: odom
+    base_frame: base_link
+
+    fresh_timeout_sec: 1.0
+    error_hold_sec: 3.0
+    tf_timeout_sec: 0.05
+
+
+turret_idle_target_publisher:
+  ros__parameters:
+    team: red
+    use_team_topic: true
+    team_topic: /team
+
+    waypoints_file: /root/nav2_ws/src/nav2_new/config/arena_waypoints_lab.yaml
+
+    target_topic: /turret/idle_target
+    publish_rate: 2.0
+
+    # Must exist in waypoints, and is also referenced by:
+    # turret_idle_targets:
+    #   red: centro_lab
+    #   blue: centro_lab
+    default_target_name: centro_lab

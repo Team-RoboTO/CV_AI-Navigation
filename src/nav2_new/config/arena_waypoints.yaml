@@ -95,6 +95,10 @@ health:
   default_strategy: rush_center
   hold_strategy: hold_center_diagonal
 
+turret_idle_targets:
+  red: center
+  blue: center
+
 # --- Arena metadata (for documentation only) --------------------------------
 arena:
   width_m: 12.0
