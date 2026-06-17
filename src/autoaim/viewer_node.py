@@ -71,14 +71,24 @@ class ViewerNode(Node):
         self.micro_vx = 0.0
         self.micro_vy = 0.0
         self.micro_pitch_feedback_opposite_sign = self.declare_parameter("micro_pitch_feedback_opposite_sign", True).value
+        self.aim_topic_timeout = float(self.declare_parameter("aim_topic_timeout", 0.30).value)
+        self.cmd_topic_timeout = float(self.declare_parameter("cmd_topic_timeout", 0.50).value)
+        self.fire_lock_yaw = float(self.declare_parameter("fire_lock_yaw", 0.05).value)
+        self.fire_lock_pitch = float(self.declare_parameter("fire_lock_pitch", 0.04).value)
+        self.debug_image_topic = self.declare_parameter(
+            "debug_image_topic", "/tracker/debug_image").value
+        self.exclusive_output = bool(self.declare_parameter("exclusive_output", True).value)
+        self.publish_enabled = True
 
         # Pixel overlay from C++ node. If missing/stale, viewer computes a fallback
         # from cmd absolute target minus current micro angle.
         self.aim_px = None
         self.imp_px = None
         self.fire_px = False
+        self.aim_holding = False
         self.last_aim_px_time = 0.0
         self.aim_source = "none"
+        self.last_cmd_time = 0.0
 
         # Camera intrinsics for fallback projection
         self.cam_fx = None
@@ -113,8 +123,19 @@ class ViewerNode(Node):
             self.get_logger().warn(
                 "autoaim.msg.ArmorKeypointArray not available — keypoint overlay disabled.")
 
-        self.pub = self.create_publisher(Image, '/tracker/debug_image', 1)
-        self.get_logger().info('Viewer started — view /tracker/debug_image in RViz2')
+        if self.exclusive_output:
+            existing_publishers = self.get_publishers_info_by_topic(self.debug_image_topic)
+            if existing_publishers:
+                self.publish_enabled = False
+                self.get_logger().error(
+                    f"Not publishing {self.debug_image_topic}: another viewer is already "
+                    f"publishing it ({len(existing_publishers)} publisher(s)). Stop duplicate "
+                    "autoaim launches/viewers to remove flicker.")
+
+        self.pub = (
+            self.create_publisher(Image, self.debug_image_topic, 1)
+            if self.publish_enabled else None)
+        self.get_logger().info(f'Viewer started — view {self.debug_image_topic} in RViz2')
 
     def camera_info_cb(self, msg):
         self.img_w = int(msg.width)
@@ -140,6 +161,7 @@ class ViewerNode(Node):
             self.micro_vy = float(msg.data[3])
 
     def cmd_cb(self, msg):
+        self.last_cmd_time = time.monotonic()
         self.cmd_fire = msg.angular.x > 0.5
         self.cmd_pitch = float(msg.angular.y)
         self.cmd_yaw = float(msg.angular.z)
@@ -157,7 +179,27 @@ class ViewerNode(Node):
         self.aim_px = (int(msg.linear.x), int(msg.linear.y))
         self.imp_px = (int(msg.angular.x), int(msg.angular.y))
         self.fire_px = msg.angular.z > 0.5
+        self.aim_holding = msg.linear.z > 0.5
         self.last_aim_px_time = time.monotonic()
+
+    def _age_s(self, stamp: float):
+        if stamp <= 0.0:
+            return None
+        return max(0.0, time.monotonic() - stamp)
+
+    def _fmt_age(self, stamp: float) -> str:
+        age = self._age_s(stamp)
+        if age is None:
+            return "missing"
+        return f"{age:.2f}s"
+
+    def _fmt_bool(self, value: bool) -> str:
+        return "Y" if value else "N"
+
+    def _micro_pitch_for_lock(self) -> float:
+        if self.micro_pitch is None:
+            return 0.0
+        return -self.micro_pitch if self.micro_pitch_feedback_opposite_sign else self.micro_pitch
 
     def _fallback_aim_px_from_absolute_command(self):
         """Project absolute target into the camera image using target-current.
@@ -204,8 +246,8 @@ class ViewerNode(Node):
         label = "AIM" if in_frame else "AIM OFFSCREEN"
         if source:
             label += f" ({source})"
-        cv2.putText(frame, label, (min(dax + 16, w - 185), max(day - 8, 18)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        cv2.putText(frame, label, (min(dax + 14, w - 165), max(day - 8, 16)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
 
     def image_cb(self, msg):
         try:
@@ -218,7 +260,16 @@ class ViewerNode(Node):
                 self.get_logger().warn(f'Image conversion failed: {e}', throttle_duration_sec=5.0)
                 return
 
+        frame = frame.copy()
         h, w = frame.shape[:2]
+        now_mono = time.monotonic()
+        cmd_fresh = (
+            self.last_cmd_time > 0.0 and
+            (now_mono - self.last_cmd_time) <= self.cmd_topic_timeout)
+        topic_fresh = (
+            self.aim_px is not None and
+            (now_mono - self.last_aim_px_time) < self.aim_topic_timeout)
+        actively_tracking = self.tracking and cmd_fresh
 
         # YOLO bounding boxes
         for det in self.detections:
@@ -232,7 +283,7 @@ class ViewerNode(Node):
             if det.results:
                 label = f"c{det.results[0].hypothesis.class_id} {det.results[0].hypothesis.score:.2f}"
                 cv2.putText(frame, label, (x1, y1 - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 255), 1, cv2.LINE_AA)
 
         # 4-point armor keypoints from the keypoint detector.
         # Convention from msg: TL, TR, BR, BL — draw as quadrilateral.
@@ -253,8 +304,17 @@ class ViewerNode(Node):
                     for p in pts:
                         cv2.circle(frame, p, 3, (255, 255, 255), -1)
                     label = f"kp c{kpd.class_id} {kpd.confidence:.2f}"
-                    cv2.putText(frame, label, (pts[0][0], pts[0][1] - 8),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.34, 1)
+                    min_x = min(p[0] for p in pts)
+                    min_y = min(p[1] for p in pts)
+                    max_y = max(p[1] for p in pts)
+                    label_x = int(np.clip(min_x, 0, max(0, w - tw - 2)))
+                    label_y = max_y + th + 6
+                    if label_y > h - 4:
+                        label_y = min_y - 8
+                    label_y = int(np.clip(label_y, th + 2, max(th + 2, h - 4)))
+                    cv2.putText(frame, label, (label_x, label_y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.34, (255, 0, 255), 1, cv2.LINE_AA)
             except (AttributeError, IndexError):
                 continue
 
@@ -262,11 +322,10 @@ class ViewerNode(Node):
         # compute it from absolute target minus current micro angle.
         aim_to_draw = None
         aim_source = None
-        if self.tracking:
-            topic_fresh = self.aim_px is not None and (time.monotonic() - self.last_aim_px_time) < 0.30
+        if actively_tracking:
             if topic_fresh:
                 aim_to_draw = self.aim_px
-                aim_source = "topic"
+                aim_source = "topic-hold" if self.aim_holding else "topic"
             else:
                 fallback = self._fallback_aim_px_from_absolute_command()
                 if fallback is not None:
@@ -278,7 +337,7 @@ class ViewerNode(Node):
             self._draw_aim_marker(frame, ax, ay, w, h, aim_source)
 
         # Impact point from C++: selected armor center / desired bullet impact point.
-        if self.tracking and self.imp_px is not None:
+        if actively_tracking and topic_fresh and self.imp_px is not None:
             ix, iy = self.imp_px
             if 0 <= ix < w and 0 <= iy < h:
                 color = (0, 255, 0) if self.fire_px else (0, 100, 255)
@@ -286,45 +345,60 @@ class ViewerNode(Node):
                 cv2.drawMarker(frame, (ix, iy), color, cv2.MARKER_TILTED_CROSS, 30, 2)
                 label = "FIRE" if self.fire_px else "HOLD"
                 cv2.putText(frame, label, (ix+25, iy+5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
 
-        # HUD
+        # HUD: old vertical layout, with bug-fix additions only where they affect
+        # what the operator sees live.
+        text_ok = (0, 255, 0)
+        text_info = (0, 255, 255)
+        text_dim = (190, 190, 190)
+        text_warn = (0, 160, 255)
+        text_bad = (0, 0, 255)
+
         lines = []
-        if self.tracking:
-            lines.append("STATE: TRACKING")
-            lines.append(f"Pitch tgt: {self.cmd_pitch:+.3f} rad")
-            lines.append(f"Yaw tgt:   {self.cmd_yaw:+.3f} rad")
+        if actively_tracking:
+            lines.append(("STATE: TRACKING", text_ok))
+            lines.append((f"Pitch tgt: {self.cmd_pitch:+.3f} rad", text_info))
+            lines.append((f"Yaw tgt:   {self.cmd_yaw:+.3f} rad", text_info))
             if self.micro_yaw is not None and self.micro_pitch is not None:
                 yaw_err = wrap_pi(self.cmd_yaw - self.micro_yaw)
-                micro_pitch_for_lock = -self.micro_pitch if self.micro_pitch_feedback_opposite_sign else self.micro_pitch
-                pitch_err = self.cmd_pitch - micro_pitch_for_lock
-                lines.append(f"Yaw now:   {self.micro_yaw:+.3f} rad")
-                lines.append(f"Pitch raw: {self.micro_pitch:+.3f} rad")
-                lines.append(f"Yaw err:   {yaw_err:+.3f} rad")
-                lines.append(f"Pitch err: {pitch_err:+.3f} rad")
-                lines.append(f"vx/vy:     {self.micro_vx:+.2f}, {self.micro_vy:+.2f} m/s")
+                pitch_err = self.cmd_pitch - self._micro_pitch_for_lock()
+                yaw_locked = abs(yaw_err) <= self.fire_lock_yaw
+                pitch_locked = abs(pitch_err) <= self.fire_lock_pitch
+                lines.append((f"Yaw now:   {self.micro_yaw:+.3f} rad", text_info))
+                lines.append((f"Pitch raw: {self.micro_pitch:+.3f} rad", text_info))
+                lines.append((f"Yaw err:   {yaw_err:+.3f} rad", text_ok if yaw_locked else text_warn))
+                lines.append((f"Pitch err: {pitch_err:+.3f} rad", text_ok if pitch_locked else text_warn))
+                lines.append((f"Lock y/p:  {self._fmt_bool(yaw_locked)}, {self._fmt_bool(pitch_locked)}",
+                              text_ok if yaw_locked and pitch_locked else text_warn))
+                lines.append((f"vx/vy:     {self.micro_vx:+.2f}, {self.micro_vy:+.2f} m/s", text_dim))
             else:
-                lines.append("Micro status: missing")
+                lines.append(("Micro status: missing", text_bad))
             if aim_to_draw is None:
-                lines.append("AIM: missing")
-            lines.append(f"Dist:      {self.cmd_distance:.2f}m")
+                lines.append(("AIM: missing", text_warn))
+            else:
+                lines.append((f"AIM src:   {aim_source}", text_dim))
+            lines.append((f"Dist:      {self.cmd_distance:.2f}m", text_info))
             if self.cmd_fire:
-                lines.append(">>> FIRE <<<")
+                lines.append((">>> FIRE <<<", text_ok))
         else:
-            lines.append("STATE: SEARCHING")
+            if self.tracking and not cmd_fresh:
+                lines.append((f"STATE: CMD STALE ({self._fmt_age(self.last_cmd_time)})", text_warn))
+            else:
+                lines.append(("STATE: SEARCHING", text_dim))
 
         y_off = 25
-        for i, line in enumerate(lines):
+        for i, (line, color) in enumerate(lines):
             y = y_off + i * 22
             (tw, th), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-            cv2.rectangle(frame, (8, y-th-4), (18+tw, y+6), (0, 0, 0), -1)
-            color = (0, 255, 0) if 'FIRE' in line else (0, 255, 255)
+            cv2.rectangle(frame, (8, y - th - 4), (18 + tw, y + 6), (0, 0, 0), -1)
             cv2.putText(frame, line, (12, y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
 
-        out_msg = self.bridge.cv2_to_imgmsg(frame, 'bgr8')
-        out_msg.header = msg.header
-        self.pub.publish(out_msg)
+        if self.pub is not None:
+            out_msg = self.bridge.cv2_to_imgmsg(frame, 'bgr8')
+            out_msg.header = msg.header
+            self.pub.publish(out_msg)
 
 
 def main():

@@ -49,6 +49,12 @@ The C++ `serial_bridge` executable is used by default. The Python
 `serial_bridge.py` remains installed as a fallback with the same node name,
 parameters, topics, and raw packet layout.
 
+`hero.launch.py` and `standard.launch.py` do not start `turret_yaw_mux` or a
+navigation pipeline. They pass `/cmd_vel_AI` directly into the serial bridge's
+`turret_cmd_topic` and set `enable_nav_pipeline` to `false`, so the nav TX
+fields are forced to zero. `sentry.launch.py` keeps the mux/navigation wiring
+and sends the mux output through `/turret/cmd`.
+
 ## Models
 
 TensorRT engines are not installed by the ROS package. Keep device-specific
@@ -176,6 +182,30 @@ for mixed testing.
 | `ego_velocity_available` | Keep false until firmware sends validated chassis velocity. |
 | `chassis_heading_index` | Index in micro status containing chassis heading, or `-1` if unavailable. |
 
+## Viewer HUD
+
+The viewer publishes `/tracker/debug_image`. The HUD is intentionally small and
+shows only values that change during a run:
+
+| Field | Meaning |
+|---|---|
+| `STATE` | `TRACKING` when a fresh autoaim command is active, `SEARCHING` when no target is active, or `CMD STALE` when the last command is too old to trust. |
+| `Pitch tgt` | Absolute pitch command from `/cmd_vel_AI.angular.y`, in radians. |
+| `Yaw tgt` | Absolute yaw command from `/cmd_vel_AI.angular.z`, in radians. |
+| `Yaw now` | Current yaw feedback from `/micro_status[0]`, in radians. |
+| `Pitch raw` | Raw pitch feedback from `/micro_status[1]`, in radians. |
+| `Yaw err` | Yaw target minus current yaw, in radians. Green means it is inside `fire_lock_yaw`; orange means it is still outside lock. |
+| `Pitch err` | Pitch target minus corrected pitch feedback, in radians. Green means it is inside `fire_lock_pitch`; orange means it is still outside lock. |
+| `Lock y/p` | Whether yaw and pitch are both inside their fire-lock thresholds. Shooting is blocked unless both are `Y`. |
+| `vx/vy` | Chassis velocity values from `/micro_status[2]` and `/micro_status[3]`, in m/s. |
+| `Dist` | Target distance from `/cmd_vel_AI.linear.x`, in meters. |
+| `AIM: missing` | No fresh aim marker is available and fallback projection cannot be computed. |
+| `AIM src` | Source of the drawn aim marker: `topic` from `/tracker/aim_pixels`, `topic-hold` for a held command, or `cmd-now` fallback projection from current command and micro angles. |
+| `>>> FIRE <<<` | Final fire command from `/cmd_vel_AI.angular.x`; shown only when autoaim is requesting shoot. |
+
+The green/orange `FIRE` or `HOLD` marker near the target is the selected impact
+point from `/tracker/aim_pixels`, not a separate fire command from the micro.
+
 RealSense-only detector settings live in `config/realsense.yaml`:
 
 | Parameter | Description |
@@ -241,3 +271,13 @@ quality.
 
 If serial cannot connect, check the device path, permissions, baudrate, parity,
 and whether another process already has the port open.
+
+If the viewer flickers or old HUD text alternates with new HUD text, check for
+duplicate publishers:
+
+```bash
+ros2 topic info /tracker/debug_image --verbose
+```
+
+There should be exactly one publisher. Duplicate `autoaim_viewer` nodes usually
+mean two launch stacks are running at the same time.

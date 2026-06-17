@@ -148,8 +148,13 @@ def autoaim_params():
         # pitch feedback, field [11] is the pitch command echo. With the gimbal
         # settled on a target: feedback ≈ -command -> set BOTH True;
         # feedback ≈ +command -> set BOTH False.
-        {"micro_pitch_feedback_opposite_sign": True},
-        {"micro_pitch_lock_opposite_sign": True},
+        # UPDATE FOR HERO ONLY:
+        # Hero RealSense micro reports pitch feedback in the SAME sign as the
+        # command echo (/micro_status[1] ~= /micro_status[11] when settled).
+        # If this is wrong, the HUD shows pitch error near 2x pitch instead of
+        # near zero and fire-lock never closes.
+        {"micro_pitch_feedback_opposite_sign": False},
+        {"micro_pitch_lock_opposite_sign": False},
 
         {"cmd_hold_time": 0.25},
         {"cmd_max_delta_yaw": 0.80},
@@ -184,6 +189,15 @@ def generate_launch_description():
         {"serial_tx_hz": 100.0},
         {"serial_reconnect_interval": 2.0},
         {"serial_rx_timeout": 3.0},
+        # Hero has no turret_yaw_mux/navigation pipeline in this launch. Feed
+        # autoaim directly into the bridge's turret-command slot and force nav
+        # TX fields to zero from launch params, without special bridge code.
+        {"turret_cmd_topic": "/cmd_vel_AI"},
+        {"nav_cmd_topic": "/cmd_vel_NAV"},
+        {"micro_status_topic": "/micro_status"},
+        {"enable_nav_pipeline": False},
+        {"enable_turret_pipeline": True},
+        {"hold_last_turret_when_disabled": True},
         # SAFETY: if /cmd_vel_AI goes stale for longer than this (autoaim node
         # crashed), the shoot flag sent to the micro is forced to 0. Without it
         # the bridge re-sends the last shoot=1 at 100 Hz forever.
@@ -194,9 +208,10 @@ def generate_launch_description():
     ]
 
     viewer_params = [
-        # Must match micro_pitch_lock_opposite_sign in the autoaim params above,
-        # otherwise the pitch-error numbers in the debug overlay are sign-flipped.
-        {"micro_pitch_feedback_opposite_sign": True},
+        # Must match micro_pitch_lock_opposite_sign in the autoaim params above.
+        {"micro_pitch_feedback_opposite_sign": False},
+        {"fire_lock_yaw": 0.05},
+        {"fire_lock_pitch": 0.04},
     ]
 
     # Camera selection: set DEFAULT_CAMERA above, or override with camera:=zed

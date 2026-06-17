@@ -207,6 +207,10 @@ def generate_launch_description():
 
     viewer_params = [
         {"micro_pitch_feedback_opposite_sign": True},
+        # Viewer-only: must match autoaim_params() above so the HUD lock line
+        # uses Sentry's actual fire gate. Does not affect commands sent to micro.
+        {"fire_lock_yaw": 0.5},
+        {"fire_lock_pitch": 0.5},
     ]
 
     camera = LaunchConfiguration("camera")
