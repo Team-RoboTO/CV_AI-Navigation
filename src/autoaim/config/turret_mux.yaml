@@ -1,0 +1,57 @@
+turret_yaw_mux:
+  ros__parameters:
+    # CV input. Your CV should publish absolute micro yaw on angular.z,
+    # pitch on angular.y, shoot on angular.x.
+    cv_cmd_topic: /cmd_vel_AI
+    cv_detection_topic: /cv/detection
+
+    # From serial_bridge.cpp.
+    micro_status_topic: /micro_status
+    micro_yaw_index: 0
+    micro_pitch_index: 1
+
+    # From navigation container. Requires /tf and /tf_static visible in CV container.
+    idle_target_topic: /turret/idle_target
+    map_frame: map
+    base_frame: base_link
+
+    # Output consumed by serial_bridge.cpp.
+    turret_cmd_topic: /turret/cmd
+
+    cv_timeout: 0.25
+    publish_rate: 50.0
+    tf_timeout: 0.05
+
+    # Tune these if sign/zero does not match the micro convention.
+    yaw_sign: 1.0
+    yaw_zero_offset: 0.0
+
+    # NAV/idle yaw slew-rate limit. 0.7 rad/s ~= 40 deg/s.
+    idle_yaw_rate_limit: 0.7
+
+    # hold_last_micro keeps pitch where the micro reports it after CV loss.
+    # static uses idle_pitch_static.
+    idle_pitch_mode: hold_last_micro
+    idle_pitch_static: 0.0
+
+    # Optional fallback if navigation does not publish /turret/idle_target.
+    use_default_idle_target: false
+    default_idle_target_x: 6.0
+    default_idle_target_y: 4.0
+
+micro_communications_node:
+  ros__parameters:
+    serial_port: /dev/ttyACM0
+    serial_baudrate: 500000
+    serial_parity: even
+    serial_tx_hz: 100.0
+    use_framed_protocol: false
+    serial_reconnect_interval: 2.0
+    serial_rx_timeout: 3.0
+    turret_timeout: 0.3
+    nav_cmd_timeout: 0.3
+    zero_nav_on_timeout: true
+    turret_cmd_topic: /turret/cmd
+    nav_cmd_topic: /cmd_vel_NAV
+    low_latency: false
+    thread_priority: 0

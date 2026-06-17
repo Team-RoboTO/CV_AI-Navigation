@@ -18,13 +18,17 @@ find_package(geometry_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(angles REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(Eigen3 REQUIRED)
-
-# Generate messages
 find_package(rosidl_default_generators REQUIRED)
+
+########################
+## Generate messages  ##
+########################
+
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/GimbalCmd.msg"
   "msg/ArmorKeypoint.msg"
@@ -74,16 +78,25 @@ rclcpp_components_register_node(${PROJECT_NAME}_component
   EXECUTABLE ${PROJECT_NAME}_node
 )
 
-# C++ serial bridge. The Python serial_bridge.py is still installed below as a
-# fallback transport with the same topics, parameters, and raw packet layout.
+# Serial bridge: /turret/cmd + /cmd_vel_NAV -> micro serial.
 add_executable(serial_bridge src/serial_bridge.cpp)
 ament_target_dependencies(serial_bridge
   rclcpp
   geometry_msgs
   std_msgs
 )
-install(TARGETS serial_bridge
-  DESTINATION lib/${PROJECT_NAME}
+
+# Turret yaw mux:
+# /cmd_vel_AI + /detector/armors + /turret/idle_target + TF -> /turret/cmd.
+add_executable(turret_yaw_mux src/turret_yaw_mux.cpp)
+ament_target_dependencies(turret_yaw_mux
+  rclcpp
+  geometry_msgs
+  std_msgs
+  vision_msgs
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
 )
 
 #############
@@ -96,24 +109,27 @@ install(TARGETS ${PROJECT_NAME}_component
   RUNTIME DESTINATION bin
 )
 
+install(TARGETS
+  serial_bridge
+  turret_yaw_mux
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 install(DIRECTORY include/
   DESTINATION include
+)
+
+install(DIRECTORY config/
+  DESTINATION share/${PROJECT_NAME}/config
 )
 
 install(DIRECTORY launch/
   DESTINATION share/${PROJECT_NAME}/launch
 )
 
-# Sensor configs (zed.yaml / realsense.yaml) consumed by the launch files.
-install(DIRECTORY config/
-  DESTINATION share/${PROJECT_NAME}/config
-)
-
 # NOTE: the TensorRT engine is intentionally NOT installed with the package.
-# It lives outside the workspace (default:
-# /workspaces/isaac_ros-dev/AI-models/yolov26_keypoints.engine) so colcon does
-# not copy a large binary on every build. Point to it with the engine_path
-# launch arg or the AUTOAIM_ENGINE_PATH env var.
+# It lives outside the workspace. Point to it with the engine_path launch arg
+# or the AUTOAIM_ENGINE_PATH env var.
 
 install(PROGRAMS
   viewer_node.py

@@ -1,44 +1,73 @@
 // =============================================================================
-// serial_bridge.cpp — C++ port of serial_bridge.py (drop-in replacement)
+// serial_bridge.cpp
 //
-// WHY C++: the Python bridge sits inside the tightest part of the latency
-// budget (±17 ms total at 150 RPM). CPython GC pauses and scheduler jitter on
-// a loaded Jetson add 1–10 ms of unpredictable delay exactly where it hurts.
-// This port keeps the protocol and behavior byte-identical and adds two
-// OPT-IN extras (low_latency ioctl, SCHED_FIFO priority), both off by default.
+// Serial bridge for RoboTO CV + Navigation architecture.
 //
-// PROTOCOL (unchanged — no firmware modification needed):
-//   TX (Jetson -> Micro): 7 x float32 LE = 28 bytes
-//     [0] timestamp since node start [s]
-//     [1] yaw   absolute target [rad]
-//     [2] pitch absolute target [rad]
-//     [3] shoot flag (watchdog-forced to 0 if /cmd_vel_AI stale > cmd_timeout)
-//     [4] nav_x   [5] nav_y   [6] nav_angle
-//   RX (Micro -> Jetson): 10 x float32 LE = 40 bytes
-//     [0] yaw, [1] pitch, [2] vx, [3] vy, [4..9] other status
+// This node lives in the CV container. It is the only node that talks to the
+// microcontroller over serial.
 //
-//   Framed mode (use_framed_protocol: true, requires updated firmware):
-//     TX: 0xA5 0x5A | 28B payload | CRC8(payload)   = 31 bytes
-//     RX: 0x5A 0xA5 | 40B payload | CRC8(payload)   = 43 bytes
-//     CRC8 poly 0x07 init 0x00 (same as CHANGES.md snippet).
+// TX (Jetson -> Micro): 7 x float32 LE = 28 bytes
+//   [0] timestamp since node start [s]
+//   [1] turret yaw   absolute target in micro frame [rad]
+//   [2] turret pitch absolute target [rad]
+//   [3] shoot flag
+//   [4] nav_x
+//   [5] nav_y
+//   [6] legacy slot, kept for firmware compatibility, always 0.0
 //
-// /micro_status layout (unchanged): RX[0..9] + TX echo [yaw, pitch, shoot,
-//   nav_x, nav_y, nav_angle] = 16 floats.
+// RX (Micro -> Jetson): 10 x float32 LE = 40 bytes
+//   [0] yaw
+//   [1] pitch
+//   [2] vx
+//   [3] vy
+//   [4] color: 0 RED, 1 BLUE
+//   [5] game_progress: 1 preparation, 2 init 15s, 3 countdown 5s,
+//       4 in match, 5 match ended/settling
+//   [6] HP
+//   [7] resupply status
+//   [8] center status: 0 free, 1 ours, 2 enemy
+//   [9] reserved
 //
-// Node name, topic names and ALL parameter names match serial_bridge.py, so
-// the launch files only need executable="serial_bridge".
+// /micro_status layout:
+//   RX[0..9] + TX echo [turret_yaw, turret_pitch, shoot, nav_x, nav_y, nav_angle]
+//   = 16 floats.
+//
+// LAB OVERRIDE:
+//   If lab_override_micro_status=true, this node overwrites only the published
+//   /micro_status fields [4], [5], [6], [7], [8] before publishing them to ROS.
+//   It does NOT change the serial data sent to the microcontroller.
+//   This lets you start/stop the match and change HP/center/team from terminal.
+//
+// Runtime pipeline switches:
+//   enable_nav_pipeline:     false -> nav_x/nav_y forced to 0
+//   enable_turret_pipeline:  false -> shoot forced to 0, yaw/pitch held or zeroed
+//
+// Subscribes:
+//   /turret/cmd   geometry_msgs/Twist
+//     angular.z = turret yaw absolute in micro frame [rad]
+//     angular.y = turret pitch [rad]
+//     angular.x = shoot flag
+//
+//   /cmd_vel_NAV  geometry_msgs/Twist
+//     linear.x = nav_x
+//     linear.y = nav_y
+//
+// Publishes:
+//   /micro_status std_msgs/Float32MultiArray
 // =============================================================================
 
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
-#include <linux/serial.h>  // ASYNC_LOW_LATENCY (opt-in)
+#include <linux/serial.h>
 #include <pthread.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -51,13 +80,13 @@
 namespace
 {
 constexpr size_t TX_NUM_VALUES = 7;
-constexpr size_t TX_PACKET_SIZE = TX_NUM_VALUES * 4;   // 28
+constexpr size_t TX_PACKET_SIZE = TX_NUM_VALUES * 4;
 constexpr size_t RX_NUM_VALUES = 10;
-constexpr size_t RX_PACKET_SIZE = RX_NUM_VALUES * 4;   // 40
+constexpr size_t RX_PACKET_SIZE = RX_NUM_VALUES * 4;
 
 constexpr uint8_t TX_FRAME_HEADER[2] = {0xA5, 0x5A};
 constexpr uint8_t RX_FRAME_HEADER[2] = {0x5A, 0xA5};
-constexpr size_t RX_FRAME_SIZE = 2 + RX_PACKET_SIZE + 1;  // 43
+constexpr size_t RX_FRAME_SIZE = 2 + RX_PACKET_SIZE + 1;
 constexpr size_t RX_BUFFER_CAP = RX_FRAME_SIZE * 64;
 
 uint8_t crc8(const uint8_t * data, size_t len)
@@ -72,11 +101,6 @@ uint8_t crc8(const uint8_t * data, size_t len)
   }
   return crc;
 }
-
-// Same pipeline switches as the Python file. Kept as compile-time constants to
-// match current behavior exactly; flip NAV_PIPELINE when navigation goes live.
-constexpr bool AI_PIPELINE = true;
-constexpr bool NAV_PIPELINE = false;
 
 speed_t baud_to_speed(int baud)
 {
@@ -104,7 +128,6 @@ public:
   : Node("micro_communications_node"),
     t_start_(std::chrono::steady_clock::now())
   {
-    // ── Parameters (names identical to serial_bridge.py) ──
     port_ = declare_parameter<std::string>("serial_port", "/dev/ttyACM0");
     baudrate_ = static_cast<int>(declare_parameter<int>("serial_baudrate", 500000));
     reconnect_interval_ = declare_parameter<double>("serial_reconnect_interval", 2.0);
@@ -113,48 +136,67 @@ public:
     use_framed_ = declare_parameter<bool>("use_framed_protocol", false);
     const double tx_hz = declare_parameter<double>("serial_tx_hz", 100.0);
 
-    // New (C++ only). Defaults preserve the Python behavior:
-    //   serial_parity: pyserial was opened with PARITY_EVEN — kept as default.
-    //     Set to "none" from the launch file if the micro uses 8N1.
-    //   low_latency: sets ASYNC_LOW_LATENCY on the tty (mainly helps FTDI-style
-    //     adapters; harmless no-op on USB CDC-ACM). Off by default.
-    //   thread_priority: >0 requests SCHED_FIFO at that priority for the spin
-    //     thread. Needs rtprio rlimit or CAP_SYS_NICE; logs a warning if denied.
     parity_ = declare_parameter<std::string>("serial_parity", "even");
     low_latency_ = declare_parameter<bool>("low_latency", false);
     thread_priority_ = static_cast<int>(declare_parameter<int>("thread_priority", 0));
 
+    turret_cmd_topic_ = declare_parameter<std::string>("turret_cmd_topic", "/turret/cmd");
+    nav_cmd_topic_ = declare_parameter<std::string>("nav_cmd_topic", "/cmd_vel_NAV");
+    micro_status_topic_ = declare_parameter<std::string>("micro_status_topic", "/micro_status");
+
+    declare_parameter<bool>("enable_nav_pipeline", true);
+    declare_parameter<bool>("enable_turret_pipeline", true);
+    declare_parameter<bool>("hold_last_turret_when_disabled", true);
+
+    // LAB OVERRIDE PARAMETERS
+    // These affect only the ROS topic /micro_status, not the serial TX packet.
+    declare_parameter<bool>("lab_override_micro_status", false);
+    declare_parameter<double>("lab_override_team", 0.0);           // 0 red, 1 blue
+    declare_parameter<double>("lab_override_game_progress", 1.0);  // 1 wait, 4 in match, 5 ended
+    declare_parameter<double>("lab_override_health", 100.0);
+    declare_parameter<double>("lab_override_resupply_status", 0.0);
+    declare_parameter<double>("lab_override_center_status", 0.0);  // 0 free, 1 ours, 2 enemy
+
     rx_buf_.reserve(RX_BUFFER_CAP);
 
-    sub_ai_ = create_subscription<geometry_msgs::msg::Twist>(
-      "cmd_vel_AI", rclcpp::SystemDefaultsQoS(),
+    sub_turret_ = create_subscription<geometry_msgs::msg::Twist>(
+      turret_cmd_topic_, rclcpp::SystemDefaultsQoS(),
       [this](geometry_msgs::msg::Twist::ConstSharedPtr msg) {
-        if (!AI_PIPELINE) {return;}
         std::lock_guard<std::mutex> lk(mtx_);
-        ai_shoot_ = msg->angular.x;   // shoot flag
-        ai_pitch_ = msg->angular.y;   // absolute pitch target [rad]
-        ai_yaw_ = msg->angular.z;     // absolute yaw target [rad]
-        last_ai_time_ = mono_now();
+        turret_shoot_ = msg->angular.x;
+        turret_pitch_ = msg->angular.y;
+        turret_yaw_ = msg->angular.z;
+        last_turret_time_ = mono_now();
+        have_turret_cmd_ = true;
       });
 
     sub_nav_ = create_subscription<geometry_msgs::msg::Twist>(
-      "cmd_vel_NAV", rclcpp::SystemDefaultsQoS(),
+      nav_cmd_topic_, rclcpp::SystemDefaultsQoS(),
       [this](geometry_msgs::msg::Twist::ConstSharedPtr msg) {
-        if (!NAV_PIPELINE) {return;}
         std::lock_guard<std::mutex> lk(mtx_);
         nav_x_ = msg->linear.x;
         nav_y_ = msg->linear.y;
-        nav_angle_ = msg->angular.z;
+        nav_angle_ = 0.0;
+        last_nav_time_ = mono_now();
+        have_nav_cmd_ = true;
       });
 
-    pub_status_ = create_publisher<std_msgs::msg::Float32MultiArray>("/micro_status", 10);
+    pub_status_ = create_publisher<std_msgs::msg::Float32MultiArray>(micro_status_topic_, 10);
 
     last_rx_time_ = mono_now();
+    last_turret_time_ = mono_now();
+    last_nav_time_ = mono_now();
+
     openSerial();
 
     timer_ = create_wall_timer(
       std::chrono::duration<double>(1.0 / std::max(tx_hz, 1.0)),
       std::bind(&SerialBridgeNode::serialTick, this));
+
+    RCLCPP_INFO(
+      get_logger(),
+      "serial_bridge started: turret_cmd=%s nav_cmd=%s micro_status=%s",
+      turret_cmd_topic_.c_str(), nav_cmd_topic_.c_str(), micro_status_topic_.c_str());
   }
 
   ~SerialBridgeNode() override
@@ -165,17 +207,18 @@ public:
     }
   }
 
-  // Called from main() after construction, before spin.
   void applyThreadPriority()
   {
     if (thread_priority_ <= 0) {return;}
+
     sched_param sp{};
     sp.sched_priority = thread_priority_;
+
     if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
       RCLCPP_WARN(
         get_logger(),
-        "Could not set SCHED_FIFO priority %d (need rtprio rlimit or CAP_SYS_NICE) "
-        "— continuing with default scheduling.", thread_priority_);
+        "Could not set SCHED_FIFO priority %d. Need rtprio rlimit or CAP_SYS_NICE.",
+        thread_priority_);
     } else {
       RCLCPP_INFO(get_logger(), "Serial bridge running at SCHED_FIFO priority %d.",
         thread_priority_);
@@ -189,7 +232,33 @@ private:
       std::chrono::steady_clock::now().time_since_epoch()).count();
   }
 
-  // ── Serial open / reconnect ─────────────────────────────────────────────
+  bool getBoolParam(const std::string & name, bool fallback)
+  {
+    rclcpp::Parameter p;
+    if (get_parameter(name, p) && p.get_type() == rclcpp::ParameterType::PARAMETER_BOOL) {
+      return p.as_bool();
+    }
+    return fallback;
+  }
+
+  double getNumericParam(const std::string & name, double fallback)
+  {
+    rclcpp::Parameter p;
+    if (!get_parameter(name, p)) {
+      return fallback;
+    }
+
+    if (p.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE) {
+      return p.as_double();
+    }
+
+    if (p.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER) {
+      return static_cast<double>(p.as_int());
+    }
+
+    return fallback;
+  }
+
   bool openSerial()
   {
     if (fd_ >= 0) {
@@ -203,9 +272,6 @@ private:
       return false;
     }
 
-    // Blocking open, but VMIN=0/VTIME=0 below makes read() non-blocking.
-    // write() can only block if the kernel tx buffer fills, which at
-    // 100 Hz * 31 B = 3.1 kB/s on a 500 kbaud link cannot happen.
     int fd = ::open(port_.c_str(), O_RDWR | O_NOCTTY);
     if (fd < 0) {
       RCLCPP_WARN(get_logger(),
@@ -222,16 +288,14 @@ private:
       return false;
     }
 
-    cfmakeraw(&tio);                       // raw 8-bit clean channel
+    cfmakeraw(&tio);
     cfsetispeed(&tio, speed);
     cfsetospeed(&tio, speed);
-    tio.c_cflag |= (CLOCAL | CREAD);
-    tio.c_cflag &= ~CSTOPB;                // 1 stop bit
-    tio.c_cflag &= ~CRTSCTS;               // no HW flow control
 
-    // Parity — pyserial used PARITY_EVEN; pyserial does not enable input
-    // parity *checking* by default, so we generate parity on TX and ignore
-    // parity errors on RX (IGNPAR) for identical behavior.
+    tio.c_cflag |= (CLOCAL | CREAD);
+    tio.c_cflag &= ~CSTOPB;
+    tio.c_cflag &= ~CRTSCTS;
+
     if (parity_ == "even") {
       tio.c_cflag |= PARENB;
       tio.c_cflag &= ~PARODD;
@@ -243,7 +307,7 @@ private:
       tio.c_cflag &= ~PARENB;
     }
 
-    tio.c_cc[VMIN] = 0;                    // non-blocking read
+    tio.c_cc[VMIN] = 0;
     tio.c_cc[VTIME] = 0;
 
     if (tcsetattr(fd, TCSANOW, &tio) != 0) {
@@ -258,18 +322,21 @@ private:
       if (ioctl(fd, TIOCGSERIAL, &ss) == 0) {
         ss.flags |= ASYNC_LOW_LATENCY;
         if (ioctl(fd, TIOCSSERIAL, &ss) != 0) {
-          RCLCPP_WARN(get_logger(), "ASYNC_LOW_LATENCY not supported on %s (ok on CDC-ACM).",
+          RCLCPP_WARN(
+            get_logger(),
+            "ASYNC_LOW_LATENCY not supported on %s. This is normal on many CDC-ACM devices.",
             port_.c_str());
         }
       }
     }
 
-    tcflush(fd, TCIOFLUSH);                // flush stale data from a previous session
+    tcflush(fd, TCIOFLUSH);
 
     fd_ = fd;
     last_rx_time_ = mono_now();
     consecutive_errors_ = 0;
     rx_buf_.clear();
+
     RCLCPP_INFO(get_logger(), "Serial port %s opened successfully at %d baud.",
       port_.c_str(), baudrate_);
     return true;
@@ -285,7 +352,6 @@ private:
     consecutive_errors_ = 0;
   }
 
-  // ── Timer: TX + RX drain ────────────────────────────────────────────────
   void serialTick()
   {
     const double now = mono_now();
@@ -305,26 +371,56 @@ private:
       return;
     }
 
-    // --- Build TX packet ---
+    const bool enable_nav = getBoolParam("enable_nav_pipeline", true);
+    const bool enable_turret = getBoolParam("enable_turret_pipeline", true);
+    const bool hold_last_turret = getBoolParam("hold_last_turret_when_disabled", true);
+
     float tx[TX_NUM_VALUES];
     {
       std::lock_guard<std::mutex> lk(mtx_);
-      const bool ai_stale = (now - last_ai_time_) > cmd_timeout_;
-      // SAFETY: force shoot=0 when /cmd_vel_AI is stale. Yaw/pitch are still
-      // re-sent (gimbal holds position) but firing stops.
+
+      const bool turret_stale = (now - last_turret_time_) > cmd_timeout_;
+
       tx[0] = static_cast<float>(
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start_).count());
-      tx[1] = static_cast<float>(ai_yaw_);
-      tx[2] = static_cast<float>(ai_pitch_);
-      tx[3] = static_cast<float>(ai_stale ? 0.0 : ai_shoot_);
-      tx[4] = static_cast<float>(nav_x_);
-      tx[5] = static_cast<float>(nav_y_);
-      tx[6] = static_cast<float>(nav_angle_);
+
+      if (enable_turret) {
+        tx[1] = static_cast<float>(turret_yaw_);
+        tx[2] = static_cast<float>(turret_pitch_);
+        tx[3] = static_cast<float>(turret_stale ? 0.0 : turret_shoot_);
+      } else {
+        if (hold_last_turret) {
+          tx[1] = static_cast<float>(turret_yaw_);
+          tx[2] = static_cast<float>(turret_pitch_);
+        } else {
+          tx[1] = 0.0f;
+          tx[2] = 0.0f;
+        }
+        tx[3] = 0.0f;
+      }
+
+      if (enable_nav) {
+        tx[4] = static_cast<float>(nav_x_);
+        tx[5] = static_cast<float>(nav_y_);
+      } else {
+        tx[4] = 0.0f;
+        tx[5] = 0.0f;
+      }
+
+      tx[6] = 0.0f;
+
+      tx_echo_turret_yaw_ = tx[1];
+      tx_echo_turret_pitch_ = tx[2];
+      tx_echo_turret_shoot_ = tx[3];
+      tx_echo_nav_x_ = tx[4];
+      tx_echo_nav_y_ = tx[5];
+      tx_echo_nav_angle_ = tx[6];
     }
 
     uint8_t frame[2 + TX_PACKET_SIZE + 1];
-    const uint8_t * out_ptr;
-    size_t out_len;
+    const uint8_t * out_ptr = nullptr;
+    size_t out_len = 0;
+
     if (use_framed_) {
       frame[0] = TX_FRAME_HEADER[0];
       frame[1] = TX_FRAME_HEADER[1];
@@ -349,9 +445,9 @@ private:
       }
       return;
     }
+
     consecutive_errors_ = 0;
 
-    // --- Drain RX ---
     const bool rx_ok = use_framed_ ? drainRxFramed() : drainRxLegacy();
     if (!rx_ok) {
       consecutive_errors_++;
@@ -365,17 +461,43 @@ private:
     }
   }
 
-  // ── RX parsing ──────────────────────────────────────────────────────────
   static bool sanityOk(const float * v, size_t n)
   {
-    // Reject obviously corrupted packets (misalignment, reflash garbage).
-    // !(|v| < 1e6) also rejects NaN and inf.
     for (size_t i = 0; i < n; i++) {
       if (!(std::fabs(v[i]) < 1e6f)) {return false;}
     }
-    // Gimbal pitch is mechanically limited; outside ±2 rad is garbage.
+
+    // Pitch feedback should normally be in a small radian range.
     if (std::fabs(v[1]) > 2.0f) {return false;}
+
     return true;
+  }
+
+  void applyLabOverride(std_msgs::msg::Float32MultiArray & msg)
+  {
+    if (!getBoolParam("lab_override_micro_status", false)) {
+      return;
+    }
+
+    if (msg.data.size() > 4) {
+      msg.data[4] = static_cast<float>(getNumericParam("lab_override_team", 0.0));
+    }
+
+    if (msg.data.size() > 5) {
+      msg.data[5] = static_cast<float>(getNumericParam("lab_override_game_progress", 1.0));
+    }
+
+    if (msg.data.size() > 6) {
+      msg.data[6] = static_cast<float>(getNumericParam("lab_override_health", 100.0));
+    }
+
+    if (msg.data.size() > 7) {
+      msg.data[7] = static_cast<float>(getNumericParam("lab_override_resupply_status", 0.0));
+    }
+
+    if (msg.data.size() > 8) {
+      msg.data[8] = static_cast<float>(getNumericParam("lab_override_center_status", 0.0));
+    }
   }
 
   void publishStatus(const float * rx)
@@ -383,15 +505,19 @@ private:
     std_msgs::msg::Float32MultiArray msg;
     msg.data.reserve(RX_NUM_VALUES + 6);
     msg.data.assign(rx, rx + RX_NUM_VALUES);
+
+    applyLabOverride(msg);
+
     {
       std::lock_guard<std::mutex> lk(mtx_);
-      msg.data.push_back(static_cast<float>(ai_yaw_));
-      msg.data.push_back(static_cast<float>(ai_pitch_));
-      msg.data.push_back(static_cast<float>(ai_shoot_));
-      msg.data.push_back(static_cast<float>(nav_x_));
-      msg.data.push_back(static_cast<float>(nav_y_));
-      msg.data.push_back(static_cast<float>(nav_angle_));
+      msg.data.push_back(static_cast<float>(tx_echo_turret_yaw_));
+      msg.data.push_back(static_cast<float>(tx_echo_turret_pitch_));
+      msg.data.push_back(static_cast<float>(tx_echo_turret_shoot_));
+      msg.data.push_back(static_cast<float>(tx_echo_nav_x_));
+      msg.data.push_back(static_cast<float>(tx_echo_nav_y_));
+      msg.data.push_back(static_cast<float>(tx_echo_nav_angle_));
     }
+
     pub_status_->publish(msg);
     last_rx_time_ = mono_now();
     consecutive_errors_ = 0;
@@ -406,15 +532,13 @@ private:
 
   bool drainRxLegacy()
   {
-    // Original raw 40-byte packets, no header/CRC (current firmware).
     const int avail = bytesAvailable();
     if (avail < 0) {return false;}
     if (static_cast<size_t>(avail) < RX_PACKET_SIZE) {return true;}
 
-    // Drain to the most recent complete packet so the autoaim node always
-    // gets fresh gimbal angles.
     uint8_t scratch[256];
     size_t stale = (static_cast<size_t>(avail) / RX_PACKET_SIZE - 1) * RX_PACKET_SIZE;
+
     while (stale > 0) {
       const ssize_t r = ::read(fd_, scratch, std::min(stale, sizeof(scratch)));
       if (r <= 0) {return false;}
@@ -423,41 +547,45 @@ private:
 
     uint8_t pkt[RX_PACKET_SIZE];
     size_t got = 0;
+
     while (got < RX_PACKET_SIZE) {
       const ssize_t r = ::read(fd_, pkt + got, RX_PACKET_SIZE - got);
       if (r < 0) {return false;}
-      if (r == 0) {return true;}  // partial packet — leave for next tick
+      if (r == 0) {return true;}
       got += static_cast<size_t>(r);
     }
 
     float vals[RX_NUM_VALUES];
     std::memcpy(vals, pkt, RX_PACKET_SIZE);
+
     if (sanityOk(vals, RX_NUM_VALUES)) {
       publishStatus(vals);
     } else {
-      RCLCPP_WARN(get_logger(), "RX sanity check failed (garbage values) — flushing buffer");
+      RCLCPP_WARN(get_logger(), "RX sanity check failed — flushing input buffer.");
       tcflush(fd_, TCIFLUSH);
     }
+
     return true;
   }
 
   bool drainRxFramed()
   {
-    // Framed packets: header + payload + CRC8. Self-resyncing.
     const int avail = bytesAvailable();
     if (avail < 0) {return false;}
+
     if (avail > 0) {
       const size_t old = rx_buf_.size();
       rx_buf_.resize(old + static_cast<size_t>(avail));
+
       ssize_t r = ::read(fd_, rx_buf_.data() + old, static_cast<size_t>(avail));
       if (r < 0) {
         rx_buf_.resize(old);
         return false;
       }
+
       rx_buf_.resize(old + static_cast<size_t>(r));
     }
 
-    // Cap buffer growth (link flooding / persistent desync).
     if (rx_buf_.size() > RX_BUFFER_CAP) {
       rx_buf_.erase(rx_buf_.begin(), rx_buf_.end() - RX_FRAME_SIZE);
     }
@@ -468,56 +596,92 @@ private:
     while (true) {
       auto it = std::search(
         rx_buf_.begin(), rx_buf_.end(), RX_FRAME_HEADER, RX_FRAME_HEADER + 2);
+
       if (it == rx_buf_.end()) {
-        // No header: keep only the last byte (could be a split header).
         if (rx_buf_.size() > 1) {
           rx_buf_.erase(rx_buf_.begin(), rx_buf_.end() - 1);
         }
         break;
       }
+
       if (it != rx_buf_.begin()) {
         rx_buf_.erase(rx_buf_.begin(), it);
       }
-      if (rx_buf_.size() < RX_FRAME_SIZE) {break;}  // incomplete — wait
+
+      if (rx_buf_.size() < RX_FRAME_SIZE) {
+        break;
+      }
 
       const uint8_t * payload = rx_buf_.data() + 2;
       const uint8_t rx_crc = rx_buf_[2 + RX_PACKET_SIZE];
+
       if (crc8(payload, RX_PACKET_SIZE) == rx_crc) {
         float vals[RX_NUM_VALUES];
         std::memcpy(vals, payload, RX_PACKET_SIZE);
+
         if (sanityOk(vals, RX_NUM_VALUES)) {
-          std::memcpy(latest, vals, sizeof(vals));  // keep only the newest
+          std::memcpy(latest, vals, sizeof(vals));
           have_latest = true;
         }
+
         rx_buf_.erase(rx_buf_.begin(), rx_buf_.begin() + RX_FRAME_SIZE);
       } else {
-        rx_buf_.erase(rx_buf_.begin());  // bad CRC: drop one byte, rescan
+        rx_buf_.erase(rx_buf_.begin());
       }
     }
 
-    if (have_latest) {publishStatus(latest);}
+    if (have_latest) {
+      publishStatus(latest);
+    }
+
     return true;
   }
 
-  // ── Members ─────────────────────────────────────────────────────────────
   std::mutex mtx_;
-  double ai_yaw_ = 0.0, ai_pitch_ = 0.0, ai_shoot_ = 0.0;
-  double nav_x_ = 0.0, nav_y_ = 0.0, nav_angle_ = 0.0;
-  double last_ai_time_ = 0.0;
 
-  std::string port_, parity_;
+  double turret_yaw_ = 0.0;
+  double turret_pitch_ = 0.0;
+  double turret_shoot_ = 0.0;
+  double nav_x_ = 0.0;
+  double nav_y_ = 0.0;
+  double nav_angle_ = 0.0;
+
+  double tx_echo_turret_yaw_ = 0.0;
+  double tx_echo_turret_pitch_ = 0.0;
+  double tx_echo_turret_shoot_ = 0.0;
+  double tx_echo_nav_x_ = 0.0;
+  double tx_echo_nav_y_ = 0.0;
+  double tx_echo_nav_angle_ = 0.0;
+
+  double last_turret_time_ = 0.0;
+  double last_nav_time_ = 0.0;
+  bool have_turret_cmd_ = false;
+  bool have_nav_cmd_ = false;
+
+  std::string port_;
+  std::string parity_;
+  std::string turret_cmd_topic_;
+  std::string nav_cmd_topic_;
+  std::string micro_status_topic_;
+
   int baudrate_ = 500000;
-  double reconnect_interval_ = 2.0, rx_timeout_ = 3.0, cmd_timeout_ = 0.3;
-  bool use_framed_ = false, low_latency_ = false;
+  double reconnect_interval_ = 2.0;
+  double rx_timeout_ = 3.0;
+  double cmd_timeout_ = 0.3;
+  bool use_framed_ = false;
+  bool low_latency_ = false;
   int thread_priority_ = 0;
 
   int fd_ = -1;
-  double last_rx_time_ = 0.0, last_reconnect_attempt_ = 0.0;
+  double last_rx_time_ = 0.0;
+  double last_reconnect_attempt_ = 0.0;
   int consecutive_errors_ = 0;
+
   std::vector<uint8_t> rx_buf_;
   std::chrono::steady_clock::time_point t_start_;
 
-  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr sub_ai_, sub_nav_;
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr sub_turret_;
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr sub_nav_;
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr pub_status_;
   rclcpp::TimerBase::SharedPtr timer_;
 };

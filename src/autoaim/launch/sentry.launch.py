@@ -1,8 +1,6 @@
-#sudo systemctl stop autoaim.service
-
+# sudo systemctl stop autoaim.service
 
 import os
-from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -20,31 +18,28 @@ DEFAULT_ENGINE = "/workspaces/isaac_ros-dev/AI-models/yolov26_keypoints.engine"
 # Change this to "zed" or "realsense" when this robot's default camera changes.
 DEFAULT_CAMERA = "zed"
 
+
 def autoaim_params():
     return [
         # YOLO26 labels: 0=blue armor, 1=grey armor (ignored), 2=red armor.
         # True: read our team color from /micro_status[target_color_status_index]
         #       and pick the enemy class automatically via micro_color_target_classes.
         # False: always shoot the fixed class list in target_classes below.
-        {"target_classes_from_micro_status": False},  # ON/OFF auto color from micro
+        {"target_classes_from_micro_status": True},
 
         # micro_color_target_classes[i] = YOLO class to shoot when micro sends i.
         #   i=0 (we are red)  -> shoot blue -> "0"
         #   i=1 (we are blue) -> shoot red  -> "2"
-        {"target_classes": ["0"]},  # used only if target_classes_from_micro_status=False
+        {"target_classes": ["0"]},
         {"target_color_status_index": 4},
         {"micro_color_target_classes": ["0", "2"]},
+
         {"use_keypoints": True},
         {"keypoint_topic": "/detector/armors_keypoints"},
 
-        # 0.0 accepted garbage keypoints -> PnP jitter -> fire-lock dropouts.
         {"min_keypoint_score": 0.15},
         {"max_reproj_error": 25.0},
 
-        # Use the gimbal angles AT THE IMAGE TIMESTAMP for the camera->odom
-        # projection (ring buffer + interpolation) instead of the latest angles.
-        # Fixes the "tracker is slow / lags behind" feel whenever the head moves.
-        # zed_detector.py now stamps with sl.TIME_REFERENCE.IMAGE (capture time).
         {"angle_sync_enable": True},
         {"light_ratio": 0.85},
         {"max_armor_distance": 6.0},
@@ -52,10 +47,6 @@ def autoaim_params():
         {"confirm_frames": 2},
         {"lost_timeout": 0.50},
 
-        # 30/40 were very high — probably raised to fight the lag caused by the
-        # missing image<->angle sync (now fixed). High q makes the state track
-        # measurement noise -> jittery commands -> fire-lock dropouts.
-        # Start lower; raise again only if tracking feels sluggish AFTER the fix.
         {"q_pos": 100.0},
         {"q_yaw": 20.0},
         {"q_r": 1e-6},
@@ -65,8 +56,6 @@ def autoaim_params():
         {"r_yaw_slope": 0.005},
         {"max_oblique_deg": 65.0},
 
-        # 0.98 at ~100 Hz decays the velocity estimate to ~13%/s — a constant
-        # drag that under-leads translating targets. Let q_pos handle the noise.
         {"alpha_pos": 0.995},
         {"alpha_yaw": 1.00},
         {"alpha_coast": 0.98},
@@ -79,45 +68,19 @@ def autoaim_params():
         {"gravity": 9.8},
         {"gimbal_height": 0.420},
 
-        # MEASURE FROM THE ACTIVE LENS, NOT THE HOUSING CENTER — and note this
-        # is a ZED X MINI: stereo baseline 50 mm, so the lens is only ~2.5 cm
-        # from the housing center (NOT ~6 cm — that figure is for ZED 2/X).
-        # The camera is upside down with SDK FLIP_MODE.ON (see zed_detector.py),
-        # which also SWAPS which physical sensor produces the "left image".
-        # Find the active lens empirically: cover one lens with a finger -> the
-        # one that blacks out the detector feed is the active one. Then:
-        #   barrel_offset_y = (muzzle) - (active lens), along robot-LEFT [m]
-        #                     (positive = muzzle left of lens)
-        #   barrel_offset_z = (muzzle height) - (lens height) [m]
-        #                     camera 3 cm ABOVE barrel -> -0.03
         {"barrel_offset_x": 0.0},
-        {"barrel_offset_y": 0.08},     # <- MEASURE (lens-cover trick, see INSTRUCTIONS.md), !!! WAS 0.15 FOR STANDARD SENTRY
+        {"barrel_offset_y": 0.08},
         {"barrel_offset_z": -0.15},
 
-        # 1.0 rad @ ref 1 m -> ~0.33 rad window at 3 m: OK for tuning, loose for
-        # a match. Against a fast spinner, timed shots need ~0.10-0.18 rad with
-        # window_ref_dist ~3.0. Tighten once the static calibration is done.
         {"angular_window": 1.0},
         {"window_ref_dist": 3.0},
         {"min_fire_dist": 0.2},
         {"max_fire_dist": 6.0},
 
-        # 0.005 is essentially ZERO latency compensation. It must cover the FULL
-        # capture->muzzle latency (capture+inference+transport+serial+gimbal),
-        # typically 40-80 ms for this pipeline. Now that the detector stamps with
-        # capture time you can MEASURE it: log (now - header.stamp) at command
-        # publish and add ~15 ms. Too small -> shots trail a mover; too large -> lead.
-        # Measured-latency horizon: the node measures (now − capture stamp)
-        # per frame and adds actuation_latency = serial TX + gimbal settle +
-        # muzzle exit (calibrate: shoot a mover, adjust in 5 ms steps; the node
-        # logs the measured pipeline part every 2 s).
         {"use_measured_latency": True},
         {"actuation_latency": 0.020},
-        # Fallback fixed bias, used ONLY if use_measured_latency is False.
         {"time_bias": 0.045},
 
-        # Must equal the REAL detection rate: ros2 topic hz /detector/armors_keypoints
-        # (the ZED grabs at 120 fps — if inference keeps up this should be ~120).
         {"ref_freq": 60.0},
         {"yaw_jump_thresh": 0.55},
         {"use_vyaw_from_timing": True},
@@ -139,18 +102,6 @@ def autoaim_params():
         {"fire_lock_yaw": 0.5},
         {"fire_lock_pitch": 0.5},
 
-        # ⚠ THESE TWO MUST BE EQUAL. Both describe the same physical fact —
-        # whether the micro's pitch FEEDBACK has the opposite sign of its pitch
-        # COMMAND. pitch_sign appears SQUARED in the loop, so it cannot absorb
-        # the difference (the old comment claiming independence was wrong).
-        # With True/False, exactly one of two failures is guaranteed:
-        #   - geometry pitch mirrored -> systematic vertical miss (shoots low/high), or
-        #   - pitch lock error = 2x command -> fire only when commanded pitch ~ 0
-        #     ("shoots only sometimes").
-        # Determine the truth empirically: echo /micro_status — field [1] is the
-        # pitch feedback, field [11] is the pitch command echo. With the gimbal
-        # settled on a target: feedback ≈ -command -> set BOTH True;
-        # feedback ≈ +command -> set BOTH False.
         {"micro_pitch_feedback_opposite_sign": True},
         {"micro_pitch_lock_opposite_sign": True},
 
@@ -172,10 +123,56 @@ def autoaim_params():
     ]
 
 
+def turret_mux_params():
+    return [
+        # CV final command, already produced by autoaim.
+        {"cv_cmd_topic": "/cmd_vel_AI"},
+
+        # Real detection gate. Do NOT use /cmd_vel_AI freshness because
+        # autoaim keeps publishing the last yaw/pitch after target loss.
+        {"detection_topic": "/detector/armors"},
+        {"detection_timeout": 0.30},
+        {"cv_cmd_timeout": 0.50},
+
+        {"micro_status_topic": "/micro_status"},
+        {"idle_target_topic": "/turret/idle_target"},
+        {"turret_cmd_topic": "/turret/cmd"},
+
+        # The CV container must see /tf and /tf_static from navigation.
+        # The mux uses TF map -> base_link to aim at the idle waypoint.
+        {"map_frame": "map"},
+        {"base_frame": "base_link"},
+
+        {"enable_cv_pipeline": True},
+        {"enable_idle_pipeline": True},
+
+        {"publish_rate": 50.0},
+
+        # If idle yaw goes in the wrong direction, set -1.0.
+        {"yaw_sign": 1.0},
+
+        # Offset between micro yaw zero and barrel/LiDAR forward direction.
+        {"yaw_zero_offset": 0.0},
+
+        # Smooth idle/nav yaw. 0.7 rad/s ≈ 40 deg/s.
+        {"idle_yaw_rate_limit": 0.7},
+
+        # When target is lost, hold the pitch reported by the micro.
+        {"idle_pitch_mode": "hold_last_micro"},
+        {"idle_pitch_static": 0.0},
+
+        # In /micro_status: RX[0] = yaw, RX[1] = pitch.
+        {"micro_yaw_index": 0},
+        {"micro_pitch_index": 1},
+
+        # Normally idle target comes from navigation.
+        {"use_default_idle_target": False},
+        {"default_idle_target_x": 0.0},
+        {"default_idle_target_y": 0.0},
+    ]
+
+
 def generate_launch_description():
-    # TensorRT engine lives OUTSIDE the package (not installed into the
-    # package share). Override order: --launch arg engine_path  >  env
-    # AUTOAIM_ENGINE_PATH  >  this default.
     default_engine = os.environ.get("AUTOAIM_ENGINE_PATH", DEFAULT_ENGINE)
 
     engine_path = LaunchConfiguration("engine_path")
@@ -187,25 +184,31 @@ def generate_launch_description():
         {"serial_tx_hz": 100.0},
         {"serial_reconnect_interval": 2.0},
         {"serial_rx_timeout": 3.0},
-        # SAFETY: if /cmd_vel_AI goes stale for longer than this (autoaim node
-        # crashed), the shoot flag sent to the micro is forced to 0. Without it
-        # the bridge re-sends the last shoot=1 at 100 Hz forever.
+
+        # If /turret/cmd becomes stale, shoot is forced to 0.
+        # Yaw/pitch are still resent to hold.
         {"cmd_timeout": 0.3},
-        # Header+CRC8 framing (self-resyncing, rejects corrupted packets).
-        # REQUIRES matching micro firmware. Leave False until then.
+
+        # Header+CRC8 framing. Requires matching micro firmware.
         {"use_framed_protocol": False},
+
+        # New architecture:
+        # turret_yaw_mux publishes /turret/cmd,
+        # navigation publishes /cmd_vel_NAV.
+        {"turret_cmd_topic": "/turret/cmd"},
+        {"nav_cmd_topic": "/cmd_vel_NAV"},
+        {"micro_status_topic": "/micro_status"},
+
+        # Runtime switches.
+        {"enable_nav_pipeline": True},
+        {"enable_turret_pipeline": True},
+        {"hold_last_turret_when_disabled": True},
     ]
 
     viewer_params = [
-        # Must match micro_pitch_lock_opposite_sign in the autoaim params above,
-        # otherwise the pitch-error numbers in the debug overlay are sign-flipped.
         {"micro_pitch_feedback_opposite_sign": True},
     ]
 
-    # Camera selection: set DEFAULT_CAMERA above, or override with camera:=zed
-    # / camera:=realsense at launch time. The detector is the ONLY
-    # camera-specific node — autoaim/tracker/serial/viewer are
-    # unchanged and never learn which camera is active (same topics either way).
     camera = LaunchConfiguration("camera")
     zed_condition = IfCondition(PythonExpression(["'", camera, "' == 'zed'"]))
     realsense_condition = IfCondition(PythonExpression(["'", camera, "' == 'realsense'"]))
@@ -214,21 +217,27 @@ def generate_launch_description():
     zed_config = os.path.join(pkg_share, "config", "zed.yaml")
     realsense_config = os.path.join(pkg_share, "config", "realsense.yaml")
 
-    # The engine_path launch arg/env overrides whatever the sensor YAML sets.
     engine_override = {"engine_path": engine_path}
 
     return LaunchDescription([
         DeclareLaunchArgument("engine_path", default_value=str(default_engine)),
         DeclareLaunchArgument("serial_port", default_value="/dev/ttyACM0"),
 
-        # Sentry defaults to DEFAULT_CAMERA above.
         DeclareLaunchArgument(
             "camera", default_value=DEFAULT_CAMERA,
             description='Active camera detector: "realsense" or "zed".'),
 
+        # Mux must start before serial_bridge.
         Node(
             package="autoaim",
-            # C++ serial bridge. Fallback: executable="serial_bridge.py".
+            executable="turret_yaw_mux",
+            name="turret_yaw_mux",
+            parameters=turret_mux_params(),
+            output="screen",
+        ),
+
+        Node(
+            package="autoaim",
             executable="serial_bridge",
             name="micro_communications_node",
             parameters=serial_params,
@@ -251,7 +260,6 @@ def generate_launch_description():
             output="screen",
         ),
 
-        # ZED detector (camera:=zed). Camera/runtime config in config/zed.yaml.
         Node(
             package="autoaim",
             executable="zed_detector.py",
@@ -261,8 +269,6 @@ def generate_launch_description():
             condition=zed_condition,
         ),
 
-        # RealSense detector (camera:=realsense). Config in config/realsense.yaml.
-        # Same topics/messages as the ZED path.
         Node(
             package="autoaim_realsense",
             executable="realsense_detector",
