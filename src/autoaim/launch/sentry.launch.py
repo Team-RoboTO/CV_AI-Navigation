@@ -125,50 +125,15 @@ def autoaim_params():
 
 def turret_mux_params():
     return [
-        # CV final command, already produced by autoaim.
         {"cv_cmd_topic": "/cmd_vel_AI"},
-
-        # Real detection gate. Do NOT use /cmd_vel_AI freshness because
-        # autoaim keeps publishing the last yaw/pitch after target loss.
         {"detection_topic": "/detector/armors"},
-        {"detection_timeout": 0.30},
-        {"cv_cmd_timeout": 0.50},
-
         {"micro_status_topic": "/micro_status"},
-        {"idle_target_topic": "/turret/idle_target"},
-        {"turret_cmd_topic": "/turret/cmd"},
-
-        # The CV container must see /tf and /tf_static from navigation.
-        # The mux uses TF map -> base_link to aim at the idle waypoint.
-        {"map_frame": "map"},
-        {"base_frame": "base_link"},
-
-        {"enable_cv_pipeline": True},
-        {"enable_idle_pipeline": True},
-
-        {"publish_rate": 50.0},
-
-        # If idle yaw goes in the wrong direction, set -1.0.
-        {"yaw_sign": 1.0},
-
-        # Offset between micro yaw zero and barrel/LiDAR forward direction.
-        {"yaw_zero_offset": 0.0},
-
-        # Smooth idle/nav yaw. 0.7 rad/s ≈ 40 deg/s.
-        {"idle_yaw_rate_limit": 0.7},
-
-        # When target is lost, hold the pitch reported by the micro.
-        {"idle_pitch_mode": "hold_last_micro"},
-        {"idle_pitch_static": 0.0},
-
-        # In /micro_status: RX[0] = yaw, RX[1] = pitch.
-        {"micro_yaw_index": 0},
-        {"micro_pitch_index": 1},
-
-        # Normally idle target comes from navigation.
-        {"use_default_idle_target": False},
-        {"default_idle_target_x": 0.0},
-        {"default_idle_target_y": 0.0},
+        {"output_topic": "/turret/cmd"},
+        {"detection_timeout": 0.50},
+        {"cv_cmd_timeout": 0.50},
+        {"min_detection_score": 0.12},
+        {"valid_class_ids": ["0", "2"]},
+        {"freeze_when_no_detection": True},
     ]
 
 
