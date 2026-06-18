@@ -78,12 +78,11 @@ waypoint_manager:
     # These strategies must exist in arena_waypoints_lab.yaml.
     # Removed "patrol" because it is not defined in the lab YAML.
     loop_strategies:
-      - center_free_strategy
-      - hold_center_diagonal
       - enemy_center_strategy
       - percorso
 
     retry_failed_after_sec: 3.0
+    execute_waypoints_sequentially: true
 
 
 game_state_manager:
@@ -97,7 +96,7 @@ game_state_manager:
     wait_strategy: wait_at_spawn
 
     # Match started.
-    rush_strategy: rush_center
+    rush_strategy: percorso
 
     # Low HP.
     retreat_strategy: retreat_to_spawn

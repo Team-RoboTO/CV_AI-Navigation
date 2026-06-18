@@ -21,10 +21,10 @@ Outputs:
 
 Lab behavior:
   - Before match start: wait_at_spawn.
-  - Match start: rush_center.
+  - Match start: rush_strategy. Set this to "rush_center" or "percorso" in YAML params.
   - Low HP: retreat_to_spawn.
   - After retreat completes: wait at spawn N seconds, then after_retreat.
-  - When rush_center/after_retreat completes: choose center strategy from center_status.
+  - When rush_strategy / after_retreat completes: choose center strategy from center_status.
   - Center free: center_free_strategy.
   - Center ours: hold_center_diagonal.
   - Center enemy: enemy_center_strategy.
@@ -148,9 +148,11 @@ class GameStateManager(Node):
 
     def _on_team(self, msg: String):
         t = msg.data.strip().lower()
+
         if t in ("red", "blue") and t != self.team:
             self.get_logger().info(f"team: {self.team} -> {t}")
             self.team = t
+
             if not self.match_started:
                 self._publish_strategy(self.s_wait, force=True)
 
@@ -197,6 +199,7 @@ class GameStateManager(Node):
 
         if old != self.center_status:
             self.get_logger().info(f"center_status: {old} -> {self.center_status}")
+
             if self.state in ("CENTER_FREE", "CENTER_OURS", "CENTER_ENEMY") and self.match_started:
                 self._select_center_strategy(force=True)
 
@@ -245,9 +248,11 @@ class GameStateManager(Node):
         if self.center_status == 2:
             self.state = "CENTER_ENEMY"
             self._publish_strategy(self.s_center_enemy, force=force)
+
         elif self.center_status == 1:
             self.state = "CENTER_OURS"
             self._publish_strategy(self.s_center_ours, force=force)
+
         else:
             self.state = "CENTER_FREE"
             self._publish_strategy(self.s_center_free, force=force)
@@ -321,6 +326,7 @@ class GameStateManager(Node):
 
 def main(args=None):
     rclpy.init(args=args)
+
     try:
         node = GameStateManager()
         rclpy.spin(node)

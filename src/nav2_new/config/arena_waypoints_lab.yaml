@@ -31,8 +31,8 @@ strategies:
 
   # Dopo 4 secondi allo spawn torna verso il centro.
   after_retreat:
-    red:  [centro_lab]
-    blue: [centro_lab]
+    red:  [fine_corridoio]
+    blue: [fine_corridoio]
 
   # Centro libero: test semplice, vai al centro.
   center_free_strategy:
@@ -66,8 +66,8 @@ health:
   hold_strategy: hold_center_diagonal
 
 turret_idle_targets:
-  red: centro_lab
-  blue: centro_lab
+  red: fine_corridoio
+  blue: fine_corridoio
 
 
 # --- Arena metadata (for documentation only) --------------------------------
