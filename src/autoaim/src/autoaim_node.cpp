@@ -1032,7 +1032,7 @@ private:
         const double dy = clampAbs(
           angles::shortest_angular_distance(imu_yaw_, yaw_target),
           cmd_max_delta_yaw_);
-        yaw_target = angles::normalize_angle(imu_yaw_ + dy);
+          yaw_target = imu_yaw_ + dy;
       }
 
       if (cmd_max_delta_pitch_ > 0.0) {
@@ -1043,9 +1043,29 @@ private:
     }
 
     // Convert final internal target to MICRO command convention.
-    // These are the exact values sent to /cmd_vel_AI.
-    double yaw_target_micro = yaw_sign_ * yaw_target;
+    //
+    // YAW FIX:
+    // The micro yaw is incremental/unbounded. Therefore we must NOT send the
+    // normalized absolute angle directly. We compute the shortest angular delta
+    // from the current internal yaw to the desired internal target, then add that
+    // delta to the raw micro yaw.
+    //
+    // Example:
+    //   micro_yaw_raw_ = 34.0
+    //   desired delta  = +0.5
+    //   command sent   = 34.5
+    //
+    // Old wrong behavior:
+    //   command sent = 0.5 or another normalized equivalent.
+    const double yaw_delta_internal =
+      angles::shortest_angular_distance(imu_yaw_, yaw_target);
+
+    double yaw_target_micro =
+      micro_yaw_raw_ + yaw_sign_ * yaw_delta_internal;
+
+    // Pitch is usually bounded, so keep the previous convention.
     double pitch_target_micro = pitch_sign_ * pitch_target;
+
 
     // Debug projection and validity check.
     bool pixels_finite = false;
