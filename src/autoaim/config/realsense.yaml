@@ -28,7 +28,7 @@
     # Set false + tune exposure/gain for the arena. Fixed 6000 us overexposes a
     # normally-lit room to pure white — only use manual once you measure on field.
     auto_exposure: false       # false -> manual exposure/gain below
-    exposure: 35             # RS2_OPTION_EXPOSURE (microseconds), manual mode only
+    exposure: 60             # RS2_OPTION_EXPOSURE (microseconds), manual mode only
     gain: 50                  # RS2_OPTION_GAIN, manual mode only
     # Color pixel format:
     #   "bgr8" = librealsense converts YUYV->BGR on the host CPU (default, exact
