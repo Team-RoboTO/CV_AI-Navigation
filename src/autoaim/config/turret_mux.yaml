@@ -23,7 +23,7 @@ turret_yaw_mux:
     tf_timeout: 0.05
 
     # Tune these if sign/zero does not match the micro convention.
-    yaw_sign: 1.0
+    yaw_sign: -1.0
     yaw_zero_offset: 0.0
 
     # NAV/idle yaw slew-rate limit. 0.7 rad/s ~= 40 deg/s.

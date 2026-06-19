@@ -13,7 +13,7 @@
 //   [3] shoot flag
 //   [4] nav_x
 //   [5] nav_y
-//   [6] legacy slot, kept for firmware compatibility, always 0.0
+//   [6] slot for autospinning of the chassis, if ROTATING_CHASSIS = False it doesn't rotate, if 1 it rotates
 //
 // RX (Micro -> Jetson): 10 x float32 LE = 40 bytes
 //   [0] yaw
@@ -88,6 +88,9 @@ constexpr uint8_t TX_FRAME_HEADER[2] = {0xA5, 0x5A};
 constexpr uint8_t RX_FRAME_HEADER[2] = {0x5A, 0xA5};
 constexpr size_t RX_FRAME_SIZE = 2 + RX_PACKET_SIZE + 1;
 constexpr size_t RX_BUFFER_CAP = RX_FRAME_SIZE * 64;
+
+constexpr bool SHOOTING_ACTIVE = false;
+constexpr bool ROTATING_CHASSIS = false;
 
 uint8_t crc8(const uint8_t * data, size_t len)
 {
@@ -387,7 +390,7 @@ private:
       if (enable_turret) {
         tx[1] = static_cast<float>(turret_yaw_);
         tx[2] = static_cast<float>(turret_pitch_);
-        tx[3] = static_cast<float>(turret_stale ? 0.0 : turret_shoot_);
+        tx[3] = static_cast<float>(SHOOTING_ACTIVE ? (turret_stale ? 0.0 : turret_shoot_) : 0.0);
       } else {
         if (hold_last_turret) {
           tx[1] = static_cast<float>(turret_yaw_);
@@ -407,7 +410,7 @@ private:
         tx[5] = 0.0f;
       }
 
-      tx[6] = 0.0f;
+      tx[6] = static_cast<float>(ROTATING_CHASSIS ? 1.0 : 0.0);
 
       tx_echo_turret_yaw_ = tx[1];
       tx_echo_turret_pitch_ = tx[2];

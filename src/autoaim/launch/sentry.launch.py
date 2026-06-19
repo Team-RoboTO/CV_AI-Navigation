@@ -48,7 +48,7 @@ def autoaim_params():
         {"lost_timeout": 0.50},
 
         {"q_pos": 100.0},
-        {"q_yaw": 20.0},
+        {"q_yaw": 10.0},
         {"q_r": 1e-6},
         {"r_pos_base": 0.05},
         {"r_pos_slope": 0.04},
@@ -103,7 +103,7 @@ def autoaim_params():
         {"fire_lock_pitch": 0.5},
 
         {"micro_pitch_feedback_opposite_sign": True},
-        {"micro_pitch_lock_opposite_sign": True},
+        {"micro_pitch_lock_opposite_sign": False},
 
         {"cmd_hold_time": 0.25},
         {"cmd_max_delta_yaw": 1.0},
@@ -111,7 +111,7 @@ def autoaim_params():
         {"require_aim_inside_frame": False},
 
         {"use_ego_motion_compensation": True},
-        {"ego_velocity_available": False},
+        {"ego_velocity_available": True},
         {"ego_velocity_body_frame": True},
         {"ego_velocity_scale_x": 1.0},
         {"ego_velocity_scale_y": 1.0},
@@ -171,11 +171,11 @@ def generate_launch_description():
     ]
 
     viewer_params = [
-        {"micro_pitch_feedback_opposite_sign": True},
+        {"micro_pitch_feedback_opposite_sign": False},
         # Viewer-only: must match autoaim_params() above so the HUD lock line
         # uses Sentry's actual fire gate. Does not affect commands sent to micro.
-        {"fire_lock_yaw": 0.5},
-        {"fire_lock_pitch": 0.5},
+        #{"fire_lock_yaw": 0.5},
+        #{"fire_lock_pitch": 0.5},
     ]
 
     camera = LaunchConfiguration("camera")
