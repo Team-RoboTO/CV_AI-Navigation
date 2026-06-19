@@ -49,7 +49,7 @@ bt_navigator:
 controller_server:
   ros__parameters:
     use_sim_time: false
-    controller_frequency: 10.0
+    controller_frequency: 20.0 # old 10.0
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.001
     min_theta_velocity_threshold: 0.001
@@ -81,15 +81,15 @@ controller_server:
       max_speed_xy: 2.5
       min_speed_theta: 0.0
       acc_lim_x: 2.5
-      acc_lim_y: 2.0
+      acc_lim_y: 2.5
       acc_lim_theta: 0.0
-      decel_lim_x: -1.0
-      decel_lim_y: -1.0
+      decel_lim_x: -2.5
+      decel_lim_y: -2.5
       decel_lim_theta: 0.0
       vx_samples: 15
       vy_samples: 15
       vtheta_samples: 1
-      sim_time: 0.45
+      sim_time: 1.2 # old 0.45
       linear_granularity: 0.03
       angular_granularity: 0.025
       transform_tolerance: 2.0
@@ -100,9 +100,9 @@ controller_server:
       critics: ["Oscillation", "BaseObstacle", "ObstacleFootprint", "PathDist", "GoalDist"]
       BaseObstacle.scale: 0.05
       #PathAlign.scale: 16.0
-      PathDist.scale: 32.0
-      GoalDist.scale: 12.0
-      ObstacleFootprint.scale: 1.0
+      PathDist.scale: 16.0 # old 32.0
+      GoalDist.scale: 24.0 # old 12.0
+      ObstacleFootprint.scale: 1.0 # old 1.0
 
 local_costmap:
   local_costmap:
@@ -114,8 +114,8 @@ local_costmap:
       update_frequency: 10.0
       publish_frequency: 5.0
       rolling_window: true
-      width: 5
-      height: 5
+      width: 10
+      height: 10
       resolution: 0.05
       robot_radius: 0.25
       plugins: ["obstacle_layer", "inflation_layer"]
@@ -180,7 +180,7 @@ global_costmap:
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        inflation_radius: 0.25
+        inflation_radius: 0.20
         cost_scaling_factor: 8.0
 
       always_send_full_costmap: true
@@ -270,8 +270,8 @@ velocity_smoother:
     feedback: "OPEN_LOOP"
     max_velocity: [2.5, 2.5, 0.0]
     min_velocity: [-2.5, -2.5, 0.0]
-    max_accel: [2.0, 2.0, 0.0]
-    max_decel: [-2.0, -2.0, 0.0]
+    max_accel: [2.5, 2.5, 0.0]
+    max_decel: [-2.5, -2.5, 0.0]
     odom_topic: "odom"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
