@@ -69,8 +69,8 @@ def autoaim_params():
         {"gimbal_height": 0.420},
 
         {"barrel_offset_x": 0.0},
-        {"barrel_offset_y": 0.08},
-        {"barrel_offset_z": -0.15},
+        {"barrel_offset_y": -0.03},
+        {"barrel_offset_z": -0.08},
 
         {"angular_window": 1.0},
         {"window_ref_dist": 3.0},
@@ -129,10 +129,42 @@ def turret_mux_params():
         {"detection_topic": "/detector/armors"},
         {"micro_status_topic": "/micro_status"},
         {"output_topic": "/turret/cmd"},
+
+        # Detection is valid only for the enemy class derived from /micro_status[4].
+        # micro 0 = we are red -> shoot/detect blue armor class "0".
+        # micro 1 = we are blue -> shoot/detect red armor class "2".
+        {"target_classes_from_micro_status": True},
+        {"target_color_status_index": 4},
+        {"micro_color_target_classes": ["0", "2"]},
+        {"valid_class_ids": ["0"]},  # fallback until the first /micro_status arrives
+
         {"detection_timeout": 0.50},
         {"cv_cmd_timeout": 0.50},
         {"min_detection_score": 0.12},
-        {"valid_class_ids": ["0", "2"]},
+
+        # When CV is lost, aim at the navigation-provided map point.
+        {"use_idle_target_when_no_detection": True},
+        {"idle_target_topic": "/turret/idle_target"},
+        {"map_frame": "map"},
+        {"base_frame": "base_link"},
+        {"tf_timeout": 0.05},
+
+        # Tune sign/zero against your micro convention.
+        {"yaw_sign": -1.0},
+        {"yaw_zero_offset": 0.0},
+        {"idle_yaw_rate_limit": 0.7},
+
+
+        {"idle_recompute_period": 3.0},
+        {"idle_yaw_deadband": 0.03},
+
+        # Pitch: hold the current pitch by default. Use "static" or "target" if needed.
+        {"idle_pitch_mode": "hold_last_micro"},
+        {"idle_pitch_static": 0.0},
+        {"idle_target_z": 0.42},
+        {"gimbal_height": 0.42},
+
+        # Fallback if /turret/idle_target or TF is unavailable.
         {"freeze_when_no_detection": True},
     ]
 
@@ -144,7 +176,7 @@ def generate_launch_description():
     serial_port = LaunchConfiguration("serial_port")
 
     serial_params = [
-        {"shooting_active": False},
+        {"shooting_active": True},
         {"rotating_chassis": False},
 
         {"serial_port": serial_port},
