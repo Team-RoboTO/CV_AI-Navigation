@@ -144,6 +144,9 @@ def generate_launch_description():
     serial_port = LaunchConfiguration("serial_port")
 
     serial_params = [
+        {"shooting_active": False},
+        {"rotating_chassis": False},
+
         {"serial_port": serial_port},
         {"serial_baudrate": 500000},
         {"serial_tx_hz": 100.0},

@@ -147,6 +147,11 @@ public:
     nav_cmd_topic_ = declare_parameter<std::string>("nav_cmd_topic", "/cmd_vel_NAV");
     micro_status_topic_ = declare_parameter<std::string>("micro_status_topic", "/micro_status");
 
+    shooting_active_ = declare_parameter<bool>("shooting_active", false);
+    rotating_chassis_ = declare_parameter<bool>("rotating_chassis", false);
+
+
+
     declare_parameter<bool>("enable_nav_pipeline", true);
     declare_parameter<bool>("enable_turret_pipeline", true);
     declare_parameter<bool>("hold_last_turret_when_disabled", true);
@@ -390,7 +395,7 @@ private:
       if (enable_turret) {
         tx[1] = static_cast<float>(turret_yaw_);
         tx[2] = static_cast<float>(turret_pitch_);
-        tx[3] = static_cast<float>(SHOOTING_ACTIVE ? (turret_stale ? 0.0 : turret_shoot_) : 0.0);
+        tx[3] = static_cast<float>(shooting_active_ ? (turret_stale ? 0.0 : turret_shoot_) : 0.0);
       } else {
         if (hold_last_turret) {
           tx[1] = static_cast<float>(turret_yaw_);
@@ -410,7 +415,7 @@ private:
         tx[5] = 0.0f;
       }
 
-      tx[6] = static_cast<float>(ROTATING_CHASSIS ? 1.0 : 0.0);
+      tx[6] = static_cast<float>(rotating_chassis_ ? 1.0 : 0.0);
 
       tx_echo_turret_yaw_ = tx[1];
       tx_echo_turret_pitch_ = tx[2];
@@ -660,6 +665,8 @@ private:
   double last_nav_time_ = 0.0;
   bool have_turret_cmd_ = false;
   bool have_nav_cmd_ = false;
+  bool shooting_active_ = false;
+  bool rotating_chassis_ = false;
 
   std::string port_;
   std::string parity_;
