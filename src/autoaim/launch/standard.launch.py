@@ -157,7 +157,7 @@ def autoaim_params():
         {"require_aim_inside_frame": False},
 
         {"use_ego_motion_compensation": True},
-        {"ego_velocity_available": False},
+        {"ego_velocity_available": True},
         {"ego_velocity_body_frame": True},
         {"ego_velocity_scale_x": 1.0},
         {"ego_velocity_scale_y": 1.0},
@@ -179,6 +179,9 @@ def generate_launch_description():
     serial_port = LaunchConfiguration("serial_port")
 
     serial_params = [
+        {"shooting_active": False},
+        {"rotating_chassis": False},
+
         {"serial_port": serial_port},
         {"serial_baudrate": 500000},
         {"serial_tx_hz": 100.0},

@@ -88,8 +88,8 @@ def autoaim_params():
         #   barrel_offset_z = (muzzle height) - (lens height) [m]
         #                     Sentry-calibrated shared value: camera above barrel.
         {"barrel_offset_x": 0.0},
-        {"barrel_offset_y": 0.08},     # <- MEASURE (lens-cover trick, see INSTRUCTIONS.md)
-        {"barrel_offset_z": -0.15},
+        {"barrel_offset_y": 0.02},     # <- MEASURE (lens-cover trick, see INSTRUCTIONS.md)
+        {"barrel_offset_z": -0.05},
 
         # 1.0 rad @ ref 1 m -> ~0.33 rad window at 3 m: OK for tuning, loose for
         # a match. Against a fast spinner, timed shots need ~0.10-0.18 rad with
@@ -148,12 +148,7 @@ def autoaim_params():
         # pitch feedback, field [11] is the pitch command echo. With the gimbal
         # settled on a target: feedback ≈ -command -> set BOTH True;
         # feedback ≈ +command -> set BOTH False.
-        # UPDATE FOR HERO ONLY:
-        # Hero RealSense micro reports pitch feedback in the SAME sign as the
-        # command echo (/micro_status[1] ~= /micro_status[11] when settled).
-        # If this is wrong, the HUD shows pitch error near 2x pitch instead of
-        # near zero and fire-lock never closes.
-        {"micro_pitch_feedback_opposite_sign": False},
+        {"micro_pitch_feedback_opposite_sign": True},
         {"micro_pitch_lock_opposite_sign": False},
 
         {"cmd_hold_time": 0.25},
@@ -162,7 +157,7 @@ def autoaim_params():
         {"require_aim_inside_frame": False},
 
         {"use_ego_motion_compensation": True},
-        {"ego_velocity_available": False},
+        {"ego_velocity_available": True},
         {"ego_velocity_body_frame": True},
         {"ego_velocity_scale_x": 1.0},
         {"ego_velocity_scale_y": 1.0},
@@ -184,6 +179,9 @@ def generate_launch_description():
     serial_port = LaunchConfiguration("serial_port")
 
     serial_params = [
+        {"shooting_active": False},
+        {"rotating_chassis": False},
+
         {"serial_port": serial_port},
         {"serial_baudrate": 500000},
         {"serial_tx_hz": 100.0},
