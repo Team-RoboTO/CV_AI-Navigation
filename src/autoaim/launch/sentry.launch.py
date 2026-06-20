@@ -98,11 +98,11 @@ def autoaim_params():
         {"cmd_deadband_yaw": 0.005},
         {"cmd_deadband_pitch": 0.005},
         {"cmd_rate_limit_yaw": 0.0},
-        {"cmd_rate_limit_pitch": 0.30},
+        {"cmd_rate_limit_pitch": 0.0},
         {"fire_lock_yaw": 0.20},
         {"fire_lock_pitch": 0.05},
 
-        {"micro_pitch_feedback_opposite_sign": False},
+        {"micro_pitch_feedback_opposite_sign": True},
         {"micro_pitch_lock_opposite_sign": False},
 
         {"cmd_hold_time": 0.25},
