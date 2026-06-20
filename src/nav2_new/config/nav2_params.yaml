@@ -72,19 +72,19 @@ controller_server:
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: true
-      min_vel_x: -2.5
-      max_vel_x: 2.5
-      min_vel_y: -2.5
-      max_vel_y: 2.5
+      min_vel_x: -1.0
+      max_vel_x: 1.0
+      min_vel_y: -1.0
+      max_vel_y: 1.0
       max_vel_theta: 0.0
       min_speed_xy: 0.0
-      max_speed_xy: 2.5
+      max_speed_xy: 1.0
       min_speed_theta: 0.0
-      acc_lim_x: 2.5
-      acc_lim_y: 2.5
+      acc_lim_x: 1.0
+      acc_lim_y: 1.0
       acc_lim_theta: 0.0
-      decel_lim_x: -2.5
-      decel_lim_y: -2.5
+      decel_lim_x: -1.0
+      decel_lim_y: -1.0
       decel_lim_theta: 0.0
       vx_samples: 15
       vy_samples: 15
@@ -268,10 +268,10 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: false
     feedback: "OPEN_LOOP"
-    max_velocity: [2.5, 2.5, 0.0]
-    min_velocity: [-2.5, -2.5, 0.0]
-    max_accel: [2.5, 2.5, 0.0]
-    max_decel: [-2.5, -2.5, 0.0]
+    max_velocity: [1.0, 1.0, 0.0]
+    min_velocity: [-1.0, -1.0, 0.0]
+    max_accel: [1.0, 1.0, 0.0]
+    max_decel: [-1.0, -1.0, 0.0]
     odom_topic: "odom"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]

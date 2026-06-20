@@ -131,7 +131,7 @@ def generate_launch_description():
         sensors,
 
         # 2s: status adapter can already listen to /micro_status; game status can monitor startup.
-        TimerAction(period=2.0, actions=[micro_status_adapter, game_status_reporter]),
+        TimerAction(period=5.0, actions=[micro_status_adapter, game_status_reporter]),
 
         # 15s: start Nav2 only after Livox/IMU/FAST-LIO have had time to stabilize.
         TimerAction(period=15.0, actions=[nav]),
