@@ -87,7 +87,7 @@ def generate_launch_description():
 
     lidar_x_arg = DeclareLaunchArgument('lidar_x', default_value='0.0')
     lidar_y_arg = DeclareLaunchArgument('lidar_y', default_value='0.0')
-    lidar_z_arg = DeclareLaunchArgument('lidar_z', default_value='0.65')
+    lidar_z_arg = DeclareLaunchArgument('lidar_z', default_value='0.60')
 
     livox_driver = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
@@ -193,7 +193,7 @@ def generate_launch_description():
             'angle_increment': 0.015,
             'scan_time': 0.1,
             'range_min': 0.20,
-            'range_max': 4.0,
+            'range_max': 10.0,
             'inf_epsilon': 1.0,
             'use_inf': True,
         }],
@@ -225,9 +225,9 @@ def generate_launch_description():
         parameters=[{
             'input_topic': '/scan',
             'output_topic': '/scan_nav',
-            'persistence_sec': 1.0,
-            'min_range': 0.12,
-            'max_range': 12.0,
+            'persistence_sec': 0.1,
+            'min_range': 0.20,
+            'max_range': 6.0,
         }],
         output='screen',
     )

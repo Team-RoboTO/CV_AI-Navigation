@@ -107,7 +107,7 @@ class CmdVelXYOnly(Node):
         self.declare_parameter('max_linear_y', 2.0)
 
         # Minimum speed compensation for motor deadzone
-        self.declare_parameter('min_linear_speed', 0.20)
+        self.declare_parameter('min_linear_speed', 0.00)
 
         input_topic = self.get_parameter('input_topic').value
         output_topic = self.get_parameter('output_topic').value
