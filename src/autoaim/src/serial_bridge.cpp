@@ -160,7 +160,7 @@ public:
     // These affect only the ROS topic /micro_status, not the serial TX packet.
     declare_parameter<bool>("lab_override_micro_status", true);
     declare_parameter<double>("lab_override_team", 1.0);           // 0 red, 1 blue
-    declare_parameter<double>("lab_override_game_progress", 4.0);  // 1 wait, 4 in match, 5 ended
+    declare_parameter<double>("lab_override_game_progress", 1.0);  // 1 wait, 4 in match, 5 ended
     declare_parameter<double>("lab_override_health", 100.0);
     declare_parameter<double>("lab_override_resupply_status", 0.0);
     declare_parameter<double>("lab_override_center_status", 0.0);  // 0 free, 1 ours, 2 enemy

@@ -48,7 +48,7 @@ def autoaim_params():
         {"lost_timeout": 0.50},
 
         {"q_pos": 100.0},
-        {"q_yaw": 10.0},
+        {"q_yaw": 30.0},
         {"q_r": 1e-6},
         {"r_pos_base": 0.05},
         {"r_pos_slope": 0.04},
@@ -56,15 +56,15 @@ def autoaim_params():
         {"r_yaw_slope": 0.005},
         {"max_oblique_deg": 65.0},
 
-        {"alpha_pos": 0.995},
-        {"alpha_yaw": 1.00},
+        {"alpha_pos": 1.0},
+        {"alpha_yaw": 0.998},
         {"alpha_coast": 0.98},
 
         {"initial_radius": 0.24},
         {"radius_ema_alpha": 0.05},
         {"initial_dz": 0.05},
 
-        {"bullet_speed": 20.0},
+        {"bullet_speed": 24.0},
         {"gravity": 9.8},
         {"gimbal_height": 0.420},
 
@@ -72,21 +72,21 @@ def autoaim_params():
         {"barrel_offset_y": -0.03},
         {"barrel_offset_z": -0.08},
 
-        {"angular_window": 1.0},
+        {"angular_window": 0.25},
         {"window_ref_dist": 3.0},
         {"min_fire_dist": 0.2},
         {"max_fire_dist": 6.0},
 
         {"use_measured_latency": True},
-        {"actuation_latency": 0.020},
+        {"actuation_latency": 0.06},
         {"time_bias": 0.045},
 
         {"ref_freq": 60.0},
-        {"yaw_jump_thresh": 0.55},
+        {"yaw_jump_thresh": 0.60},
         {"use_vyaw_from_timing": True},
-        {"vyaw_timing_min_dt": 0.050},
-        {"vyaw_timing_max_dt": 0.500},
-        {"vyaw_fire_threshold": 5.0},
+        {"vyaw_timing_min_dt": 0.070},
+        {"vyaw_timing_max_dt": 0.350},
+        {"vyaw_fire_threshold": 3.5},
 
         {"max_match_dist": 0.8},
         {"maha_threshold": 16.9},
@@ -98,11 +98,11 @@ def autoaim_params():
         {"cmd_deadband_yaw": 0.005},
         {"cmd_deadband_pitch": 0.005},
         {"cmd_rate_limit_yaw": 0.0},
-        {"cmd_rate_limit_pitch": 0.0},
-        {"fire_lock_yaw": 0.5},
-        {"fire_lock_pitch": 0.5},
+        {"cmd_rate_limit_pitch": 0.30},
+        {"fire_lock_yaw": 0.20},
+        {"fire_lock_pitch": 0.05},
 
-        {"micro_pitch_feedback_opposite_sign": True},
+        {"micro_pitch_feedback_opposite_sign": False},
         {"micro_pitch_lock_opposite_sign": False},
 
         {"cmd_hold_time": 0.25},
@@ -150,13 +150,13 @@ def turret_mux_params():
         {"tf_timeout": 0.05},
 
         # Tune sign/zero against your micro convention.
-        {"yaw_sign": -1.0},
+        {"yaw_sign": 1.0},
         {"yaw_zero_offset": 0.0},
-        {"idle_yaw_rate_limit": 0.7},
+        {"idle_yaw_rate_limit": 0.5},
 
 
-        {"idle_recompute_period": 3.0},
-        {"idle_yaw_deadband": 0.03},
+        {"idle_recompute_period": 0.10},
+        {"idle_yaw_deadband": 0.07},
 
         # Pitch: hold the current pitch by default. Use "static" or "target" if needed.
         {"idle_pitch_mode": "hold_last_micro"},
@@ -176,7 +176,7 @@ def generate_launch_description():
     serial_port = LaunchConfiguration("serial_port")
 
     serial_params = [
-        {"shooting_active": True},
+        {"shooting_active": False},
         {"rotating_chassis": False},
 
         {"serial_port": serial_port},
