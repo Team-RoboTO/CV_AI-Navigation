@@ -105,3 +105,14 @@ Then enter the headless container:
 
 The enter script sets the video/display variables needed to access the container
 and handle the ZED camera.
+
+## Install jetson-fan-max service
+
+To keep the Jetson cool during operation, install and enable the fan max service:
+
+```bash
+sudo cp jetson-fan-max.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable jetson-fan-max.service
+sudo systemctl start jetson-fan-max.service
+```

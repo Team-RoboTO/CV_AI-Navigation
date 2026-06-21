@@ -1,0 +1,11 @@
+[Unit]
+Description=Set Jetson fan to max speed at boot
+After=multi-user.target nvfancontrol.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/jetson_clocks --fan
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

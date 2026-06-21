@@ -169,3 +169,14 @@ This profile is not the sentry/ZED startup profile. It intentionally does not:
 If this folder is later reused for sentry/ZED, do not just change the launch
 file. Reintroduce the ZED/Argus waits and any display/X11 requirements only if
 that runtime path actually needs them.
+
+## Install jetson-fan-max service
+
+To keep the Jetson cool during operation, install and enable the fan max service:
+
+```bash
+sudo cp jetson-fan-max.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable jetson-fan-max.service
+sudo systemctl start jetson-fan-max.service
+```
