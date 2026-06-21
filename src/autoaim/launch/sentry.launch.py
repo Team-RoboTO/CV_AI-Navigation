@@ -270,7 +270,7 @@ def generate_launch_description():
             name="zed_detector",
             parameters=[zed_config, engine_override],
             output="screen",
-            prefix="taskset -c 9-11 nice -n 8",
+            prefix="taskset -c 8-11 nice -n 3",
             condition=zed_condition,
         ),
 
