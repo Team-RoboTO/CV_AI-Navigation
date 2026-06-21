@@ -170,17 +170,65 @@ for mixed testing.
 | `max_reproj_error` | Rejects PnP solutions with high average reprojection error in pixels. |
 | `angle_sync_enable` | Uses interpolated gimbal yaw/pitch at the image capture timestamp. Keep enabled. |
 | `use_measured_latency` | Uses measured capture-to-aim latency from message timestamps. Keep enabled for normal operation. |
-| `actuation_latency` | Extra fixed latency for serial TX, gimbal settle, and muzzle exit. Tune in small steps on moving targets. |
-| `time_bias` | Fixed fallback prediction horizon used only when measured latency is disabled. |
+| `actuation_latency` | Post-command fixed delay only (serial TX + gimbal settle + muzzle exit). Do NOT make it cover capture→aim — that is measured per frame. Horizon = measured + actuation_latency. On a spinner, every 10 ms ≈ 18° of spin at 300 RPM, so keep it tight (~0.02–0.03) and tune in 5 ms steps. |
+| `LEGACY_time_bias` | Fixed fallback prediction horizon, used ONLY when `use_measured_latency` is false. Renamed `LEGACY_` because the measured-latency path is the default. |
+| `vyaw_conf_p_max` | Spin-confidence gate. Four-face spinning prediction (and any TEMP_LOST coast-fire) turn on only when the vyaw covariance `P(7,7)` is below this. |
+| `vyaw_timing_max_reproj` | Anti-spurious-jump gate: a 90° face jump may drive the spin-rate estimator only if PnP reprojection error (px) is below this. Raise if real spins are being ignored. |
+| `vyaw_timing_consistency` | Two consecutive same-direction face-jump vyaw estimates must agree within ±this fraction before the spin rate is trusted. Lower = stricter (harder to lock a wrong spin). |
 | `ref_freq` | Detector/keypoint rate used by damping math. Set from the measured detector rate. |
 | `bullet_speed` | Measured muzzle velocity. Wrong values usually appear as vertical misses. |
 | `barrel_offset_x/y/z` | Offset from active camera lens to muzzle in the gimbal body frame. Measure from the active lens. |
-| `angular_window` | Fire gate angle. Large values are useful for tuning; tighten for match timing. |
-| `fire_lock_yaw` / `fire_lock_pitch` | Required gimbal-command agreement before firing. Keep larger than command deadbands. |
+| `angular_window` | Fire gate FACING tolerance on the selected plate: `win = angular_window * min(window_ref_dist/range, 1.0)`. The multiplier is capped at 1.0, so the window only SHRINKS far away — it no longer DOUBLES up close (that close-range expansion let the shot fire on a plate ~46° off-facing → "hits the wheels / 45° to the side"). Now that vyaw is gated you can tighten toward 0.25 for tighter groups. |
+| `fire_lock_yaw` / `fire_lock_pitch` | LEGACY fixed lock thresholds. The ACTIVE fire-lock is range-scaled (`fire_lock_k_*/range`, clamped to `[fire_lock_min, fire_lock_max_*]`). These remain only as the DEFAULTS for `fire_lock_max_yaw/pitch` and are also read by the viewer HUD, so the names are kept. Set `fire_lock_max_*` directly. |
 | `micro_pitch_feedback_opposite_sign` | Whether pitch feedback has the opposite sign from command echo. |
 | `micro_pitch_lock_opposite_sign` | Must match `micro_pitch_feedback_opposite_sign`; mismatches cause vertical miss or no-fire behavior. |
 | `ego_velocity_available` | Keep false until firmware sends validated chassis velocity. |
 | `chassis_heading_index` | Index in micro status containing chassis heading, or `-1` if unavailable. |
+
+## Spinning-Target Tuning
+
+Static aim (a non-rotating enemy) depends only on geometry: bullet speed, barrel
+offset, gimbal height, pitch sign. If static hits dead-center, that whole chain
+is correct and must NOT be retuned to fix a spinning-target miss.
+
+Missing a spinner (小陀螺) to the side, or hitting the wheels, is a SPIN-PHASE
+problem: where will a plate be, and which way will it face, when the bullet
+arrives. That depends on three things — the spin rate `vyaw`, the prediction
+horizon, and the fire window — and on the PnP yaw, which is the weak, partly
+unobservable input. The revision below targets exactly that path. Five changes:
+
+1. **Adaptive `q_pos` removed.** It adapted only the horizontal-center noise,
+   but a spinner's center is ~still, so it was reacting to yaw/PnP model error
+   (not real maneuvers), cranking `q_pos` up and overshooting the lead. `q_pos`
+   and `q_yaw` are now static. (Removed params: `q_adapt_*`.)
+2. **Anti-spurious-jump gate on the spin estimator.** vyaw is estimated from the
+   time between 90° face jumps. A PnP flip or a bad association produces the same
+   "jump" signature; trusting it (old code: 80–100% blend + `P(7,7)→1.0` after
+   ONE jump) locked a WRONG spin with high confidence → ~45° side shots. A jump
+   now drives the estimator only when PnP is clean (`vyaw_timing_max_reproj`),
+   the yaw is real (not faked from bearing), and two consecutive estimates agree
+   (`vyaw_timing_consistency`); then it blends gently.
+3. **Dual-solution PnP yaw.** A planar plate has two IPPE pose solutions whose
+   yaw differs. The detector now passes both; the tracker keeps whichever is
+   closer to its predicted yaw. This kills the frame-to-frame yaw flicker that
+   polluted vyaw and could masquerade as a face jump. Position is unchanged.
+4. **Fire window no longer expands up close.** `win = angular_window *
+   min(window_ref_dist/range, 1.0)`. The cap was 2.0, so the facing tolerance
+   DOUBLED at close range and the shot could fire on a plate ~46° off-facing.
+   Capped at 1.0 it only shrinks far away.
+5. **`alpha_yaw = 1.0`** (no spin damping): a top spins at a roughly constant
+   rate, so damping `vyaw` between updates only makes the phase prediction lag.
+
+Tuning order for a spinner, after static aim is confirmed:
+
+1. Confirm `ref_freq` equals the real detector rate (`ros2 topic hz
+   /detector/armors_keypoints`). Damping and timing math depend on it.
+2. Calibrate the horizon: keep `actuation_latency` to the post-command delay
+   only (~0.02–0.03 s). Too large leads the shot into the gap between plates.
+3. Watch `/debug_state.vyaw_rpm` against the real spin. It should lock within
+   ~2 jumps and stay steady. If it jumps around, lower `vyaw_timing_consistency`
+   (stricter) or `vyaw_timing_max_reproj` (cleaner PnP only).
+4. Only then tighten `angular_window` toward 0.25 for tighter groups.
 
 ## Viewer HUD
 
@@ -263,7 +311,13 @@ parameters.
 If shots trail a moving target, increase `actuation_latency`, verify `ref_freq`,
 and make sure `use_measured_latency` is enabled.
 
-If shots lead too much, reduce `actuation_latency` or fallback `time_bias`.
+If shots lead too much, reduce `actuation_latency` or `LEGACY_time_bias`.
+
+If static aim is perfect but the robot misses a SPINNING enemy ~45° to the side
+or hits the wheels, the spin phase prediction is off, not the geometry. Watch
+`/debug_state`: `vyaw_rpm` should match the real spin and stay steady (not jump
+around); `faces` should be 4 only when the spin is trusted; `margin` should pass
+when a plate is near dead-on. See "Spinning-Target Tuning" below.
 
 If the tracker flickers between tracking and lost states, inspect
 `lost_timeout`, `maha_threshold`, `max_match_dist`, and detector keypoint

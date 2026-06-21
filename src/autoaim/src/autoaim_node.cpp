@@ -1,6 +1,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <vision_msgs/msg/detection2_d_array.hpp>
+#include <autoaim/msg/debug_state.hpp>
 #include <autoaim/msg/armor_keypoint_array.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -14,6 +15,7 @@
 #include <opencv2/calib3d.hpp>
 #include <cmath>
 #include <algorithm>
+#include <cstdint>
 #include <deque>
 #include <iterator>
 #include <set>
@@ -40,6 +42,12 @@ public:
     cfg.max_armor_z      = declare_parameter("max_armor_z", 2.0);
     cfg.confirm_frames   = declare_parameter("confirm_frames", 3);
     cfg.lost_timeout     = declare_parameter("lost_timeout", 0.4);
+    cfg.track_grace_misses = declare_parameter("track_grace_misses", 2);
+    cfg.fire_in_temp_lost = declare_parameter("fire_in_temp_lost", false);
+    cfg.temp_lost_fire_max = declare_parameter("temp_lost_fire_max", 3);
+    // STATIC process noise. The adaptive/NIS q_pos controller was removed:
+    // it adapted only horizontal-center noise, but a spinner's center is ~still,
+    // so it reacted to yaw/PnP model error and made the lead overshoot.
     cfg.q_pos            = declare_parameter("q_pos", 5.0);
     cfg.q_yaw            = declare_parameter("q_yaw", 10.0);
     cfg.q_r              = declare_parameter("q_r", 1e-6);
@@ -54,6 +62,7 @@ public:
     cfg.initial_radius   = declare_parameter("initial_radius", 0.24);
     cfg.radius_ema_alpha = declare_parameter("radius_ema_alpha", 0.05);
     cfg.initial_dz       = declare_parameter("initial_dz", 0.0);
+    cfg.adapt_dz_enable  = declare_parameter("adapt_dz_enable", false);
     cfg.bullet_speed     = declare_parameter("bullet_speed", 25.0);
     cfg.gravity          = declare_parameter("gravity", 9.8);
     cfg.gimbal_height    = declare_parameter("gimbal_height", 0.325);
@@ -64,7 +73,17 @@ public:
     cfg.window_ref_dist  = declare_parameter("window_ref_dist", 3.0);
     cfg.min_fire_dist    = declare_parameter("min_fire_dist", 0.3);
     cfg.max_fire_dist    = declare_parameter("max_fire_dist", 6.0);
-    cfg.time_bias        = declare_parameter("time_bias", 0.10);
+    cfg.face_lookahead_enable = declare_parameter("face_lookahead_enable", true);
+    cfg.face_lookahead_min_vyaw = declare_parameter("face_lookahead_min_vyaw", 0.35);
+    cfg.face_lookahead_horizon = declare_parameter("face_lookahead_horizon", 0.35);
+    cfg.face_switch_hysteresis = declare_parameter("face_switch_hysteresis", 0.08);
+    cfg.min_face_hold_time = declare_parameter("min_face_hold_time", 0.10);
+    // LEGACY fallback: only used when use_measured_latency is FALSE. With
+    // measured latency on (the default), the horizon is (now − capture stamp) +
+    // actuation_latency and this value is ignored. Renamed LEGACY_ to make that
+    // explicit in launch files. To use it: set use_measured_latency:=False and
+    // tune LEGACY_time_bias to the full capture→muzzle latency.
+    cfg.time_bias        = declare_parameter("LEGACY_time_bias", 0.10);
     // Measured-latency prediction horizon: the node measures
     // (now − capture stamp) per frame and the tracker adds actuation_latency
     // (serial TX + gimbal settle + muzzle exit). time_bias is only the
@@ -78,7 +97,10 @@ public:
     cfg.use_vyaw_from_timing = declare_parameter("use_vyaw_from_timing", true);
     cfg.vyaw_timing_min_dt   = declare_parameter("vyaw_timing_min_dt", 0.020);
     cfg.vyaw_timing_max_dt   = declare_parameter("vyaw_timing_max_dt", 0.400);
-    cfg.vyaw_fire_threshold  = declare_parameter("vyaw_fire_threshold", 3.0);
+    cfg.vyaw_conf_p_max      = declare_parameter("vyaw_conf_p_max", 2.0);
+    // Anti-spurious-jump gate for the spin-rate-from-timing estimator.
+    cfg.vyaw_timing_max_reproj  = declare_parameter("vyaw_timing_max_reproj", 8.0);
+    cfg.vyaw_timing_consistency = declare_parameter("vyaw_timing_consistency", 0.35);
     cfg.switch_range_ratio = declare_parameter("switch_range_ratio", 0.85);
     cfg.switch_cooldown  = declare_parameter("switch_cooldown", 10);
     cfg.same_target_identity_dist = declare_parameter("same_target_identity_dist", 1.0);
@@ -115,12 +137,25 @@ public:
     cmd_deadband_pitch_ = declare_parameter("cmd_deadband_pitch", 0.005);
     cmd_rate_limit_yaw_ = declare_parameter("cmd_rate_limit_yaw", 2.5);
     cmd_rate_limit_pitch_ = declare_parameter("cmd_rate_limit_pitch", 2.0);
+    // LEGACY fallback thresholds. The ACTIVE fire-lock tolerance is the
+    // range-scaled window below (fire_lock_k_* / range, clamped to
+    // [fire_lock_min, fire_lock_max_*]). fire_lock_yaw/pitch are kept only as
+    // the DEFAULT VALUES for fire_lock_max_yaw/pitch when a launch file does not
+    // set those explicitly, and they are also read independently by the viewer's
+    // fallback HUD — so the names are retained instead of being prefixed
+    // LEGACY_. Treat them as legacy: set fire_lock_max_* directly instead.
     fire_lock_yaw_ = declare_parameter("fire_lock_yaw", 0.05);
     fire_lock_pitch_ = declare_parameter("fire_lock_pitch", 0.04);
+    // Range-scaled fire lock: tolerance = armor half-extent / range, clamped
+    // to [fire_lock_min, fire_lock_max_*].
+    fire_lock_k_yaw_ = declare_parameter("fire_lock_k_yaw", 0.0675);
+    fire_lock_k_pitch_ = declare_parameter("fire_lock_k_pitch", 0.0625);
+    fire_lock_min_ = declare_parameter("fire_lock_min", 0.015);
+    fire_lock_max_yaw_ = declare_parameter("fire_lock_max_yaw", fire_lock_yaw_);
+    fire_lock_max_pitch_ = declare_parameter("fire_lock_max_pitch", fire_lock_pitch_);
     micro_pitch_feedback_opposite_sign_ = declare_parameter("micro_pitch_feedback_opposite_sign", true);
-    // Separate flag for the fire-lock pitch comparison only.
-    // With gimbal.pitch_sign=-1.0, set this to False (lock uses raw pitch directly).
-    // With gimbal.pitch_sign=+1.0 and opposite firmware, set this to True.
+    // Separate lock-space correction: geometry feedback may need inversion for
+    // PnP while the micro command echo can still share the raw feedback sign.
     micro_pitch_lock_opposite_sign_ = declare_parameter("micro_pitch_lock_opposite_sign", false);
 
     // Safety when EKF/prediction briefly jumps off-screen or the target is lost.
@@ -169,6 +204,8 @@ public:
     keypoint_topic_ = declare_parameter("keypoint_topic", std::string("/detector/armors_keypoints"));
     min_keypoint_score_ = declare_parameter("min_keypoint_score", 0.05);
     max_reproj_error_ = declare_parameter("max_reproj_error", 25.0);
+    publish_debug_state_ = declare_parameter("publish_debug_state", true);
+    publish_other_debug_messages_ = declare_parameter("publish_other_debug_messages", true);
 
     // Image <-> gimbal-angle time synchronization.
     // The image was captured 30-100 ms before the detection arrives here
@@ -231,6 +268,9 @@ public:
     aim_px_pub_ = create_publisher<geometry_msgs::msg::Twist>("/tracker/aim_pixels", 10);
     marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
       "/tracker/marker", 10);
+    if (publish_debug_state_) {
+      debug_state_pub_ = create_publisher<autoaim::msg::DebugState>("/debug_state", 10);
+    }
 
     RCLCPP_INFO(
       get_logger(),
@@ -265,6 +305,12 @@ private:
     // because /cmd_vel_AI is sent in this same micro convention.
     micro_yaw_raw_ = micro_yaw_rad;
     micro_pitch_raw_ = micro_pitch_rad;
+    if (msg->data.size() > 11) {
+      pitch_cmd_echo_ = static_cast<double>(msg->data[11]);
+      pitch_cmd_echo_valid_ = std::isfinite(pitch_cmd_echo_);
+    } else {
+      pitch_cmd_echo_valid_ = false;
+    }
 
     updateTargetClassesFromMicroStatus(*msg);
 
@@ -317,6 +363,107 @@ private:
     }
     out += "]";
     return out;
+  }
+
+  static const char * trackerStateName(Tracker::State state)
+  {
+    switch (state) {
+      case Tracker::LOST:
+        return "LOST";
+      case Tracker::DETECTING:
+        return "DETECTING";
+      case Tracker::TRACKING:
+        return "TRACKING";
+      case Tracker::TEMP_LOST:
+        return "TEMP_LOST";
+      default:
+        return "UNKNOWN";
+    }
+  }
+
+  std::string fireBlockReason(
+    const AimResult & aim,
+    bool finite_cmd,
+    bool command_valid,
+    bool command_locked,
+    bool yaw_locked,
+    bool pitch_locked,
+    bool holding_last_cmd,
+    bool pixels_inside,
+    bool fire_decision) const
+  {
+    if (fire_decision) {
+      return "firing";
+    }
+
+    if (!aim.tracking) {
+      return "not_tracking";
+    }
+
+    const auto state = tracker_->state();
+    if (!aim.target_valid) {
+      return "no_target_solution";
+    }
+
+    if (aim.distance < cfg_.min_fire_dist) {
+      return "too_close";
+    }
+
+    if (aim.distance > cfg_.max_fire_dist) {
+      return "too_far";
+    }
+
+    if (aim.fire_margin < 0.0) {
+      return "fire_window_margin";
+    }
+
+    if (!tracker_->fireStatePermits()) {
+      return std::string("tracker_") + trackerStateName(state);
+    }
+
+    if (!aim.fire) {
+      return "aim_fire_false";
+    }
+
+    if (!finite_cmd) {
+      return "nonfinite_command";
+    }
+
+    if (require_aim_inside_frame_ && !pixels_inside) {
+      return "aim_pixels_outside";
+    }
+
+    if (!command_valid) {
+      return "command_invalid";
+    }
+
+    if (holding_last_cmd) {
+      return "holding_last_cmd";
+    }
+
+    if (!yaw_locked && !pitch_locked) {
+      return "yaw_pitch_unlocked";
+    }
+
+    if (!yaw_locked) {
+      return "yaw_unlocked";
+    }
+
+    if (!pitch_locked) {
+      return "pitch_unlocked";
+    }
+
+    if (!command_locked) {
+      return "command_unlocked";
+    }
+
+    return "unknown";
+  }
+
+  double currentPredictionBias() const
+  {
+    return cfg_.use_measured_latency ? (tracker_->pipelineLatency() + cfg_.actuation_latency)
+                                     : cfg_.time_bias;
   }
 
   void resetTrackingForTargetClassChange()
@@ -603,7 +750,8 @@ private:
     const cv::Mat & rvec, const cv::Mat & tvec,
     const std::string & cid, double confidence,
     bool is_large, double reproj_error,
-    std::vector<ArmorDetection> & armors)
+    std::vector<ArmorDetection> & armors,
+    const cv::Mat * rvec_alt = nullptr)
   {
     if (tvec.empty() || rvec.empty()) {
       return false;
@@ -616,10 +764,12 @@ private:
     }
 
     if (p_cam.z() <= 0.05) {
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 1000,
-        "REJECTED: PnP returned target behind/too close to camera z=%.3f",
-        p_cam.z());
+      if (publish_other_debug_messages_) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "REJECTED: PnP returned target behind/too close to camera z=%.3f",
+          p_cam.z());
+      }
       return false;
     }
 
@@ -647,10 +797,12 @@ private:
     tf2::Matrix3x3(q_odom).getRPY(r, p, y);
 
     if (std::abs(p_odom.z()) > cfg_.max_armor_z) {
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 1000,
-        "REJECTED: z=%.2f exceeds max_armor_z=%.1f",
-        p_odom.z(), cfg_.max_armor_z);
+      if (publish_other_debug_messages_) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "REJECTED: z=%.2f exceeds max_armor_z=%.1f",
+          p_odom.z(), cfg_.max_armor_z);
+      }
       return false;
     }
 
@@ -661,10 +813,12 @@ private:
     const double rel_range_3d = std::sqrt(
       p_cam.x() * p_cam.x() + p_cam.y() * p_cam.y() + p_cam.z() * p_cam.z());
     if (rel_range_3d > cfg_.max_armor_dist) {
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 1000,
-        "REJECTED: rel_range=%.2f exceeds max_armor_dist=%.1f",
-        rel_range_3d, cfg_.max_armor_dist);
+      if (publish_other_debug_messages_) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "REJECTED: rel_range=%.2f exceeds max_armor_dist=%.1f",
+          rel_range_3d, cfg_.max_armor_dist);
+      }
       return false;
     }
 
@@ -673,6 +827,7 @@ private:
     // otherwise the inward yaw correction is wrong when the robot has moved.
     double bearing_inward = std::atan2(p_odom.y() - robot_y_, p_odom.x() - robot_x_);
     double yaw_inward = y;
+    bool yaw_replaced_by_bearing = false;
 
     if (std::abs(angles::shortest_angular_distance(bearing_inward, yaw_inward)) > M_PI / 2.0) {
       yaw_inward = angles::normalize_angle(yaw_inward + M_PI);
@@ -682,17 +837,57 @@ private:
         cfg_.max_oblique_deg * M_PI / 180.0)
     {
       yaw_inward = bearing_inward;
+      yaw_replaced_by_bearing = true;
     }
 
-    RCLCPP_INFO_THROTTLE(
-      get_logger(), *get_clock(), 1000,
-      "PnP OK [%s]: cam=(%.2f,%.2f,%.2f) odom=(%.2f,%.2f,%.2f) yaw=%.2f rel=%.2f large=%d err=%.2f",
-      use_keypoints_ ? "keypoints" : "bbox",
-      p_cam.x(), p_cam.y(), p_cam.z(),
-      p_odom.x(), p_odom.y(), p_odom.z(),
-      yaw_inward, rel_range_3d, is_large ? 1 : 0, reproj_error);
+    // ── Alternate (second IPPE solution) yaw, for the tracker's planar
+    // disambiguation. Same inward correction. Only meaningful when the primary
+    // yaw was NOT replaced by the bearing (then both solutions are too oblique
+    // to trust and the tracker should lean on position only). Position is taken
+    // from the primary solution regardless — the two solutions differ in yaw.
+    double yaw_inward_alt = yaw_inward;
+    bool has_yaw_alt = false;
+    if (rvec_alt != nullptr && !rvec_alt->empty() && !yaw_replaced_by_bearing) {
+      cv::Mat rmat_alt;
+      cv::Rodrigues(*rvec_alt, rmat_alt);
+      tf2::Matrix3x3 tf_rm_alt(
+        rmat_alt.at<double>(0, 0), rmat_alt.at<double>(0, 1), rmat_alt.at<double>(0, 2),
+        rmat_alt.at<double>(1, 0), rmat_alt.at<double>(1, 1), rmat_alt.at<double>(1, 2),
+        rmat_alt.at<double>(2, 0), rmat_alt.at<double>(2, 1), rmat_alt.at<double>(2, 2));
+      tf2::Quaternion q_armor_alt;
+      tf_rm_alt.getRotation(q_armor_alt);
+      if (q_armor_alt.length() >= 1e-6) {
+        q_armor_alt.normalize();
+        tf2::Quaternion q_odom_alt = frame_rotation_ * q_armor_alt;
+        double r_alt, p_alt, y_alt;
+        tf2::Matrix3x3(q_odom_alt).getRPY(r_alt, p_alt, y_alt);
+        if (std::abs(angles::shortest_angular_distance(bearing_inward, y_alt)) > M_PI / 2.0) {
+          y_alt = angles::normalize_angle(y_alt + M_PI);
+        }
+        // Keep the alternate only if it is itself not edge-on.
+        if (std::abs(angles::shortest_angular_distance(bearing_inward, y_alt)) <=
+            cfg_.max_oblique_deg * M_PI / 180.0) {
+          yaw_inward_alt = y_alt;
+          has_yaw_alt = true;
+        }
+      }
+    }
+
+    if (publish_other_debug_messages_) {
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "PnP OK [%s]: cam=(%.2f,%.2f,%.2f) odom=(%.2f,%.2f,%.2f) yaw=%.2f rel=%.2f large=%d err=%.2f",
+        use_keypoints_ ? "keypoints" : "bbox",
+        p_cam.x(), p_cam.y(), p_cam.z(),
+        p_odom.x(), p_odom.y(), p_odom.z(),
+        yaw_inward, rel_range_3d, is_large ? 1 : 0, reproj_error);
+    }
 
     ArmorDetection det{p_odom.x(), p_odom.y(), p_odom.z(), yaw_inward, cid, confidence, rel_range_3d};
+    det.reproj_error = reproj_error;
+    det.yaw_replaced_by_bearing = yaw_replaced_by_bearing;
+    det.yaw_alt = yaw_inward_alt;
+    det.has_yaw_alt = has_yaw_alt;
     armors.push_back(det);
     return true;
   }
@@ -710,10 +905,12 @@ private:
 
     last_time_ = now;
 
-    RCLCPP_INFO_THROTTLE(
-      get_logger(), *get_clock(), 1000,
-      "Passing %zu armors to tracker (state=%d)",
-      armors.size(), static_cast<int>(tracker_->state()));
+    if (publish_other_debug_messages_) {
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "Passing %zu armors to tracker (state=%d)",
+        armors.size(), static_cast<int>(tracker_->state()));
+    }
 
     // Tell the tracker our current odom position. Used internally by
     // targetRange() / shouldSwitch() so the range comparison is consistent
@@ -750,12 +947,14 @@ private:
       pipeline_latency = (this->now() - now).seconds();
     }
     tracker_->setPipelineLatency(pipeline_latency);
-    RCLCPP_INFO_THROTTLE(
-      get_logger(), *get_clock(), 2000,
-      "pipeline latency (capture->aim) = %.1f ms, + actuation_latency = %.0f ms "
-      "(use_measured_latency=%d)",
-      pipeline_latency * 1e3, cfg_.actuation_latency * 1e3,
-      cfg_.use_measured_latency ? 1 : 0);
+    if (publish_other_debug_messages_) {
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "pipeline latency (capture->aim) = %.1f ms, + actuation_latency = %.0f ms "
+        "(use_measured_latency=%d)",
+        pipeline_latency * 1e3, cfg_.actuation_latency * 1e3,
+        cfg_.use_measured_latency ? 1 : 0);
+    }
 
     auto aim = tracker_->computeAim(imu_yaw_, imu_pitch_,
                                     robot_x_, robot_y_,
@@ -842,28 +1041,34 @@ private:
       }
 
       if (!kpts_ok) {
-        RCLCPP_WARN_THROTTLE(
-          get_logger(), *get_clock(), 1000,
-          "Skipping class=%s: invalid/low-score keypoints",
-          cid.c_str());
+        if (publish_other_debug_messages_) {
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 1000,
+            "Skipping class=%s: invalid/low-score keypoints",
+            cid.c_str());
+        }
         continue;
       }
 
-      cv::Mat rvec, tvec;
+      cv::Mat rvec, tvec, rvec_alt;
       bool is_large = false;
+      bool has_alt = false;
       double reproj_error = 0.0;
 
-      if (!pnp_.solveKeypoints(corners, rvec, tvec, is_large, &reproj_error, max_reproj_error_)) {
-        RCLCPP_WARN_THROTTLE(
-          get_logger(), *get_clock(), 1000,
-          "PnP FAILED for keypoints class=%s reproj_err=%.2f",
-          cid.c_str(), reproj_error);
+      if (!pnp_.solveKeypoints(corners, rvec, tvec, is_large, &reproj_error,
+                               max_reproj_error_, &rvec_alt, &has_alt)) {
+        if (publish_other_debug_messages_) {
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 1000,
+            "PnP FAILED for keypoints class=%s reproj_err=%.2f",
+            cid.c_str(), reproj_error);
+        }
         continue;
       }
 
       appendArmorFromPnP(
         rvec, tvec, cid, static_cast<double>(det.confidence),
-        is_large, reproj_error, armors);
+        is_large, reproj_error, armors, has_alt ? &rvec_alt : nullptr);
     }
 
     handleArmorMeasurements(msg->header, armors);
@@ -911,10 +1116,12 @@ private:
       bool is_large = false;
 
       if (!pnp_.solve(cx, cy, w, h, cfg_.light_ratio, rvec, tvec, is_large)) {
-        RCLCPP_WARN_THROTTLE(
-          get_logger(), *get_clock(), 1000,
-          "PnP FAILED for bbox (%.0f,%.0f,%.0f,%.0f)",
-          cx, cy, w, h);
+        if (publish_other_debug_messages_) {
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 1000,
+            "PnP FAILED for bbox (%.0f,%.0f,%.0f,%.0f)",
+            cx, cy, w, h);
+        }
         continue;
       }
 
@@ -961,6 +1168,156 @@ private:
     }
 
     return previous + clampAbs(target - previous, max_step);
+  }
+
+  void publishDebugState(
+    const std_msgs::msg::Header & header,
+    const AimResult & aim,
+    bool command_valid,
+    bool holding_last_cmd,
+    bool yaw_locked,
+    bool pitch_locked,
+    double yaw_lock_threshold,
+    double pitch_lock_threshold,
+    double yaw_err_micro,
+    double pitch_err_micro,
+    double yaw_target_micro,
+    double pitch_target_micro,
+    double micro_pitch_for_lock,
+    bool finite_cmd,
+    bool command_locked,
+    bool fire_decision,
+    bool pixels_finite,
+    bool pixels_inside,
+    const std::string & fire_block_reason,
+    double aim_px_x,
+    double aim_px_y,
+    double imp_px_x,
+    double imp_px_y)
+  {
+    if (!debug_state_pub_) {
+      return;
+    }
+
+    auto msg = autoaim::msg::DebugState();
+    msg.header = header;
+
+    const auto state = tracker_->state();
+    msg.state = trackerStateName(state);
+    msg.state_id = static_cast<uint8_t>(state);
+    msg.tracking = aim.tracking;
+    msg.aim_fire = aim.fire;
+    msg.cmd_fire = fire_decision;
+    msg.yaw_locked = yaw_locked;
+    msg.pitch_locked = pitch_locked;
+    msg.command_valid = command_valid;
+    msg.holding = holding_last_cmd;
+
+    msg.yaw_error = yaw_err_micro;
+    msg.yaw_lock_threshold = yaw_lock_threshold;
+    msg.pitch_error = pitch_err_micro;
+    msg.pitch_lock_threshold = pitch_lock_threshold;
+
+    double vyaw = 0.0;
+    const auto & x = tracker_->ekfState();
+    if (x.size() > 7 && std::isfinite(x(7))) {
+      vyaw = x(7);
+    }
+    msg.vyaw = vyaw;
+    msg.vyaw_rpm = vyaw * 60.0 / (2.0 * M_PI);
+
+    const auto & tracker_debug = tracker_->debugInfo();
+    msg.jump_detected = tracker_debug.jump_detected;
+    msg.jump_abs = tracker_debug.jump_abs;
+    msg.jump_dir = tracker_debug.jump_dir;
+    msg.one_face_jump = tracker_debug.one_face_jump;
+    msg.dt_jump = tracker_debug.dt_jump;
+    msg.vyaw_est_from_timing = tracker_debug.vyaw_est_from_timing;
+    msg.vyaw_timing_accepted = tracker_debug.vyaw_timing_accepted;
+    msg.vyaw_confident = tracker_->vyawConfident();
+    msg.phase_confident = tracker_->phaseConfident();
+    msg.consecutive_same_dir_jumps = tracker_->consecutiveSameDirJumps();
+    msg.p_vyaw = tracker_->pVyaw();
+
+    msg.q_pos = tracker_->qPos();  // static now (adaptive q_pos removed)
+    msg.q_yaw = cfg_.q_yaw;
+    msg.faces = static_cast<uint8_t>(std::clamp(aim.faces_checked, 0, 255));
+    msg.phase = aim.phase_error;
+    msg.best_face_idx = aim.best_face_idx;
+    msg.faces_checked = static_cast<uint8_t>(std::clamp(aim.faces_checked, 0, 255));
+    msg.phase_error = aim.phase_error;
+    msg.selected_face_idx = aim.selected_face_idx;
+    msg.face_lookahead_active = aim.face_lookahead_active;
+    msg.face_time_to_window = aim.face_time_to_window;
+    msg.face_margin = aim.face_margin;
+    msg.face_phase_error = aim.face_phase_error;
+    msg.face_switch_reason = aim.face_switch_reason;
+    msg.fire_window = aim.fire_window;
+    msg.flight_time = aim.flight_time;
+    msg.prediction_bias = currentPredictionBias();
+    msg.prediction_time = aim.prediction_time;
+    msg.margin = aim.fire_margin;
+    msg.distance = aim.distance;
+
+    msg.cmd_yaw = yaw_target_micro;
+    msg.cmd_pitch = pitch_target_micro;
+    msg.micro_yaw = micro_yaw_raw_;
+    msg.micro_pitch = micro_pitch_raw_;
+    msg.pitch_raw = micro_pitch_raw_;
+    msg.pitch_lock = micro_pitch_for_lock;
+    msg.pitch_cmd_echo = pitch_cmd_echo_valid_ ? pitch_cmd_echo_ : 0.0;
+    msg.pitch_cmd_echo_valid = pitch_cmd_echo_valid_;
+
+    msg.pixels_valid = pixels_finite;
+    msg.pixels_inside = pixels_inside;
+    msg.aim_px_x = pixels_finite ? static_cast<int32_t>(std::lround(aim_px_x)) : 0;
+    msg.aim_px_y = pixels_finite ? static_cast<int32_t>(std::lround(aim_px_y)) : 0;
+    msg.impact_px_x = pixels_finite ? static_cast<int32_t>(std::lround(imp_px_x)) : 0;
+    msg.impact_px_y = pixels_finite ? static_cast<int32_t>(std::lround(imp_px_y)) : 0;
+
+    msg.radius = tracker_->radius();
+    msg.dz = tracker_->dz();
+
+    msg.matched = tracker_debug.matched;
+    msg.mahalanobis = tracker_debug.mahalanobis;
+    msg.matched_face_idx = tracker_debug.matched_face_idx;
+    msg.association_mahalanobis = tracker_debug.association_mahalanobis;
+    msg.association_yaw_valid = tracker_debug.association_yaw_valid;
+    msg.association_yaw_hypothesis = tracker_debug.association_yaw_hypothesis;
+    msg.last_matched_face_idx = tracker_debug.last_matched_face_idx;
+    msg.face_transition_observed = tracker_debug.face_transition_observed;
+    msg.pd = tracker_debug.pd;
+    msg.yd = tracker_debug.yd;
+    msg.oblique = tracker_debug.oblique;
+    msg.det_yaw = tracker_debug.det_yaw;
+    msg.state_yaw = tracker_debug.state_yaw;
+    msg.yaw_replaced_by_bearing = tracker_debug.yaw_replaced_by_bearing;
+    msg.reproj_error = tracker_debug.reproj_error;
+    msg.selected_class_id = tracker_debug.selected_class_id;
+
+    const bool tracker_tracking = tracker_->fireStatePermits();
+    const bool distance_ok =
+      aim.target_valid &&
+      aim.distance >= cfg_.min_fire_dist &&
+      aim.distance <= cfg_.max_fire_dist;
+    const bool margin_ok = aim.target_valid && aim.fire_margin >= 0.0;
+    const bool pixels_ok = !require_aim_inside_frame_ || pixels_inside;
+
+    msg.fire_block_reason = fire_block_reason;
+    msg.fire_check_aim_tracking = aim.tracking;
+    msg.fire_check_tracker_tracking = tracker_tracking;
+    msg.fire_check_target_valid = aim.target_valid;
+    msg.fire_check_distance_ok = distance_ok;
+    msg.fire_check_margin_ok = margin_ok;
+    msg.fire_check_finite_cmd = finite_cmd;
+    msg.fire_check_pixels_ok = pixels_ok;
+    msg.fire_check_command_valid = command_valid;
+    msg.fire_check_yaw_locked = yaw_locked;
+    msg.fire_check_pitch_locked = pitch_locked;
+    msg.fire_check_command_locked = command_locked;
+    msg.fire_check_not_holding = !holding_last_cmd;
+
+    debug_state_pub_->publish(msg);
   }
 
   void publishCommand(const std_msgs::msg::Header & header, const AimResult & aim)
@@ -1136,23 +1493,22 @@ private:
 
       holding_last_cmd = true;
 
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 500,
-        "Holding last cmd: tracking=%d finite=%d pixels_inside=%d hold=%.2fs yaw=%.3f pitch=%.3f",
-        static_cast<int>(aim.tracking),
-        static_cast<int>(finite_cmd),
-        static_cast<int>(pixels_inside),
-        cmd_hold_time_,
-        yaw_target_micro,
-        pitch_target_micro);
+      if (publish_other_debug_messages_) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 500,
+          "Holding last cmd: tracking=%d finite=%d pixels_inside=%d hold=%.2fs yaw=%.3f pitch=%.3f",
+          static_cast<int>(aim.tracking),
+          static_cast<int>(finite_cmd),
+          static_cast<int>(pixels_inside),
+          cmd_hold_time_,
+          yaw_target_micro,
+          pitch_target_micro);
+      }
     }
 
     // Fire-lock compares what we command with what the micro reports.
-    // micro_pitch_lock_opposite_sign is SEPARATE from micro_pitch_feedback_opposite_sign:
-    // - micro_pitch_feedback_opposite_sign: corrects the geometry/PnP pitch (imu_pitch_)
-    // - micro_pitch_lock_opposite_sign: corrects the lock comparison only
-    // With pitch_sign=-1.0, the geometry flip is already handled. The lock
-    // comparison needs its own independent flag so the two don't fight each other.
+    // feedback_opposite is for geometry/PnP. lock_opposite is for the raw
+    // feedback-vs-command comparison. They may differ on this firmware.
     const double micro_pitch_for_lock =
       micro_pitch_lock_opposite_sign_ ? -micro_pitch_raw_ : micro_pitch_raw_;
 
@@ -1175,9 +1531,17 @@ private:
       }
     }
 
-    const bool command_locked =
-      std::abs(yaw_err_micro) <= fire_lock_yaw_ &&
-      std::abs(pitch_err_micro) <= fire_lock_pitch_;
+    // Range-scaled lock window. Tolerance follows the armor angular half-size
+    // k/range, clamped by explicit min/max limits. fire_lock_yaw/pitch remain
+    // legacy fixed-threshold defaults; fire_lock_max_* are the close-range caps.
+    const double lock_range = std::max(aim.distance, 0.3);
+    const double tol_yaw =
+      std::clamp(fire_lock_k_yaw_ / lock_range, fire_lock_min_, fire_lock_max_yaw_);
+    const double tol_pitch =
+      std::clamp(fire_lock_k_pitch_ / lock_range, fire_lock_min_, fire_lock_max_pitch_);
+    const bool yaw_locked = std::abs(yaw_err_micro) <= tol_yaw;
+    const bool pitch_locked = std::abs(pitch_err_micro) <= tol_pitch;
+    const bool command_locked = yaw_locked && pitch_locked;
 
     bool fire_decision = false;
 
@@ -1206,6 +1570,11 @@ private:
       fire_decision = false;
     }
 
+    const std::string fire_block_reason = fireBlockReason(
+      aim, finite_cmd, command_valid, command_locked,
+      yaw_locked, pitch_locked, holding_last_cmd,
+      pixels_inside, fire_decision);
+
     geometry_msgs::msg::Twist twist;
     twist.angular.x = fire_decision ? 1.0 : 0.0;
     twist.angular.y = pitch_target_micro;
@@ -1213,18 +1582,35 @@ private:
     twist.linear.x = aim.distance;
     twist_pub_->publish(twist);
 
-    RCLCPP_INFO_THROTTLE(
-      get_logger(), *get_clock(), 500,
-      "CMD micro: yaw=%.4f pitch=%.4f | micro raw yaw=%.4f pitch=%.4f | err yaw=%.4f pitch=%.4f | locked=%d fire=%d hold=%d",
-      yaw_target_micro,
-      pitch_target_micro,
-      micro_yaw_raw_,
-      micro_pitch_raw_,
-      yaw_err_micro,
-      pitch_err_micro,
-      static_cast<int>(command_locked),
-      static_cast<int>(fire_decision),
-      static_cast<int>(holding_last_cmd));
+    if (publish_debug_state_) {
+      publishDebugState(
+        header, aim, command_valid, holding_last_cmd,
+        yaw_locked, pitch_locked,
+        tol_yaw, tol_pitch,
+        yaw_err_micro, pitch_err_micro,
+        yaw_target_micro, pitch_target_micro, micro_pitch_for_lock,
+        finite_cmd, command_locked,
+        fire_decision, pixels_finite, pixels_inside,
+        fire_block_reason,
+        aim_px_x, aim_px_y, imp_px_x, imp_px_y);
+    }
+
+    if (publish_other_debug_messages_) {
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 500,
+        "CMD micro: yaw=%.4f pitch=%.4f | micro raw yaw=%.4f pitch=%.4f | "
+        "err yaw=%.4f pitch=%.4f | locked=%d fire=%d hold=%d reason=%s",
+        yaw_target_micro,
+        pitch_target_micro,
+        micro_yaw_raw_,
+        micro_pitch_raw_,
+        yaw_err_micro,
+        pitch_err_micro,
+        static_cast<int>(command_locked),
+        static_cast<int>(fire_decision),
+        static_cast<int>(holding_last_cmd),
+        fire_block_reason.c_str());
+    }
 
     if (aim.tracking && pnp_.ready() && pixels_finite) {
       geometry_msgs::msg::Twist aim_px;
@@ -1388,6 +1774,8 @@ private:
   // These are used for fire-lock/deadband checks in the same convention as /cmd_vel_AI.
   double micro_yaw_raw_ = 0.0;
   double micro_pitch_raw_ = 0.0;
+  double pitch_cmd_echo_ = 0.0;
+  bool pitch_cmd_echo_valid_ = false;
 
   tf2::Quaternion imu_rotation_{0, 0, 0, 1};
   tf2::Vector3 imu_translation_{0, 0, 0};
@@ -1408,6 +1796,11 @@ private:
   double cmd_rate_limit_pitch_ = 2.0;
   double fire_lock_yaw_ = 0.025;
   double fire_lock_pitch_ = 0.025;
+  double fire_lock_k_yaw_ = 0.0675;
+  double fire_lock_k_pitch_ = 0.0625;
+  double fire_lock_min_ = 0.015;
+  double fire_lock_max_yaw_ = 0.05;
+  double fire_lock_max_pitch_ = 0.04;
   double cmd_hold_time_ = 0.25;
   double cmd_max_delta_yaw_ = 0.35;
   double cmd_max_delta_pitch_ = 0.25;
@@ -1467,6 +1860,8 @@ private:
   std::string keypoint_topic_ = "/detector/armors_keypoints";
   double min_keypoint_score_ = 0.05;
   double max_reproj_error_ = 25.0;
+  bool publish_debug_state_ = true;
+  bool publish_other_debug_messages_ = true;
 
   rclcpp::Subscription<autoaim::msg::ArmorKeypointArray>::SharedPtr kpt_sub_;
   rclcpp::Subscription<vision_msgs::msg::Detection2DArray>::SharedPtr det_sub_;
@@ -1476,6 +1871,7 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr twist_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr aim_px_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
+  rclcpp::Publisher<autoaim::msg::DebugState>::SharedPtr debug_state_pub_;
 
   double cam_fx_ = 700.0;
   double cam_fy_ = 700.0;

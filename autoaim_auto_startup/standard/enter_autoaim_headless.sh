@@ -16,6 +16,10 @@ exec docker exec -it \
   -w "$WORKDIR" \
   "$CONTAINER" \
   bash -lc '
+    # Keep the manual shell in the same ROS 2 graph as the auto-started launch.
+    export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-12}"
+    echo "[autoaim] ROS_DOMAIN_ID=$ROS_DOMAIN_ID"
+
     cd /workspaces/isaac_ros-dev
     source /opt/ros/humble/setup.bash
     source install/setup.bash

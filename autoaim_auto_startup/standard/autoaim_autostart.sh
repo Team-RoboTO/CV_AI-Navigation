@@ -34,6 +34,17 @@ CAMERA_INFO_MESSAGES=3
 FIRST_HEALTH_ATTEMPTS=8
 TOPIC_TIMEOUT_SEC=8
 
+# ROS 2 graph isolation.
+# Every robot on the same Wi-Fi must use a different ROS_DOMAIN_ID to avoid
+# topic/service/action collisions with identical names such as /cmd_vel_AI,
+# /micro_status, /camera_info, /detector/armors, etc.
+#
+# Suggested team convention:
+#   Hero     -> 11
+#   Standard -> 12
+#   Sentry   -> 0
+ROS_DOMAIN_ID="12"
+
 log() {
   echo "[autoaim] $*"
 }
@@ -108,10 +119,13 @@ docker ps --filter "name=$CONTAINER"
 log "launching ROS and checking ${HEALTH_TOPIC}..."
 
 exec docker exec -i \
+  -e ROS_DOMAIN_ID="$ROS_DOMAIN_ID" \
   -w "$WORKDIR" \
   "$CONTAINER" \
   bash -s -- "$LAUNCH_PKG" "$LAUNCH_FILE" "$HEALTH_TOPIC" "$CAMERA" "$WORKDIR" "$SYMLINK_TARGET_WS" "$CAMERA_INFO_MESSAGES" "$FIRST_HEALTH_ATTEMPTS" "$TOPIC_TIMEOUT_SEC" <<'INSIDE_CONTAINER'
 set -eo pipefail
+ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-12}"
+export ROS_DOMAIN_ID
 
 LAUNCH_PKG="$1"
 LAUNCH_FILE="$2"
@@ -147,6 +161,7 @@ set -u
 
 log "inside container"
 log "pwd=$(pwd)"
+log "ROS_DOMAIN_ID=$ROS_DOMAIN_ID"
 log "package=$LAUNCH_PKG"
 log "launch=$LAUNCH_FILE"
 log "camera=$CAMERA"

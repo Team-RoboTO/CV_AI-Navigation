@@ -35,42 +35,84 @@ void PnPSolver::init(const std::array<double, 9> & K, const std::vector<double> 
 double PnPSolver::solveWithModel(
   const std::vector<cv::Point3f> & obj_pts,
   const std::vector<cv::Point2f> & img_pts,
-  cv::Mat & rvec, cv::Mat & tvec) const
+  cv::Mat & rvec, cv::Mat & tvec,
+  cv::Mat * rvec_alt, bool * has_alt) const
 {
+  if (has_alt) {
+    *has_alt = false;
+  }
   if (!ready_ || img_pts.size() != 4 || obj_pts.size() != 4) return 1e9;
 
-  // IPPE is designed for planar targets and is usually more stable for armor plates.
-  // However it can fail on degenerate keypoint configurations (near-collinear points,
-  // very small image area, partial occlusion, motion blur). When IPPE fails we fall
-  // back to SOLVEPNP_ITERATIVE, which is more permissive but less accurate.
-  // This costs at most one extra solver call per failure (~1 ms) and only on the
-  // problematic frames, while greatly improving robustness at close range and
-  // oblique viewing angles.
-  bool ok = cv::solvePnP(obj_pts, img_pts, K_, dist_, rvec, tvec,
-                         false, cv::SOLVEPNP_IPPE);
-  if (!ok) {
-    // Reset output mats — solvePnP may have written partial data.
-    rvec = cv::Mat();
-    tvec = cv::Mat();
-    ok = cv::solvePnP(obj_pts, img_pts, K_, dist_, rvec, tvec,
-                      false, cv::SOLVEPNP_ITERATIVE);
-    if (!ok) return 1e9;
+  // Mean per-corner reprojection error [px] for one candidate pose.
+  auto reproj_of = [&](const cv::Mat & rv, const cv::Mat & tv) -> double {
+    std::vector<cv::Point2f> proj;
+    cv::projectPoints(obj_pts, rv, tv, K_, dist_, proj);
+    double sum = 0.0;
+    for (size_t i = 0; i < img_pts.size(); ++i) {
+      sum += cv::norm(proj[i] - img_pts[i]);
+    }
+    return sum / static_cast<double>(img_pts.size());
+  };
+
+  // IPPE is designed for planar targets and returns BOTH pose solutions of the
+  // planar ambiguity (their yaw differs; position is ~identical). We keep the
+  // best by reprojection error and expose the runner-up's rotation so the
+  // tracker can disambiguate the yaw temporally. solvePnPGeneric can throw on
+  // degenerate inputs — fall back to the single-solution ITERATIVE solver then.
+  std::vector<cv::Mat> rvecs, tvecs;
+  int n = 0;
+  try {
+    n = cv::solvePnPGeneric(obj_pts, img_pts, K_, dist_, rvecs, tvecs,
+                            false, cv::SOLVEPNP_IPPE);
+  } catch (const cv::Exception &) {
+    n = 0;
   }
 
-  std::vector<cv::Point2f> proj;
-  cv::projectPoints(obj_pts, rvec, tvec, K_, dist_, proj);
-  double sum = 0.0;
-  for (size_t i = 0; i < img_pts.size(); ++i) {
-    sum += cv::norm(proj[i] - img_pts[i]);
+  if (n <= 0 || rvecs.empty() || tvecs.empty()) {
+    cv::Mat rv, tv;
+    if (!cv::solvePnP(obj_pts, img_pts, K_, dist_, rv, tv,
+                      false, cv::SOLVEPNP_ITERATIVE)) {
+      return 1e9;
+    }
+    rvec = rv;
+    tvec = tv;
+    return reproj_of(rv, tv);  // single solution → no alternate yaw
   }
-  return sum / static_cast<double>(img_pts.size());
+
+  // Rank solutions: best (lowest reprojection error) + runner-up.
+  int best_i = 0;
+  double best_e = reproj_of(rvecs[0], tvecs[0]);
+  int alt_i = -1;
+  double alt_e = 1e9;
+  for (int i = 1; i < n; ++i) {
+    const double e = reproj_of(rvecs[i], tvecs[i]);
+    if (e < best_e) {
+      alt_i = best_i; alt_e = best_e;
+      best_i = i; best_e = e;
+    } else if (e < alt_e) {
+      alt_i = i; alt_e = e;
+    }
+  }
+
+  rvec = rvecs[best_i];
+  tvec = tvecs[best_i];
+  if (rvec_alt && has_alt && alt_i >= 0) {
+    *rvec_alt = rvecs[alt_i];
+    *has_alt = true;
+  }
+  return best_e;
 }
 
 bool PnPSolver::solveKeypoints(
   const std::array<cv::Point2f, 4> & corners_tl_tr_br_bl,
   cv::Mat & rvec, cv::Mat & tvec, bool & is_large,
-  double * reproj_error, double max_reproj_error) const
+  double * reproj_error, double max_reproj_error,
+  cv::Mat * rvec_alt, bool * has_alt) const
 {
+  if (has_alt) {
+    *has_alt = false;
+  }
+
   const std::vector<cv::Point2f> img_pts = {
     corners_tl_tr_br_bl[0],  // TL
     corners_tl_tr_br_bl[1],  // TR
@@ -79,8 +121,12 @@ bool PnPSolver::solveKeypoints(
   };
 
   cv::Mat rv_s, tv_s, rv_l, tv_l;
-  const double err_s = solveWithModel(pts_small_tl_tr_br_bl_, img_pts, rv_s, tv_s);
-  const double err_l = solveWithModel(pts_large_tl_tr_br_bl_, img_pts, rv_l, tv_l);
+  cv::Mat rv_s_alt, rv_l_alt;
+  bool alt_s = false, alt_l = false;
+  const double err_s =
+    solveWithModel(pts_small_tl_tr_br_bl_, img_pts, rv_s, tv_s, &rv_s_alt, &alt_s);
+  const double err_l =
+    solveWithModel(pts_large_tl_tr_br_bl_, img_pts, rv_l, tv_l, &rv_l_alt, &alt_l);
 
   if (err_s > 1e8 && err_l > 1e8) return false;
 
@@ -92,10 +138,12 @@ bool PnPSolver::solveKeypoints(
     rvec = rv_s;
     tvec = tv_s;
     is_large = false;
+    if (rvec_alt && has_alt && alt_s) { *rvec_alt = rv_s_alt; *has_alt = true; }
   } else {
     rvec = rv_l;
     tvec = tv_l;
     is_large = true;
+    if (rvec_alt && has_alt && alt_l) { *rvec_alt = rv_l_alt; *has_alt = true; }
   }
 
   return err <= max_reproj_error;

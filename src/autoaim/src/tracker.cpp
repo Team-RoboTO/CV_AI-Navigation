@@ -27,7 +27,9 @@
 #include "autoaim/tracker.hpp"
 #include <angles/angles.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <limits>
 
 namespace autoaim
 {
@@ -79,7 +81,10 @@ void Tracker::ekfPredict(double dt)
   F(4,5) = b*dt; F(5,5) = b;
   F(6,7) = a*dt; F(7,7) = a;
 
-  // Process noise Q (continuous white-noise acceleration model)
+  // Process noise Q: discrete white-noise acceleration model. STATIC q_pos for
+  // all center axes (xc, yc, za) and STATIC q_yaw for the spin. The old online
+  // q_pos adaptation was removed (it amplified yaw/PnP model error into the
+  // center estimate and caused lead overshoot).
   Eigen::MatrixXd Q = Eigen::MatrixXd::Zero(9, 9);
   double t = dt;
   auto block = [&](int i, double s2) {
@@ -105,120 +110,166 @@ void Tracker::ekfPredict(double dt)
   }
 }
 
-// =========================================================================
-// EKF UPDATE — fuse measurement z = [xa, ya, za, yaw].
-//
-// Observation model h(x):
-//   xa = xc - r * cos(yaw)     (armor is offset from center by radius)
-//   ya = yc - r * sin(yaw)
-//   za = za                    (pass-through)
-//   yaw = yaw                  (pass-through)
-//
-// Measurement noise R is DYNAMIC:
-//   - Position noise grows with range (PnP less accurate far away)
-//   - Yaw noise explodes at oblique angles (edge-on armor = bad PnP)
-// =========================================================================
-Eigen::VectorXd Tracker::ekfUpdate(const Eigen::Vector4d & z)
+FacePrediction Tracker::predictFace(const Eigen::VectorXd & x, int face_idx, double t) const
 {
-  double yaw = x_(6), r = x_(8);
+  FacePrediction face;
+  const int idx = ((face_idx % 4) + 4) % 4;
+  const double offset = idx * M_PI / 2.0;
+  const bool odd_face = (idx % 2) == 1;
+  const double radius = odd_face ? other_radius_ : x(8);
+  const double z_offset = odd_face ? dz_ : 0.0;
+  const double theta = x(6) + x(7) * t + offset;
 
-  // H: Jacobian of h(x)
-  Eigen::MatrixXd H = Eigen::MatrixXd::Zero(4, 9);
-  H(0,0) = 1;  H(0,6) =  r*sin(yaw);  H(0,8) = -cos(yaw);
-  H(1,2) = 1;  H(1,6) = -r*cos(yaw);  H(1,8) = -sin(yaw);
-  H(2,4) = 1;
-  H(3,6) = 1;
+  face.idx = idx;
+  face.yaw = theta;
+  face.radius = radius;
+  face.z_offset = z_offset;
+  face.position = Eigen::Vector3d(
+    x(0) + x(1) * t - radius * std::cos(theta),
+    x(2) + x(3) * t - radius * std::sin(theta),
+    x(4) + x(5) * t + z_offset);
+  return face;
+}
 
-  // R: range-dependent + obliquity-dependent noise.
-  // Range and bearing must be relative to the camera/robot, not the world origin,
-  // otherwise once ego-motion is active the noise scaling and obliquity decision
-  // are based on the wrong geometry.
-  double zdx = z(0) - ego_x_;
-  double zdy = z(1) - ego_y_;
-  double zdz = z(2) - cfg_.gimbal_height;
-  double dist = std::sqrt(zdx*zdx + zdy*zdy + zdz*zdz);
-  double ps = cfg_.r_pos_base + cfg_.r_pos_slope * dist;
-  double ys = cfg_.r_yaw_base + cfg_.r_yaw_slope * dist;
-  double xyz_f = 1.0, yaw_f = 1.0;
-  if (zdx*zdx + zdy*zdy > 0.01) {
-    double bearing = std::atan2(zdy, zdx);
-    double face_a = std::abs(angles::shortest_angular_distance(z(3), bearing));
-    double cf = std::cos(face_a);
-    xyz_f = 1.0 / std::max(cf*cf, 0.04);
+Eigen::Matrix4d Tracker::measurementNoise(
+  const ArmorDetection & det,
+  double face_yaw,
+  bool yaw_valid) const
+{
+  const double rel_range = det.range() > 1e-6 ?
+    det.range() :
+    std::sqrt(
+      std::pow(det.x - ego_x_, 2) +
+      std::pow(det.y - ego_y_, 2) +
+      std::pow(det.z - cfg_.gimbal_height, 2));
+  const double ps = cfg_.r_pos_base + cfg_.r_pos_slope * rel_range;
+  const double ys = cfg_.r_yaw_base + cfg_.r_yaw_slope * rel_range;
+
+  double xyz_f = 1.0;
+  double yaw_f = 1.0;
+  const double dx = det.x - ego_x_;
+  const double dy = det.y - ego_y_;
+  if (dx * dx + dy * dy > 0.01) {
+    const double bearing = std::atan2(dy, dx);
+    const double face_a =
+      std::abs(angles::shortest_angular_distance(face_yaw, bearing));
+    const double cf = std::cos(face_a);
+    xyz_f = 1.0 / std::max(cf * cf, 0.04);
     yaw_f = 1.0 / std::max(std::pow(std::abs(cf), 4.0), 1e-4);
-    if (face_a > cfg_.max_oblique_deg * M_PI / 180.0)
-      yaw_f = 1e6;  // ignore yaw when armor is edge-on
+    if (face_a > cfg_.max_oblique_deg * M_PI / 180.0) {
+      yaw_f = 1e6;
+    }
   }
+
   Eigen::Matrix4d R = Eigen::Matrix4d::Zero();
-  R(0,0) = R(1,1) = R(2,2) = ps*ps*xyz_f;
-  R(3,3) = ys*ys*yaw_f;
+  R(0, 0) = R(1, 1) = R(2, 2) = ps * ps * xyz_f;
+  R(3, 3) = yaw_valid ? ys * ys * yaw_f : 1e6;
+  return R;
+}
 
-  // Innovation
-  Eigen::Vector4d z_pred;
-  z_pred << x_(0) - r*cos(yaw), x_(2) - r*sin(yaw), x_(4), yaw;
-  Eigen::Vector4d y = z - z_pred;
+Eigen::VectorXd Tracker::ekfUpdateFace(
+  const ArmorDetection & det,
+  int face_idx,
+  double yaw_meas,
+  bool yaw_valid)
+{
+  if (!std::isfinite(det.x) || !std::isfinite(det.y) || !std::isfinite(det.z)) {
+    return x_;
+  }
 
-  // Kalman gain via LDLT (numerically stable)
-  Eigen::Matrix4d S = H * P_ * H.transpose() + R;
+  const int idx = ((face_idx % 4) + 4) % 4;
+  const bool odd_face = (idx % 2) == 1;
+  const FacePrediction face = predictFace(x_, idx, 0.0);
+  const double theta = face.yaw;
+  const double r = face.radius;
+
+  Eigen::Matrix<double, 4, 9> H = Eigen::Matrix<double, 4, 9>::Zero();
+  H(0, 0) = 1.0;
+  H(0, 6) = r * std::sin(theta);
+  H(1, 2) = 1.0;
+  H(1, 6) = -r * std::cos(theta);
+  H(2, 4) = 1.0;
+  if (!odd_face) {
+    H(0, 8) = -std::cos(theta);
+    H(1, 8) = -std::sin(theta);
+  }
+  if (yaw_valid) {
+    H(3, 6) = 1.0;
+  }
+
+  const Eigen::Matrix4d R =
+    measurementNoise(det, yaw_valid ? yaw_meas : face.yaw, yaw_valid);
+  Eigen::Vector4d innovation;
+  innovation << det.x - face.position.x(),
+    det.y - face.position.y(),
+    det.z - face.position.z(),
+    yaw_valid ? angles::shortest_angular_distance(face.yaw, yaw_meas) : 0.0;
+
+  const Eigen::Matrix4d S = H * P_ * H.transpose() + R;
   Eigen::LDLT<Eigen::Matrix4d> S_ldlt(S);
-  if (S_ldlt.info() != Eigen::Success || !S_ldlt.isPositive()) return x_;
+  if (S_ldlt.info() != Eigen::Success || !S_ldlt.isPositive()) {
+    return x_;
+  }
 
-  Eigen::MatrixXd K = S_ldlt.solve(H * P_.transpose()).transpose();
-  x_ = x_ + K * y;
+  const Eigen::Matrix<double, 9, 4> K =
+    S_ldlt.solve(H * P_.transpose()).transpose();
+  x_ = x_ + K * innovation;
 
-  // Joseph form for P (guarantees positive semi-definite)
-  Eigen::MatrixXd IKH = Eigen::MatrixXd::Identity(9,9) - K * H;
+  const Eigen::MatrixXd IKH = Eigen::MatrixXd::Identity(9, 9) - K * H;
   P_ = IKH * P_ * IKH.transpose() + K * R * K.transpose();
   P_ = (P_ + P_.transpose()) * 0.5;
   return x_;
 }
 
-double Tracker::ekfMahalanobis(const Eigen::Vector4d & z) const
+double Tracker::ekfMahalanobisFace(
+  const ArmorDetection & det,
+  int face_idx,
+  double yaw_meas,
+  bool yaw_valid) const
 {
-  if (!z.allFinite()) return 1e9;
-  double yaw = x_(6), r = x_(8);
-  Eigen::MatrixXd H = Eigen::MatrixXd::Zero(4,9);
-  H(0,0)=1; H(0,6)=r*sin(yaw); H(0,8)=-cos(yaw);
-  H(1,2)=1; H(1,6)=-r*cos(yaw); H(1,8)=-sin(yaw);
-  H(2,4)=1; H(3,6)=1;
-  // Range used for noise scaling must be camera-relative, same as ekfUpdate.
-  double zdx = z(0) - ego_x_;
-  double zdy = z(1) - ego_y_;
-  double zdz = z(2) - cfg_.gimbal_height;
-  double d = std::sqrt(zdx*zdx + zdy*zdy + zdz*zdz);
-  double ps = cfg_.r_pos_base + cfg_.r_pos_slope*d;
-  double ys = cfg_.r_yaw_base + cfg_.r_yaw_slope*d;
-  // CRITICAL FIX: the gate must use the SAME obliquity-inflated R as ekfUpdate.
-  // Without the inflation, a slightly oblique plate (very common: a stationary
-  // enemy rarely faces you perfectly) has its noisy yaw measurement judged
-  // against an unrealistically small variance -> Mahalanobis blows past the
-  // threshold -> detection rejected -> TRACKING flickers to TEMP_LOST ->
-  // aim.fire (which requires TRACKING) stutters on a perfectly visible target.
-  // (Raising maha_threshold to 16.9 only papered over this; the gate noise
-  // model itself was inconsistent with the update.)
-  double xyz_f = 1.0, yaw_f = 1.0;
-  if (zdx*zdx + zdy*zdy > 0.01) {
-    double bearing = std::atan2(zdy, zdx);
-    double face_a = std::abs(angles::shortest_angular_distance(z(3), bearing));
-    double cf = std::cos(face_a);
-    xyz_f = 1.0 / std::max(cf*cf, 0.04);
-    yaw_f = 1.0 / std::max(std::pow(std::abs(cf), 4.0), 1e-4);
-    if (face_a > cfg_.max_oblique_deg * M_PI / 180.0)
-      yaw_f = 1e6;
+  if (!std::isfinite(det.x) || !std::isfinite(det.y) || !std::isfinite(det.z)) {
+    return 1e9;
   }
-  Eigen::Matrix4d R = Eigen::Matrix4d::Zero();
-  R(0,0)=R(1,1)=R(2,2)=ps*ps*xyz_f; R(3,3)=ys*ys*yaw_f;
-  Eigen::Vector4d zp; zp << x_(0)-r*cos(yaw), x_(2)-r*sin(yaw), x_(4), yaw;
-  Eigen::Vector4d y = z - zp;
-  Eigen::Matrix4d S = H*P_*H.transpose()+R;
-  Eigen::LDLT<Eigen::Matrix4d> Sl(S);
-  if (Sl.info()!=Eigen::Success) return 1e9;
-  return (y.transpose()*Sl.solve(y)).value();
+
+  const int idx = ((face_idx % 4) + 4) % 4;
+  const bool odd_face = (idx % 2) == 1;
+  const FacePrediction face = predictFace(x_, idx, 0.0);
+  const double theta = face.yaw;
+  const double r = face.radius;
+
+  Eigen::Matrix<double, 4, 9> H = Eigen::Matrix<double, 4, 9>::Zero();
+  H(0, 0) = 1.0;
+  H(0, 6) = r * std::sin(theta);
+  H(1, 2) = 1.0;
+  H(1, 6) = -r * std::cos(theta);
+  H(2, 4) = 1.0;
+  if (!odd_face) {
+    H(0, 8) = -std::cos(theta);
+    H(1, 8) = -std::sin(theta);
+  }
+  if (yaw_valid) {
+    H(3, 6) = 1.0;
+  }
+
+  const Eigen::Matrix4d R =
+    measurementNoise(det, yaw_valid ? yaw_meas : face.yaw, yaw_valid);
+  Eigen::Vector4d innovation;
+  innovation << det.x - face.position.x(),
+    det.y - face.position.y(),
+    det.z - face.position.z(),
+    yaw_valid ? angles::shortest_angular_distance(face.yaw, yaw_meas) : 0.0;
+
+  const Eigen::Matrix4d S = H * P_ * H.transpose() + R;
+  Eigen::LDLT<Eigen::Matrix4d> S_ldlt(S);
+  if (S_ldlt.info() != Eigen::Success) {
+    return 1e9;
+  }
+  return (innovation.transpose() * S_ldlt.solve(innovation)).value();
 }
 
 Eigen::Vector3d Tracker::armorFromState(const Eigen::VectorXd & x) const
 {
-  return {x(0)-x(8)*cos(x(6)), x(2)-x(8)*sin(x(6)), x(4)};
+  return predictFace(x, 0, 0.0).position;
 }
 
 double Tracker::unwrapYaw(double raw_yaw)
@@ -241,22 +292,102 @@ double Tracker::targetRange() const
   return std::sqrt(dx*dx + dy*dy + dz*dz);
 }
 
+bool Tracker::fireStatePermits() const
+{
+  if (state_ == TRACKING) {
+    return true;
+  }
+
+  return
+    state_ == TEMP_LOST &&
+    cfg_.fire_in_temp_lost &&
+    lost_count_ <= cfg_.temp_lost_fire_max &&
+    phaseConfident();
+}
+
+bool Tracker::phaseConfident() const
+{
+  if (std::abs(x_(7)) < cfg_.face_lookahead_min_vyaw) {
+    return true;
+  }
+  return phase_timing_confident_;
+}
+
+Tracker::AssociationHypothesis Tracker::associateDetections(
+  const std::vector<ArmorDetection> & detections) const
+{
+  AssociationHypothesis best;
+
+  struct YawHypothesis
+  {
+    double yaw = 0.0;
+    bool valid = false;
+    int id = -1;
+  };
+
+  for (const auto & det : detections) {
+    if (det.class_id != target_id_) {
+      continue;
+    }
+
+    std::array<YawHypothesis, 3> yaw_hypotheses{};
+    int yaw_count = 0;
+    if (det.yaw_replaced_by_bearing) {
+      yaw_hypotheses[yaw_count++] = YawHypothesis{0.0, false, -1};
+    } else {
+      yaw_hypotheses[yaw_count++] = YawHypothesis{det.yaw, true, 0};
+      if (det.has_yaw_alt && !det.yaw_replaced_by_bearing_alt) {
+        yaw_hypotheses[yaw_count++] = YawHypothesis{det.yaw_alt, true, 1};
+      }
+    }
+
+    for (int face_idx = 0; face_idx < 4; ++face_idx) {
+      const FacePrediction face = predictFace(x_, face_idx, 0.0);
+      const Eigen::Vector3d det_pos(det.x, det.y, det.z);
+      const double position_error = (det_pos - face.position).norm();
+
+      for (int yi = 0; yi < yaw_count; ++yi) {
+        const auto & yh = yaw_hypotheses[yi];
+        const double yaw_meas = yh.valid ?
+          face.yaw + angles::shortest_angular_distance(face.yaw, yh.yaw) :
+          face.yaw;
+        const double yaw_error = yh.valid ?
+          std::abs(angles::shortest_angular_distance(face.yaw, yaw_meas)) :
+          std::numeric_limits<double>::infinity();
+        const double m =
+          ekfMahalanobisFace(det, face_idx, yaw_meas, yh.valid);
+
+        if (!best.valid ||
+            m < best.mahalanobis ||
+            (std::abs(m - best.mahalanobis) < 1e-6 &&
+             position_error < best.position_error))
+        {
+          best.valid = true;
+          best.det = &det;
+          best.face_idx = face_idx;
+          best.yaw_meas = yaw_meas;
+          best.yaw_valid = yh.valid;
+          best.yaw_hypothesis = yh.id;
+          best.mahalanobis = m;
+          best.position_error = position_error;
+          best.yaw_error = yaw_error;
+        }
+      }
+    }
+  }
+
+  return best;
+}
+
 void Tracker::initFromDetection(const ArmorDetection & det)
 {
   last_yaw_ = 0;
+  last_aim_face_idx_ = 0;
   double yaw = unwrapYaw(det.yaw);
   double r = cfg_.initial_radius;
   radius_ = r;  other_radius_ = r;
-  // Seed dz_ from the known physical step between armor pairs.
-  // If initial_dz is 0 (default) the behavior is unchanged.
-  // If set to e.g. 0.05, faces 1 and 3 immediately get +5cm z offset
-  // so the aim is correct from the first frame even before a face jump.
-  if (cfg_.initial_dz != 0.0) {
-    dz_ = cfg_.initial_dz;
-    dz_initialized_ = true;
-  } else {
-    dz_ = 0;  dz_initialized_ = false;
-  }
+  dz_ = cfg_.initial_dz;
+  dz_initialized_ = std::abs(dz_) > 1e-6;
   x_ = Eigen::VectorXd::Zero(9);
   x_ << det.x+r*cos(yaw), 0, det.y+r*sin(yaw), 0, det.z, 0, yaw, 0, r;
   P_ = P0_;
@@ -268,6 +399,11 @@ void Tracker::initFromDetection(const ArmorDetection & det)
   last_jump_time_valid_ = false;
   last_jump_dir_ = 0.0;
   consecutive_same_dir_jumps_ = 0;
+  last_vyaw_timing_est_ = 0.0;
+  last_matched_face_idx_ = 0;
+  last_face_assoc_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+  last_face_assoc_time_valid_ = false;
+  phase_timing_confident_ = false;
 }
 
 // =========================================================================
@@ -325,14 +461,14 @@ bool Tracker::shouldSwitch(const ArmorDetection & candidate) const
     return new_range < cur_range * cfg_.switch_range_ratio;
   }
 
-  // ── Same class. Decide identity by spatial proximity. ──
-  // Predict where the current target's visible face is right now and compare
-  // to the candidate's measured position.
-  Eigen::Vector3d pred = armorFromState(x_);
-  double dx = candidate.x - pred(0);
-  double dy = candidate.y - pred(1);
-  double dz = candidate.z - pred(2);
-  double spatial_dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+  // ── Same class. Decide identity by nearest predicted face. ──
+  // A different armor face on the same robot is still the same physical target.
+  double spatial_dist = std::numeric_limits<double>::infinity();
+  const Eigen::Vector3d candidate_pos(candidate.x, candidate.y, candidate.z);
+  for (int face_idx = 0; face_idx < 4; ++face_idx) {
+    const Eigen::Vector3d pred = predictFace(x_, face_idx, 0.0).position;
+    spatial_dist = std::min(spatial_dist, (candidate_pos - pred).norm());
+  }
 
   // If within identity threshold → same physical robot, no switch.
   // The threshold is a hyperparameter; same_target_identity_dist in cfg.
@@ -360,149 +496,134 @@ bool Tracker::shouldSwitch(const ArmorDetection & candidate) const
 }
 
 // =========================================================================
-// ARMOR JUMP — robot rotated, a different face is now visible.
-// Snap yaw, swap radii if pair switch, check for divergence.
+// FACE TRANSITION OBSERVER — spin timing only, never EKF ownership.
 // =========================================================================
-void Tracker::handleArmorJump(const ArmorDetection & det, const rclcpp::Time & now)
+void Tracker::observeFaceAssociation(
+  int matched_face_idx,
+  const ArmorDetection & det,
+  const rclcpp::Time & now,
+  bool yaw_valid)
 {
-  double yaw = unwrapYaw(det.yaw);
-  double jump = angles::shortest_angular_distance(x_(6), yaw);
-  double jump_dir = (jump > 0) ? 1.0 : -1.0;
-  const double jump_abs = std::abs(jump);
-  // The timing formula below assumes this is a ONE-face (~90°) jump. A ~180°
-  // wrap (a face was skipped: occlusion, missed frames) would make
-  // (π/2)/dt_jump report HALF the true spin rate and corrupt x_(7) with an
-  // 80-100% blend. Only feed the timing estimator with 90°-ish jumps.
-  const bool one_face_jump = (jump_abs > M_PI/4 && jump_abs < 3*M_PI/4);
+  debug_info_.last_matched_face_idx = last_matched_face_idx_;
 
-  // ── Spin rate from timing ────────────────────────────────────────────────
-  // The most reliable way to estimate vyaw is from the time between consecutive
-  // 90° face jumps. At 300 RPM a 90° jump takes exactly π/(2*vyaw) = 50ms.
-  // This converges in 2 jumps (~100ms) vs 10-20 EKF frames for normal estimation.
-  // Only activate after 2 same-direction jumps to avoid noise and spin reversals.
-  if (cfg_.use_vyaw_from_timing && last_jump_time_valid_ && one_face_jump) {
-    double dt_jump = (now - last_jump_time_).seconds();
-    bool same_dir = (jump_dir * last_jump_dir_ > 0);
-
-    if (same_dir && dt_jump >= cfg_.vyaw_timing_min_dt &&
-        dt_jump <= cfg_.vyaw_timing_max_dt)
-    {
-      consecutive_same_dir_jumps_++;
-      if (consecutive_same_dir_jumps_ >= 1) {
-        // Direct estimate: each face is π/2 apart, so vyaw = (π/2) / dt
-        double vyaw_est = (M_PI / 2.0) / dt_jump * jump_dir;
-        // Blend with current EKF estimate: trust timing heavily (80%) after
-        // the first confirmation, fully (100%) after the second.
-        double blend = (consecutive_same_dir_jumps_ >= 2) ? 1.0 : 0.80;
-        x_(7) = blend * vyaw_est + (1.0 - blend) * x_(7);
-        // Tighten vyaw covariance — we have a direct measurement now
-        P_(7,7) = std::min(P_(7,7), 1.0);
-      }
-    } else if (!same_dir) {
-      // Direction reversal: robot changed spin direction or this is noise.
-      // Reset the counter but keep the last jump time.
-      consecutive_same_dir_jumps_ = 0;
-    }
+  if (matched_face_idx < 0) {
+    return;
   }
-  last_jump_time_ = now;
-  last_jump_time_valid_ = true;
-  last_jump_dir_ = jump_dir;
 
-  // Spin reversal: if jump opposes estimated spin and timing didn't just
-  // correct it, zero vyaw to avoid runaway prediction.
-  if (std::abs(x_(7)) > 0.2 && jump * x_(7) < 0 &&
-      consecutive_same_dir_jumps_ == 0) {
-    x_(7) = 0;
+  if (last_matched_face_idx_ < 0) {
+    last_matched_face_idx_ = matched_face_idx;
+    last_face_assoc_time_ = now;
+    last_face_assoc_time_valid_ = true;
+    return;
   }
-  x_(6) = yaw;
 
-  // 90° jump = pair switch (different radius and height)
-  double ja = std::abs(jump);
-  if (ja > M_PI/4 && ja < 3*M_PI/4) {
-    // Height step between pairs.
-    // The sign flip (dz_ = -dz_) was unreliable: x_(4) at jump time is the
-    // z of the face we just LEFT, not the true center, so new_dz was measured
-    // from the wrong reference. Over multiple jumps the sign flip + noisy EMA
-    // would corrupt dz_ away from the physical value within 2-3 seconds.
-    //
-    // New approach:
-    //   1. Compute the raw height step from this jump: step = x_(4) - det.z
-    //   2. Use the ABSOLUTE value for the EMA — the sign is handled separately
-    //      by tracking which face index is "high" vs "low".
-    //   3. After the EMA update, restore the sign based on whether we jumped
-    //      UP (new face is higher → dz_ positive) or DOWN (→ negative).
-    //   4. If initial_dz was seeded, protect it: only update if the new
-    //      measurement agrees in sign with the seed.
-    double raw_step = x_(4) - det.z;  // positive = we jumped DOWN to a lower face
-    double abs_step = std::abs(raw_step);
+  int raw_step = (matched_face_idx - last_matched_face_idx_ + 4) % 4;
+  int face_step = raw_step;
+  if (face_step == 3) {
+    face_step = -1;
+  }
+  const bool transition = face_step != 0;
+  debug_info_.face_transition_observed = transition;
 
-    if (!dz_initialized_) {
-      // First jump: take the measurement directly
-      dz_ = raw_step;
-      dz_initialized_ = true;
-    } else {
-      // Subsequent jumps: EMA on absolute magnitude, preserve sign from measurement
-      // Only update if the new measurement is plausible (within 3x of current value)
-      // to reject outliers from noisy PnP at oblique angles.
-      double abs_dz = std::abs(dz_);
-      if (abs_step < std::max(abs_dz * 3.0, 0.03) && abs_step > 0.005) {
-        double new_abs = 0.10 * abs_step + 0.90 * abs_dz;
-        // Sign: if raw_step and dz_ agree in sign, keep. If they disagree,
-        // only flip if the disagreement is consistent (abs_step > 0.5*abs_dz).
-        // This prevents single noisy measurements from flipping the sign.
-        if (raw_step * dz_ > 0) {
-          dz_ = new_abs * (dz_ > 0 ? 1.0 : -1.0);
-        } else if (abs_step > abs_dz * 0.5) {
-          // Consistent sign disagreement — the initial seed may have been wrong
-          dz_ = new_abs * (raw_step > 0 ? 1.0 : -1.0);
+  if (transition) {
+    const bool one_face_jump = std::abs(face_step) == 1;
+    // If visible face index increments, the robot yaw moved the opposite way.
+    const double yaw_dir = one_face_jump ? -static_cast<double>(face_step) : 0.0;
+    debug_info_.jump_detected = true;
+    debug_info_.jump_abs = std::abs(face_step) * M_PI / 2.0;
+    debug_info_.jump_dir = yaw_dir;
+    debug_info_.one_face_jump = one_face_jump;
+
+    const bool reproj_ok =
+      det.reproj_error >= 0.0 && det.reproj_error <= cfg_.vyaw_timing_max_reproj;
+    const bool transition_credible =
+      cfg_.use_vyaw_from_timing && one_face_jump && yaw_valid && reproj_ok;
+
+    if (transition_credible && last_jump_time_valid_) {
+      const double dt_jump = (now - last_jump_time_).seconds();
+      const bool same_dir = yaw_dir * last_jump_dir_ > 0.0;
+      debug_info_.dt_jump = dt_jump;
+
+      if (same_dir && dt_jump >= cfg_.vyaw_timing_min_dt &&
+          dt_jump <= cfg_.vyaw_timing_max_dt)
+      {
+        const double vyaw_est = (M_PI / 2.0) / dt_jump * yaw_dir;
+        debug_info_.vyaw_est_from_timing = vyaw_est;
+        const bool consistent =
+          consecutive_same_dir_jumps_ >= 1 &&
+          std::abs(vyaw_est - last_vyaw_timing_est_) <=
+            cfg_.vyaw_timing_consistency * std::max(std::abs(vyaw_est), 1e-3);
+
+        consecutive_same_dir_jumps_++;
+        last_vyaw_timing_est_ = vyaw_est;
+
+        if (consecutive_same_dir_jumps_ >= 2 && consistent) {
+          const double blend = (consecutive_same_dir_jumps_ >= 3) ? 0.70 : 0.50;
+          x_(7) = blend * vyaw_est + (1.0 - blend) * x_(7);
+          P_(7, 7) = std::min(P_(7, 7), 1.5);
+          phase_timing_confident_ = true;
+          debug_info_.vyaw_timing_accepted = true;
         }
-        // else: small disagreement, keep current sign
+      } else if (!same_dir) {
+        consecutive_same_dir_jumps_ = 0;
+        last_vyaw_timing_est_ = 0.0;
+        phase_timing_confident_ = false;
+      }
+    } else if (!transition_credible) {
+      consecutive_same_dir_jumps_ = 0;
+      last_vyaw_timing_est_ = 0.0;
+      phase_timing_confident_ = false;
+      last_jump_time_valid_ = false;
+    }
+
+    if (transition_credible) {
+      last_jump_time_ = now;
+      last_jump_time_valid_ = true;
+      last_jump_dir_ = yaw_dir;
+    }
+  }
+
+  last_matched_face_idx_ = matched_face_idx;
+  last_face_assoc_time_ = now;
+  last_face_assoc_time_valid_ = true;
+}
+
+void Tracker::updateRadiusFromAssociation(
+  const ArmorDetection & det,
+  int face_idx,
+  bool oblique)
+{
+  if (oblique || face_idx < 0) {
+    return;
+  }
+
+  const FacePrediction face = predictFace(x_, face_idx, 0.0);
+  const double rm =
+    (x_(0) - det.x) * std::cos(face.yaw) +
+    (x_(2) - det.y) * std::sin(face.yaw);
+  if (rm <= 0.10 || rm >= 0.45) {
+    return;
+  }
+
+  if (face.idx % 2 == 0) {
+    radius_ = (1.0 - cfg_.radius_ema_alpha) * radius_ + cfg_.radius_ema_alpha * rm;
+    x_(8) = radius_;
+  } else {
+    other_radius_ =
+      (1.0 - cfg_.radius_ema_alpha) * other_radius_ + cfg_.radius_ema_alpha * rm;
+  }
+
+  if (cfg_.adapt_dz_enable && face.idx % 2 == 1) {
+    const double measured_dz = det.z - x_(4);
+    if (std::abs(measured_dz) < 0.20) {
+      if (!dz_initialized_) {
+        dz_ = measured_dz;
+        dz_initialized_ = true;
+      } else {
+        dz_ = 0.95 * dz_ + 0.05 * measured_dz;
       }
     }
-    x_(4) = det.z;  x_(5) = 0;
-    std::swap(radius_, other_radius_);
-    x_(8) = radius_;
   }
-
-  // Divergence check: if inferred armor is far from detection, hard reset
-  auto inferred = armorFromState(x_);
-  Eigen::Vector3d detected(det.x, det.y, det.z);
-  if ((inferred - detected).norm() > cfg_.max_match_dist) {
-    double r = x_(8);
-    x_ << det.x+r*cos(yaw), 0, det.y+r*sin(yaw), 0, det.z, 0, yaw, 0, r;
-    P_ = P0_;
-    radius_ = cfg_.initial_radius;  other_radius_ = cfg_.initial_radius;
-    // Preserve dz_ if it was seeded from initial_dz or learned — resetting
-    // to zero on every divergence was causing random high/low misses during
-    // spinning because the height step was re-learned from scratch each time.
-    if (!dz_initialized_ || std::abs(dz_) < 0.005) {
-      dz_ = cfg_.initial_dz;
-      dz_initialized_ = (cfg_.initial_dz != 0.0);
-    }
-    // Reset timing estimator — divergence means the phase is unknown
-    last_jump_time_valid_ = false;
-    consecutive_same_dir_jumps_ = 0;
-  } else {
-    // Inflate yaw/vyaw covariance (we bypassed the EKF)
-    double s = 2.0;
-    P_.row(6)*=s; P_.col(6)*=s;  P_.row(7)*=s; P_.col(7)*=s;
-    P_ = (P_+P_.transpose())*0.5;
-  }
-
-  // EKF update with jump measurement
-  Eigen::Vector4d z(det.x, det.y, det.z, yaw);
-  x_ = ekfUpdate(z);
-
-  // Update radius via EMA. Bearing is from ROBOT to armor (not from world origin),
-  // otherwise the obliquity check is wrong once ego-motion is active.
-  double bearing = std::atan2(det.y - ego_y_, det.x - ego_x_);
-  double fa = std::abs(angles::shortest_angular_distance(x_(6), bearing));
-  if (fa < cfg_.max_oblique_deg * M_PI/180.0) {
-    double rm = (x_(0)-det.x)*cos(x_(6)) + (x_(2)-det.y)*sin(x_(6));
-    if (rm > 0.10 && rm < 0.45)
-      radius_ = (1-cfg_.radius_ema_alpha)*radius_ + cfg_.radius_ema_alpha*rm;
-  }
-  x_(8) = radius_;
 }
 
 // =========================================================================
@@ -511,6 +632,11 @@ void Tracker::handleArmorJump(const ArmorDetection & det, const rclcpp::Time & n
 void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
                      const rclcpp::Time & now)
 {
+  debug_info_ = TrackerDebugInfo{};
+  debug_info_.state_yaw = x_(6);
+  debug_info_.phase_confident = phaseConfident();
+  debug_info_.last_matched_face_idx = last_matched_face_idx_;
+
   if (switch_cooldown_counter_ > 0) switch_cooldown_counter_--;
 
   // ── TARGET SWITCHING CHECK ──
@@ -522,6 +648,10 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
       if (d.range() < min_range) { min_range = d.range(); closest = &d; }
     }
     if (closest && shouldSwitch(*closest)) {
+      debug_info_.det_yaw = closest->yaw;
+      debug_info_.yaw_replaced_by_bearing = closest->yaw_replaced_by_bearing;
+      debug_info_.reproj_error = closest->reproj_error;
+      debug_info_.selected_class_id = closest->class_id;
       initFromDetection(*closest);
       state_ = DETECTING;
       return;
@@ -533,6 +663,10 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
     if (detections.empty()) return;
     auto best = std::min_element(detections.begin(), detections.end(),
       [](const auto& a, const auto& b) { return a.range() < b.range(); });
+    debug_info_.det_yaw = best->yaw;
+    debug_info_.yaw_replaced_by_bearing = best->yaw_replaced_by_bearing;
+    debug_info_.reproj_error = best->reproj_error;
+    debug_info_.selected_class_id = best->class_id;
     initFromDetection(*best);
     state_ = DETECTING;
     return;
@@ -543,55 +677,58 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
   // ── PREDICT ──
   ekfPredict(dt);
 
-  // ── ASSOCIATE: find best matching detection (Mahalanobis gating) ──
-  auto pred_armor = armorFromState(x_);
+  // ── ASSOCIATE: detection × face × yaw-hypothesis Mahalanobis gating ──
   bool matched = false;
-  ArmorDetection best_det{};
-  double best_maha = cfg_.maha_threshold;
-
-  for (const auto & det : detections) {
-    if (det.class_id != target_id_) continue;
-    double pred_yaw = x_(6);
-    double uw = pred_yaw + angles::shortest_angular_distance(pred_yaw, det.yaw);
-    Eigen::Vector4d z(det.x, det.y, det.z, uw);
-    double m = ekfMahalanobis(z);
-    if (m < best_maha) { best_maha = m; best_det = det; matched = true; }
+  const AssociationHypothesis assoc = associateDetections(detections);
+  if (assoc.valid && assoc.det != nullptr) {
+    debug_info_.mahalanobis = assoc.mahalanobis;
+    debug_info_.association_mahalanobis = assoc.mahalanobis;
+    debug_info_.matched_face_idx = assoc.face_idx;
+    debug_info_.association_yaw_valid = assoc.yaw_valid;
+    debug_info_.association_yaw_hypothesis = assoc.yaw_hypothesis;
+    debug_info_.pd = assoc.position_error;
+    debug_info_.yd = assoc.yaw_error;
+    debug_info_.det_yaw = assoc.yaw_meas;
+    debug_info_.yaw_replaced_by_bearing = assoc.det->yaw_replaced_by_bearing;
+    debug_info_.reproj_error = assoc.det->reproj_error;
+    debug_info_.selected_class_id = assoc.det->class_id;
+    matched =
+      assoc.mahalanobis < cfg_.maha_threshold &&
+      assoc.position_error < cfg_.max_match_dist;
   }
 
   // ── UPDATE or COAST ──
-  if (matched) {
-    double meas_yaw = unwrapYaw(best_det.yaw);
-    double yd = std::abs(angles::shortest_angular_distance(x_(6), meas_yaw));
-    Eigen::Vector3d dp(best_det.x, best_det.y, best_det.z);
-    double pd = (pred_armor - dp).norm();
-
-    // Obliquity check: bearing from robot (not from origin) to armor.
-    double bearing = std::atan2(best_det.y - ego_y_, best_det.x - ego_x_);
-    double fa = std::abs(angles::shortest_angular_distance(meas_yaw, bearing));
+  if (matched && assoc.det != nullptr) {
+    const double state_yaw_before_update = x_(6);
+    const ArmorDetection & best_det = *assoc.det;
+    const FacePrediction face_before_update =
+      predictFace(x_, assoc.face_idx, 0.0);
+    const double bearing = std::atan2(best_det.y - ego_y_, best_det.x - ego_x_);
+    const double obliquity_yaw = assoc.yaw_valid ? assoc.yaw_meas : face_before_update.yaw;
+    const double fa =
+      std::abs(angles::shortest_angular_distance(obliquity_yaw, bearing));
     bool oblique = fa > cfg_.max_oblique_deg * M_PI/180.0;
 
-    if (pd < cfg_.max_match_dist && (yd < cfg_.yaw_jump_thresh || oblique)) {
-      // MATCH — normal EKF update
-      Eigen::Vector4d z(best_det.x, best_det.y, best_det.z, meas_yaw);
-      x_ = ekfUpdate(z);
-      // Radius EMA (skip when oblique)
-      if (!oblique) {
-        double rm = (x_(0)-best_det.x)*cos(x_(6)) + (x_(2)-best_det.y)*sin(x_(6));
-        if (rm > 0.10 && rm < 0.45)
-          radius_ = (1-cfg_.radius_ema_alpha)*radius_ + cfg_.radius_ema_alpha*rm;
-        x_(8) = radius_;
-      }
-    } else if (yd > cfg_.yaw_jump_thresh && !oblique) {
-      // JUMP — face switch
-      handleArmorJump(best_det, now);
-    } else {
-      matched = false;  // too far — treat as miss
-    }
+    debug_info_.matched = true;
+    debug_info_.mahalanobis = assoc.mahalanobis;
+    debug_info_.oblique = oblique;
+    debug_info_.det_yaw = assoc.yaw_meas;
+    debug_info_.state_yaw = state_yaw_before_update;
+    debug_info_.yaw_replaced_by_bearing = best_det.yaw_replaced_by_bearing;
+    debug_info_.reproj_error = best_det.reproj_error;
+    debug_info_.selected_class_id = best_det.class_id;
+
+    x_ = ekfUpdateFace(best_det, assoc.face_idx, assoc.yaw_meas, assoc.yaw_valid);
+    updateRadiusFromAssociation(best_det, assoc.face_idx, oblique);
+    observeFaceAssociation(assoc.face_idx, best_det, now, assoc.yaw_valid);
+  } else if (assoc.valid) {
+    debug_info_.matched = false;
   }
 
   // ── SAFETY CLAMPS ──
   x_(8) = std::clamp(x_(8), 0.12, 0.40);
   radius_ = x_(8);
+  other_radius_ = std::clamp(other_radius_, 0.12, 0.40);
 
   // ── DYNAMIC SPIN-RATE BOUND ──
   // Old approach: hard clamp at 25 rad/s + full P_ reset.
@@ -620,6 +757,7 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
 
   double wy = angles::normalize_angle(x_(6));
   if (wy != x_(6)) { x_(6) = wy; last_yaw_ = wy; }
+  debug_info_.phase_confident = phaseConfident();
 
   // ── STATE MACHINE ──
   if (state_ == DETECTING) {
@@ -639,13 +777,30 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
       if (++lost_count_ > 3) {
         state_ = LOST;
         lost_count_ = 0;
+        last_aim_face_idx_ = 0;
+        last_matched_face_idx_ = -1;
+        last_face_assoc_time_valid_ = false;
+        last_jump_time_valid_ = false;
+        phase_timing_confident_ = false;
       }
     }
   } else if (state_ == TRACKING) {
-    if (!matched) { state_ = TEMP_LOST; lost_count_ = 1; }
+    if (matched) {
+      lost_count_ = 0;
+    } else if (++lost_count_ > cfg_.track_grace_misses) {
+      state_ = TEMP_LOST;
+      lost_count_ = 1;  // restart the TEMP_LOST timeout/coast-fire counter
+    }
   } else if (state_ == TEMP_LOST) {
     if (matched) { state_ = TRACKING; lost_count_ = 0; }
-    else if (++lost_count_ > lost_thresh_) { state_ = LOST; }
+    else if (++lost_count_ > lost_thresh_) {
+      state_ = LOST;
+      last_aim_face_idx_ = 0;
+      last_matched_face_idx_ = -1;
+      last_face_assoc_time_valid_ = false;
+      last_jump_time_valid_ = false;
+      phase_timing_confident_ = false;
+    }
   }
 }
 
@@ -690,7 +845,10 @@ Tracker::BallisticResult Tracker::solveBallistic(double gd, double dz) const
 //   1. Compute barrel position in odom frame (rotated with gimbal)
 //   2. For each of 4 faces, predict position at time T_impact
 //   3. Compute bearing + elevation from BARREL to face
-//   4. Pick face with best fire_window_margin
+//   4. Pick a face for aim planning:
+//      - fire-valid faces first,
+//      - otherwise incoming faces that will enter the window soon,
+//      - otherwise the best current-margin fallback
 //   5. Solve ballistics (gravity) for that face
 //   6. Compute absolute target angles and relative error
 // =========================================================================
@@ -729,22 +887,82 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
   double pred_t = predictionBias() + dist_now / std::max(cfg_.bullet_speed, 1.0);
   constexpr int FACES = 4;
 
-  // Single-face vs four-face mode.
-  // When |vyaw| is below vyaw_fire_threshold the spin rate is unreliable —
-  // either the robot is stationary, rotating slowly, or just starting to spin.
-  // In this case only aim at the currently visible face (fi=0). Predicting
-  // phantom faces with wrong vyaw causes random aim jumps.
-  // When spinning fast (above threshold) use all four faces so the EKF can
-  // pick the best face at impact time.
-  const int faces_to_check = (std::abs(x_(7)) >= cfg_.vyaw_fire_threshold) ? FACES : 1;
+  // Face lookahead is aim planning, not fire permission. The fire window still
+  // decides whether a shot is safe (margin >= 0). Lookahead merely points the
+  // gimbal at an incoming face early enough to settle before that face becomes
+  // fire-valid, avoiding the old failure mode of tracking an outgoing face and
+  // arriving late on the next plate. Keep the spin-confidence gate so untrusted
+  // phase estimates do not re-enable wrong four-face prediction.
+  const bool spin_phase_trusted = phaseConfident();
+  const bool face_lookahead_active =
+    cfg_.face_lookahead_enable &&
+    spin_phase_trusted &&
+    std::abs(x_(7)) >= cfg_.face_lookahead_min_vyaw;
+  std::array<int, FACES> face_indices{};
+  int faces_to_check = 0;
+  if (spin_phase_trusted) {
+    for (int i = 0; i < FACES; ++i) {
+      face_indices[faces_to_check++] = i;
+    }
+  } else {
+    const int held_face =
+      (last_matched_face_idx_ >= 0 && last_matched_face_idx_ < FACES) ?
+      last_matched_face_idx_ : 0;
+    face_indices[faces_to_check++] = held_face;
+  }
+  aim.faces_checked = faces_to_check;
+  aim.face_lookahead_active = face_lookahead_active;
+
+  enum class FaceChoice {
+    None,
+    FireValid,
+    Incoming,
+    Fallback
+  };
 
   struct Face {
     double x = 0, y = 0, z = 0, range = 0, bearing = 0;
-    double abs_pitch = 0, flight_time = 0, margin = -1e9, vis = 0;
+    double abs_pitch = 0, flight_time = 0, phase_error = 0, fire_window = 0;
+    double margin = -1e9, vis = 0;
+    double phase_error_future = 0.0, margin_future = -1e9;
+    double dwell_time = 0.0;
+    double time_to_window = std::numeric_limits<double>::infinity();
+    double score = std::numeric_limits<double>::infinity();
+    int idx = -1;
     bool valid = false;
+    bool fire_valid = false;
+    bool incoming = false;
+    bool approaching = false;
   };
+  std::array<Face, FACES> candidates{};
   Face best;
   bool found = false;
+  FaceChoice best_choice = FaceChoice::None;
+  bool held_by_hysteresis = false;
+  std::string fallback_reason = "fallback_margin";
+  const int previous_face_idx =
+    (last_aim_face_idx_ >= 0 && last_aim_face_idx_ < FACES) ? last_aim_face_idx_ : 0;
+
+  auto better_margin = [&candidates](int idx, int best_idx) {
+    if (best_idx < 0) return true;
+    const auto & a = candidates[idx];
+    const auto & b = candidates[best_idx];
+    if (a.margin > b.margin + 0.01) return true;
+    if (std::abs(a.margin - b.margin) < 0.01 && a.vis > b.vis) return true;
+    return false;
+  };
+
+  auto better_incoming = [&candidates](int idx, int best_idx) {
+    if (best_idx < 0) return true;
+    const auto & a = candidates[idx];
+    const auto & b = candidates[best_idx];
+    if (a.time_to_window < b.time_to_window - 1e-3) return true;
+    if (std::abs(a.time_to_window - b.time_to_window) < 1e-3) {
+      if (a.margin > b.margin + 0.01) return true;
+      if (std::abs(a.margin - b.margin) < 0.01 && a.vis > b.vis) return true;
+    }
+    return false;
+  };
 
   // Two iterations: first rough estimate, then refine with actual flight time.
   // Three iterations converge tightly for ranges 0.5–6 m with any bullet speed.
@@ -758,21 +976,22 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
     double barrel_x_future = barrel_x_now + robot_vx * pred_t;
     double barrel_y_future = barrel_y_now + robot_vy * pred_t;
 
-    for (int fi = 0; fi < faces_to_check; fi++) {
-      double fy = x_(6) + x_(7)*pred_t + fi*(2*M_PI/FACES);
-      bool alt = (fi % 2 == 1);
-      double r = alt ? other_radius_ : radius_;
-      double dzo = alt ? dz_ : 0.0;
+    candidates = {};
+    int best_fire_idx = -1;
+    int best_incoming_idx = -1;
+    int best_fallback_idx = -1;
+    bool nonfire_seen = false;
+    bool approaching_seen = false;
+    bool blocked_by_horizon = false;
+    bool blocked_by_approach = false;
 
-      // Predicted center at impact (constant velocity model)
-      double cx = x_(0) + x_(1)*pred_t;
-      double cy = x_(2) + x_(3)*pred_t;
-      double cz = x_(4) + x_(5)*pred_t;
-
-      // Face position in odom
-      double fx = cx - r*std::cos(fy);
-      double fpy = cy - r*std::sin(fy);
-      double fz = cz + dzo;
+    for (int face_slot = 0; face_slot < faces_to_check; face_slot++) {
+      const int fi = face_indices[face_slot];
+      const FacePrediction face = predictFace(x_, fi, pred_t);
+      const double fy = face.yaw;
+      const double fx = face.position.x();
+      const double fpy = face.position.y();
+      const double fz = face.position.z();
 
       // ── AIM VECTOR: from FUTURE barrel to FUTURE target face ──
       double dx = fx - barrel_x_future;
@@ -796,27 +1015,173 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
       auto bal = solveBallistic(gd, dz_aim);
       if (!bal.valid) continue;
 
-      // Fire window margin: positive = face is aligned with bearing
-      double ds = std::min(cfg_.window_ref_dist / std::max(range, 0.5), 2.0);
+      // Fire window margin: positive = face is aligned with bearing.
+      // phase_error is a FACING angle (plate normal vs line of sight); its
+      // tolerance must NOT grow at close range. The old cap of 2.0 let the
+      // window DOUBLE up close (angular_window 0.40 → 0.80 rad ≈ 46°), so the
+      // shot could be taken on a plate 45° off-facing — exactly the "hits the
+      // wheels / 45° to the side" symptom. Cap at 1.0: the window only SHRINKS
+      // with distance (where the same facing error is a larger linear miss),
+      // never expands beyond the configured angular_window.
+      double ds = std::min(cfg_.window_ref_dist / std::max(range, 0.5), 1.0);
       double win = cfg_.angular_window * ds;
-      double err = std::abs(angles::shortest_angular_distance(bearing, fy));
+      double phase_error = angles::shortest_angular_distance(bearing, fy);
+      double err = std::abs(phase_error);
       double margin = win - err;
 
+      auto eval_phase = [&](double t_eval) {
+        const FacePrediction eval_face = predictFace(x_, fi, t_eval);
+        const double bx = barrel_x_now + robot_vx * t_eval;
+        const double by = barrel_y_now + robot_vy * t_eval;
+        const double dx_eval = eval_face.position.x() - bx;
+        const double dy_eval = eval_face.position.y() - by;
+        const double dz_eval = eval_face.position.z() - barrel_z;
+        const double range_eval =
+          std::sqrt(dx_eval * dx_eval + dy_eval * dy_eval + dz_eval * dz_eval);
+        const double bearing_eval = std::atan2(dy_eval, dx_eval);
+        const double win_eval =
+          cfg_.angular_window *
+          std::min(cfg_.window_ref_dist / std::max(range_eval, 0.5), 1.0);
+        const double phase_eval =
+          angles::shortest_angular_distance(bearing_eval, eval_face.yaw);
+        return std::array<double, 3>{
+          phase_eval,
+          win_eval - std::abs(phase_eval),
+          std::abs(phase_eval)
+        };
+      };
+
+      const double future_dt =
+        cfg_.face_lookahead_horizon > 0.0 ?
+        std::min(std::max(cfg_.face_lookahead_horizon, 0.02), 0.12) :
+        0.02;
+      const auto future_phase = eval_phase(pred_t + future_dt);
+      const double phase_error_future = future_phase[0];
+      const double margin_future = future_phase[1];
+      const bool approaching =
+        margin >= 0.0 || future_phase[2] < err - 0.01;
+
+      double excess = err - win;
+      double time_to_window = 0.0;
+      if (excess <= 0.0) {
+        time_to_window = 0.0;
+      } else if (approaching && std::abs(x_(7)) > 1e-3) {
+        time_to_window = excess / std::abs(x_(7));
+      } else {
+        time_to_window = std::numeric_limits<double>::infinity();
+      }
+
       Face c;
+      c.idx = fi;
       c.x = fx; c.y = fpy; c.z = fz;
       c.range = range; c.bearing = bearing;
       c.abs_pitch = bal.pitch; c.flight_time = bal.flight_time;
+      c.phase_error = phase_error;
+      c.fire_window = win;
       c.margin = margin; c.vis = vis; c.valid = true;
+      c.phase_error_future = phase_error_future;
+      c.margin_future = margin_future;
+      c.fire_valid = margin >= 0.0;
+      c.time_to_window = time_to_window;
+      c.approaching = approaching;
+      c.incoming =
+        face_lookahead_active &&
+        !c.fire_valid &&
+        c.approaching &&
+        c.time_to_window <= cfg_.face_lookahead_horizon;
+      // Lower is better. This keeps hysteresis in radians for both fire-valid
+      // and incoming/fallback faces: it is just the negative fire margin.
+      c.score = -c.margin;
 
-      if (!found || margin > best.margin ||
-          (std::abs(margin - best.margin) < 0.01 && vis > best.vis)) {
-        best = c; found = true;
+      candidates[fi] = c;
+      if (c.fire_valid && better_margin(fi, best_fire_idx)) {
+        best_fire_idx = fi;
+      }
+      if (c.incoming && better_incoming(fi, best_incoming_idx)) {
+        best_incoming_idx = fi;
+      }
+      if (better_margin(fi, best_fallback_idx)) {
+        best_fallback_idx = fi;
+      }
+      if (face_lookahead_active && !c.fire_valid) {
+        nonfire_seen = true;
+        if (c.approaching) {
+          approaching_seen = true;
+          if (c.time_to_window > cfg_.face_lookahead_horizon) {
+            blocked_by_horizon = true;
+          }
+        } else {
+          blocked_by_approach = true;
+        }
       }
     }
-    if (found) pred_t = best.flight_time + predictionBias();
+
+    int chosen_idx = -1;
+    FaceChoice choice = FaceChoice::None;
+    if (best_fire_idx >= 0) {
+      chosen_idx = best_fire_idx;
+      choice = FaceChoice::FireValid;
+    } else if (best_incoming_idx >= 0) {
+      chosen_idx = best_incoming_idx;
+      choice = FaceChoice::Incoming;
+    } else if (best_fallback_idx >= 0) {
+      chosen_idx = best_fallback_idx;
+      choice = FaceChoice::Fallback;
+    }
+
+    if (chosen_idx < 0) {
+      continue;
+    }
+
+    bool held = false;
+    const int prev_idx =
+      (previous_face_idx >= 0 && previous_face_idx < FACES) ? previous_face_idx : 0;
+    if (prev_idx != chosen_idx && candidates[prev_idx].valid &&
+        cfg_.face_switch_hysteresis > 0.0)
+    {
+      bool previous_same_stage = false;
+      if (choice == FaceChoice::FireValid) {
+        previous_same_stage = candidates[prev_idx].fire_valid;
+      } else if (choice == FaceChoice::Incoming) {
+        previous_same_stage = candidates[prev_idx].incoming;
+      } else if (choice == FaceChoice::Fallback) {
+        previous_same_stage = true;
+      }
+
+      if (previous_same_stage) {
+        const double score_advantage =
+          candidates[prev_idx].score - candidates[chosen_idx].score;
+        if (score_advantage < cfg_.face_switch_hysteresis) {
+          chosen_idx = prev_idx;
+          held = true;
+        }
+      }
+    }
+
+    best = candidates[chosen_idx];
+    found = true;
+    best_choice = choice;
+    held_by_hysteresis = held;
+    if (choice == FaceChoice::Fallback) {
+      if (!cfg_.face_lookahead_enable) {
+        fallback_reason = "fallback_lookahead_disabled";
+      } else if (!spin_phase_trusted) {
+        fallback_reason = "fallback_phase_not_confident";
+      } else if (std::abs(x_(7)) < cfg_.face_lookahead_min_vyaw) {
+        fallback_reason = "fallback_spin_below_min";
+      } else if (blocked_by_horizon) {
+        fallback_reason = "fallback_incoming_beyond_horizon";
+      } else if (blocked_by_approach || (nonfire_seen && !approaching_seen)) {
+        fallback_reason = "fallback_no_approaching_face";
+      } else {
+        fallback_reason = "fallback_margin";
+      }
+    }
+    pred_t = best.flight_time + predictionBias();
   }
 
   if (!found) return aim;
+  last_aim_face_idx_ = best.idx;
 
   // Absolute target angles in the IMU/odom startup frame.
   // These are destinations: the microcontroller should compare them with
@@ -833,6 +1198,48 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
   aim.target_x = best.x;
   aim.target_y = best.y;
   aim.target_z = best.z;
+  aim.best_face_idx = best.idx;
+  aim.selected_face_idx = best.idx;
+  aim.phase_error = best.phase_error;
+  aim.fire_window = best.fire_window;
+  aim.flight_time = best.flight_time;
+  aim.prediction_time = pred_t;
+  aim.fire_margin = best.margin;
+  aim.face_time_to_window =
+    std::isfinite(best.time_to_window) ? best.time_to_window : -1.0;
+  aim.face_margin = best.margin;
+  aim.face_phase_error = best.phase_error;
+  if (held_by_hysteresis) {
+    switch (best_choice) {
+      case FaceChoice::FireValid:
+        aim.face_switch_reason = "hysteresis_hold_fire_valid";
+        break;
+      case FaceChoice::Incoming:
+        aim.face_switch_reason = "hysteresis_hold_incoming";
+        break;
+      case FaceChoice::Fallback:
+        aim.face_switch_reason = "hysteresis_hold_fallback";
+        break;
+      case FaceChoice::None:
+        aim.face_switch_reason = "hysteresis_hold";
+        break;
+    }
+  } else {
+    switch (best_choice) {
+      case FaceChoice::FireValid:
+        aim.face_switch_reason = "fire_valid";
+        break;
+      case FaceChoice::Incoming:
+        aim.face_switch_reason = "incoming_lookahead";
+        break;
+      case FaceChoice::Fallback:
+        aim.face_switch_reason = fallback_reason;
+        break;
+      case FaceChoice::None:
+        aim.face_switch_reason = "none";
+        break;
+    }
+  }
 
   // Clamp only the relative error used by fire gating/debug. Do not clamp the
   // absolute destination; the microcontroller/gimbal limits should handle that.
@@ -841,7 +1248,7 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
   aim.rel_pitch = std::clamp(aim.rel_pitch, -max_rad, max_rad);
 
   aim.fire = best.valid &&
-    state_ == TRACKING &&
+    fireStatePermits() &&
     best.range >= cfg_.min_fire_dist &&
     best.range <= cfg_.max_fire_dist &&
     best.margin >= 0.0;

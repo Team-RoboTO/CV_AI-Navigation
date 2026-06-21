@@ -17,8 +17,15 @@ DEFAULT_ENGINE = "/workspaces/isaac_ros-dev/AI-models/yolov26_keypoints.engine"
 # Change this to "zed" or "realsense" when this robot's default camera changes.
 DEFAULT_CAMERA = "realsense"
 
+# Main debug switches for the hero launch.
+publish_debug_state = True
+publish_other_debug_messages = True
+
 def autoaim_params():
     return [
+        {"publish_debug_state": publish_debug_state},
+        {"publish_other_debug_messages": publish_other_debug_messages},
+
         # YOLO26 labels: 0=blue armor, 1=grey armor (ignored), 2=red armor.
         # True: read our team color from /micro_status[target_color_status_index]
         #       and pick the enemy class automatically via micro_color_target_classes.
@@ -49,11 +56,10 @@ def autoaim_params():
         {"confirm_frames": 2},
         {"lost_timeout": 0.50},
 
-        # 30/40 were very high — probably raised to fight the lag caused by the
-        # missing image<->angle sync (now fixed). High q makes the state track
-        # measurement noise -> jittery commands -> fire-lock dropouts.
-        # Start lower; raise again only if tracking feels sluggish AFTER the fix.
-        {"q_pos": 100.0},
+        # STATIC process noise (the adaptive/NIS q_pos controller was REMOVED —
+        # see standard.launch.py / INSTRUCTIONS.md). q_yaw is higher on the hero
+        # because its turret/spin dynamics are heavier.
+        {"q_pos": 5.0},
         {"q_yaw": 20.0},
         {"q_r": 1e-6},
         {"r_pos_base": 0.05},
@@ -94,8 +100,8 @@ def autoaim_params():
         # 1.0 rad @ ref 1 m -> ~0.33 rad window at 3 m: OK for tuning, loose for
         # a match. Against a fast spinner, timed shots need ~0.10-0.18 rad with
         # window_ref_dist ~3.0. Tighten once the static calibration is done.
-        {"angular_window": 1.0},
-        {"window_ref_dist": 1.0},
+        {"angular_window": 0.40},
+        {"window_ref_dist": 3.0},
         {"min_fire_dist": 0.2},
         {"max_fire_dist": 6.0},
 
@@ -110,8 +116,8 @@ def autoaim_params():
         # logs the measured pipeline part every 2 s).
         {"use_measured_latency": True},
         {"actuation_latency": 0.020},
-        # Fallback fixed bias, used ONLY if use_measured_latency is False.
-        {"time_bias": 0.045},
+        # LEGACY fallback fixed horizon, used ONLY if use_measured_latency=False.
+        {"LEGACY_time_bias": 0.045},
 
         # Must equal the REAL detection rate: ros2 topic hz /detector/armors_keypoints
         # (the ZED grabs at 120 fps — if inference keeps up this should be ~120).
@@ -120,7 +126,10 @@ def autoaim_params():
         {"use_vyaw_from_timing": True},
         {"vyaw_timing_min_dt": 0.050},
         {"vyaw_timing_max_dt": 0.500},
-        {"vyaw_fire_threshold": 5.0},
+        {"vyaw_conf_p_max": 2.0},
+        # Anti-spurious-jump gate (see standard.launch.py for the rationale).
+        {"vyaw_timing_max_reproj": 8.0},
+        {"vyaw_timing_consistency": 0.35},
 
         {"max_match_dist": 0.8},
         {"maha_threshold": 16.9},
@@ -135,19 +144,15 @@ def autoaim_params():
         {"cmd_rate_limit_pitch": 0.0},
         {"fire_lock_yaw": 0.05},
         {"fire_lock_pitch": 0.04},
+        {"fire_lock_k_yaw": 0.0675},
+        {"fire_lock_k_pitch": 0.0625},
+        {"fire_lock_min": 0.015},
+        {"fire_lock_max_yaw": 0.12},
+        {"fire_lock_max_pitch": 0.10},
 
-        # ⚠ THESE TWO MUST BE EQUAL. Both describe the same physical fact —
-        # whether the micro's pitch FEEDBACK has the opposite sign of its pitch
-        # COMMAND. pitch_sign appears SQUARED in the loop, so it cannot absorb
-        # the difference (the old comment claiming independence was wrong).
-        # With True/False, exactly one of two failures is guaranteed:
-        #   - geometry pitch mirrored -> systematic vertical miss (shoots low/high), or
-        #   - pitch lock error = 2x command -> fire only when commanded pitch ~ 0
-        #     ("shoots only sometimes").
-        # Determine the truth empirically: echo /micro_status — field [1] is the
-        # pitch feedback, field [11] is the pitch command echo. With the gimbal
-        # settled on a target: feedback ≈ -command -> set BOTH True;
-        # feedback ≈ +command -> set BOTH False.
+        # Pitch signs have two different jobs:
+        # - feedback_opposite corrects geometry/PnP from raw micro feedback.
+        # - lock_opposite converts raw feedback to command-echo convention.
         {"micro_pitch_feedback_opposite_sign": True},
         {"micro_pitch_lock_opposite_sign": False},
 
@@ -208,6 +213,8 @@ def generate_launch_description():
     viewer_params = [
         # Must match micro_pitch_lock_opposite_sign in the autoaim params above.
         {"micro_pitch_feedback_opposite_sign": False},
+        {"use_debug_state": publish_debug_state},
+        {"debug_state_topic": "/debug_state"},
         {"fire_lock_yaw": 0.05},
         {"fire_lock_pitch": 0.04},
     ]

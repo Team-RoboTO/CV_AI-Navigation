@@ -18,9 +18,16 @@ DEFAULT_ENGINE = "/workspaces/isaac_ros-dev/AI-models/yolov26_keypoints.engine"
 # Change this to "zed" or "realsense" when this robot's default camera changes.
 DEFAULT_CAMERA = "zed"
 
+# Main debug switches for the sentry launch.
+publish_debug_state = True
+publish_other_debug_messages = True
+
 
 def autoaim_params():
     return [
+        {"publish_debug_state": publish_debug_state},
+        {"publish_other_debug_messages": publish_other_debug_messages},
+
         # YOLO26 labels: 0=blue armor, 1=grey armor (ignored), 2=red armor.
         # True: read our team color from /micro_status[target_color_status_index]
         #       and pick the enemy class automatically via micro_color_target_classes.
@@ -47,7 +54,9 @@ def autoaim_params():
         {"confirm_frames": 2},
         {"lost_timeout": 0.50},
 
-        {"q_pos": 100.0},
+        # STATIC process noise (the adaptive/NIS q_pos controller was REMOVED —
+        # see standard.launch.py / INSTRUCTIONS.md).
+        {"q_pos": 5.0},
         {"q_yaw": 10.0},
         {"q_r": 1e-6},
         {"r_pos_base": 0.05},
@@ -72,21 +81,25 @@ def autoaim_params():
         {"barrel_offset_y": -0.03},
         {"barrel_offset_z": -0.08},
 
-        {"angular_window": 1.0},
+        {"angular_window": 0.40},
         {"window_ref_dist": 3.0},
         {"min_fire_dist": 0.2},
         {"max_fire_dist": 6.0},
 
         {"use_measured_latency": True},
         {"actuation_latency": 0.020},
-        {"time_bias": 0.045},
+        # LEGACY fallback fixed horizon, used ONLY if use_measured_latency=False.
+        {"LEGACY_time_bias": 0.045},
 
         {"ref_freq": 60.0},
         {"yaw_jump_thresh": 0.55},
         {"use_vyaw_from_timing": True},
         {"vyaw_timing_min_dt": 0.050},
         {"vyaw_timing_max_dt": 0.500},
-        {"vyaw_fire_threshold": 5.0},
+        {"vyaw_conf_p_max": 2.0},
+        # Anti-spurious-jump gate (see standard.launch.py for the rationale).
+        {"vyaw_timing_max_reproj": 8.0},
+        {"vyaw_timing_consistency": 0.35},
 
         {"max_match_dist": 0.8},
         {"maha_threshold": 16.9},
@@ -99,9 +112,17 @@ def autoaim_params():
         {"cmd_deadband_pitch": 0.005},
         {"cmd_rate_limit_yaw": 0.0},
         {"cmd_rate_limit_pitch": 0.0},
-        {"fire_lock_yaw": 0.5},
-        {"fire_lock_pitch": 0.5},
+        {"fire_lock_yaw": 0.05},
+        {"fire_lock_pitch": 0.04},
+        {"fire_lock_k_yaw": 0.0675},
+        {"fire_lock_k_pitch": 0.0625},
+        {"fire_lock_min": 0.015},
+        {"fire_lock_max_yaw": 0.12},
+        {"fire_lock_max_pitch": 0.10},
 
+        # Pitch signs have two different jobs:
+        # - feedback_opposite corrects geometry/PnP from raw micro feedback.
+        # - lock_opposite converts raw feedback to command-echo convention.
         {"micro_pitch_feedback_opposite_sign": True},
         {"micro_pitch_lock_opposite_sign": False},
 
@@ -176,7 +197,7 @@ def generate_launch_description():
     serial_port = LaunchConfiguration("serial_port")
 
     serial_params = [
-        {"shooting_active": True},
+        {"shooting_active": False},
         {"rotating_chassis": False},
 
         {"serial_port": serial_port},
@@ -207,6 +228,8 @@ def generate_launch_description():
 
     viewer_params = [
         {"micro_pitch_feedback_opposite_sign": False},
+        {"use_debug_state": publish_debug_state},
+        {"debug_state_topic": "/debug_state"},
         # Viewer-only: must match autoaim_params() above so the HUD lock line
         # uses Sentry's actual fire gate. Does not affect commands sent to micro.
         #{"fire_lock_yaw": 0.5},

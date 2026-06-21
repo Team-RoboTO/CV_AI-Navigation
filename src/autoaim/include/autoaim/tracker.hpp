@@ -3,7 +3,9 @@
 
 #include <Eigen/Dense>
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <limits>
 #include <string>
 #include <vector>
 #include <rclcpp/time.hpp>
@@ -23,6 +25,20 @@ struct ArmorDetection
   // DO NOT use sqrt(x*x+y*y+z*z) — those are world coords, and once ego-motion
   // is active the robot is no longer at the world origin.
   double rel_range = 0.0;
+  double reproj_error = -1.0;
+  bool yaw_replaced_by_bearing = false;
+  // ── Planar-PnP yaw disambiguation ──
+  // A single armor plate is planar, so IPPE returns TWO pose solutions whose
+  // YAW differs (the classic flip ambiguity) while position is the same. The
+  // node fills yaw_alt with the second solution's odom yaw (inward-corrected,
+  // same convention as `yaw`). The tracker then picks whichever of {yaw, yaw_alt}
+  // is closer to its predicted yaw — this kills the frame-to-frame yaw flicker
+  // that otherwise pollutes the vyaw/spin estimate. has_yaw_alt is false when
+  // there is only one solution or the primary yaw was already replaced by the
+  // bearing (too oblique to trust either solution's yaw).
+  double yaw_alt = 0.0;
+  bool yaw_replaced_by_bearing_alt = false;
+  bool has_yaw_alt = false;
   /// Backwards-compatible accessor — returns the camera-relative range.
   double range() const { return rel_range; }
 };
@@ -52,6 +68,64 @@ struct AimResult
 
   bool   tracking  = false;
   bool   fire      = false;
+
+  // Debug-only details for the selected predicted face.
+  int    best_face_idx    = -1;
+  int    faces_checked    = 0;
+  double phase_error      = 0;  // signed bearing-vs-face error [rad]
+  double fire_window      = 0;  // selected face fire window [rad]
+  double flight_time      = 0;  // bullet flight time [s]
+  double prediction_time  = 0;  // flight_time + latency/bias [s]
+  double fire_margin      = 0;  // positive means inside fire window [rad]
+
+  // Phase-aware face scheduling debug. selected_face_idx mirrors
+  // best_face_idx for newer tooling; the remaining fields explain whether the
+  // aim point was chosen for immediate fire or to pre-aim an incoming face.
+  int    selected_face_idx      = -1;
+  bool   face_lookahead_active  = false;
+  double face_time_to_window    = -1.0;  // seconds until selected face is fire-valid; -1 = n/a
+  double face_margin            = 0.0;
+  double face_phase_error       = 0.0;
+  std::string face_switch_reason;
+};
+
+struct FacePrediction
+{
+  int idx = -1;
+  double yaw = 0.0;       // face normal yaw in odom [rad]
+  double radius = 0.0;    // radius used by this face [m]
+  double z_offset = 0.0;  // height offset for this face [m]
+  Eigen::Vector3d position = Eigen::Vector3d::Zero();
+};
+
+struct TrackerDebugInfo
+{
+  bool matched = false;
+  double mahalanobis = -1.0;
+  double pd = -1.0;
+  double yd = -1.0;
+  bool oblique = false;
+  double det_yaw = 0.0;
+  double state_yaw = 0.0;
+  bool yaw_replaced_by_bearing = false;
+  double reproj_error = -1.0;
+  std::string selected_class_id;
+
+  bool jump_detected = false;
+  double jump_abs = 0.0;
+  double jump_dir = 0.0;
+  bool one_face_jump = false;
+  double dt_jump = -1.0;
+  double vyaw_est_from_timing = 0.0;
+  bool vyaw_timing_accepted = false;
+
+  bool phase_confident = false;
+  int matched_face_idx = -1;
+  double association_mahalanobis = -1.0;
+  bool association_yaw_valid = false;
+  int association_yaw_hypothesis = 0;
+  int last_matched_face_idx = -1;
+  bool face_transition_observed = false;
 };
 
 // ── All config in one struct ──
@@ -65,8 +139,15 @@ struct TrackerConfig
   // Tracker state machine
   int    confirm_frames    = 3;     // frames to promote DETECTING → TRACKING
   double lost_timeout      = 0.4;   // seconds before TEMP_LOST → LOST
+  int    track_grace_misses = 2;     // missed TRACKING frames before TEMP_LOST
+  bool   fire_in_temp_lost = false;  // allow bounded coast-fire in TEMP_LOST
+  int    temp_lost_fire_max = 3;     // max consecutive missed frames that may fire
 
-  // EKF process noise (higher = trust measurements more, respond faster)
+  // EKF process noise (higher = trust measurements more, respond faster).
+  // STATIC values — the old adaptive/NIS q_pos controller was removed: it
+  // adapted only the horizontal-center noise, but a spinning target's center
+  // is ~still, so it was reacting to yaw/PnP model error (not real maneuvers),
+  // cranking q_pos up and making the lead overshoot. See INSTRUCTIONS.md.
   double q_pos             = 5.0;
   double q_yaw             = 10.0;
   double q_r               = 1e-6;
@@ -78,7 +159,10 @@ struct TrackerConfig
   double r_yaw_slope       = 0.005;
   double max_oblique_deg   = 65.0;
 
-  // Velocity damping: v *= alpha each frame (at ref_freq Hz)
+  // Velocity damping: v *= alpha each frame (at ref_freq Hz).
+  // alpha_yaw should be 1.0 (NO spin damping): a 小陀螺 spins at a roughly
+  // constant rate, so damping vyaw between updates only makes the spin estimate
+  // decay and the 4-face phase prediction lag. Let q_yaw + the EKF set vyaw.
   double alpha_pos         = 0.99;
   double alpha_yaw         = 1.00;
   double alpha_coast       = 0.95;  // stronger damping when no measurement
@@ -92,6 +176,7 @@ struct TrackerConfig
   // face jump, but seeding avoids shooting low on the raised pair before
   // a jump is seen. Set to 0.0 if all four faces are at the same height.
   double initial_dz        = 0.0;
+  bool   adapt_dz_enable   = false;
 
   // ── BALLISTICS & PHYSICAL GEOMETRY ──
   double bullet_speed      = 25.0;  // [m/s] — MEASURE THIS on your robot!
@@ -126,6 +211,17 @@ struct TrackerConfig
   double min_fire_dist     = 0.3;
   double max_fire_dist     = 6.0;
 
+  // Face lookahead is aim planning, not fire permission. The fire window below
+  // still decides whether a shot is safe; lookahead only lets the gimbal settle
+  // on an incoming armor face before that face becomes fire-valid.
+  bool   face_lookahead_enable   = true;
+  double face_lookahead_min_vyaw = 0.35;  // [rad/s] minimum spin rate to plan incoming faces
+  double face_lookahead_horizon  = 0.35;  // [s] max pre-aim time before entering fire window
+  double face_switch_hysteresis  = 0.08;  // [rad] score advantage required to switch aim face
+  // TODO: implement timestamp-aware face hold when computeAim() receives a
+  // monotonic time source. Hysteresis is the current anti-flicker mechanism.
+  double min_face_hold_time      = 0.10;  // [s]
+
   // Timing
   // ── PREDICTION HORIZON (measured-latency split) ──
   // When use_measured_latency is true, the horizon between the EKF state time
@@ -142,10 +238,9 @@ struct TrackerConfig
 
   // Match gates
   double max_match_dist    = 0.5;
-  // yaw_jump_thresh [rad]: minimum measured yaw change to trigger handleArmorJump.
-  // Below this = normal EKF update. Above this = face switch.
-  // Default M_PI/3 (60°) can miss oblique face jumps. 0.5 rad (28°) detects
-  // jumps earlier for faster vyaw convergence during spinning.
+  // Legacy tuning surface retained for launch compatibility. Face changes are
+  // now normal face-indexed associations; spin timing is observed from matched
+  // face_idx transitions instead of raw yaw jumps.
   double yaw_jump_thresh   = 0.50;
   double maha_threshold    = 13.3;
 
@@ -157,11 +252,19 @@ struct TrackerConfig
   bool   use_vyaw_from_timing  = true;
   double vyaw_timing_min_dt    = 0.020;  // ignore if jump faster than this [s]
   double vyaw_timing_max_dt    = 0.400;  // ignore if jump slower than this [s]
-  // vyaw_fire_threshold [rad/s]: below this spin rate, only aim at the
-  // currently visible face (single-face mode). Above this, use full four-face
-  // spinning prediction. This prevents random aim during slow rotation when
-  // vyaw is unreliable. 200 RPM = 20.9, 100 RPM = 10.5, 30 RPM = 3.1 rad/s.
-  double vyaw_fire_threshold   = 3.0;
+  double vyaw_conf_p_max       = 2.0;    // P(7,7) below this = vyaw trusted (gates 4-face)
+  // ── ANTI-SPURIOUS-JUMP GATE (the reason IMM/PLL/fast-vyaw kept misfiring) ──
+  // A "90° jump" in the MEASURED yaw is not always a real face switch: a PnP
+  // flip or a wrong association produces the same signature. Trusting it
+  // (old code: 80% blend + P(7,7)->1.0 after ONE jump) locked a WRONG vyaw with
+  // high confidence -> 4-face prediction led the shot ~45° to the side.
+  // We now only feed the timing estimator a jump that is geometrically credible:
+  //   - PnP reprojection error below vyaw_timing_max_reproj, AND
+  //   - yaw was NOT replaced by bearing (a faked yaw can't measure spin), AND
+  //   - two consecutive same-direction estimates agree within
+  //     vyaw_timing_consistency (relative). Only then do we blend/tighten P.
+  double vyaw_timing_max_reproj   = 8.0;   // [px] max reproj err to trust a jump for timing
+  double vyaw_timing_consistency  = 0.35;  // successive vyaw timing estimates must agree within ±35%
 
   // ── TARGET SWITCHING ──
   // POLICY: always prefer the closest enemy (highest hit probability).
@@ -263,6 +366,7 @@ public:
 
   enum State { LOST, DETECTING, TRACKING, TEMP_LOST };
   State state() const { return state_; }
+  bool fireStatePermits() const;
   const Eigen::VectorXd & ekfState() const { return x_; }
   double radius() const { return radius_; }
   double otherRadius() const { return other_radius_; }
@@ -273,14 +377,58 @@ public:
   int targetGeneration() const { return target_generation_; }
   /// Current tracked target range (for debug / visualization)
   double targetRange() const;
+  const TrackerDebugInfo & debugInfo() const { return debug_info_; }
+  double pVyaw() const { return (P_.rows() > 7 && P_.cols() > 7) ? P_(7, 7) : 0.0; }
+  bool phaseConfident() const;
+  bool vyawConfident() const { return phaseConfident(); }
+  int consecutiveSameDirJumps() const { return consecutive_same_dir_jumps_; }
+  /// Static horizontal process noise (kept as a method so the debug message
+  /// publisher does not need to reach into cfg_). The adaptive scaler is gone.
+  double qPos() const { return cfg_.q_pos; }
 
 private:
+  struct AssociationHypothesis
+  {
+    bool valid = false;
+    const ArmorDetection * det = nullptr;
+    int face_idx = -1;
+    double yaw_meas = 0.0;
+    bool yaw_valid = false;
+    int yaw_hypothesis = 0;  // 0=primary, 1=IPPE alternate, -1=position-only
+    double mahalanobis = std::numeric_limits<double>::infinity();
+    double position_error = std::numeric_limits<double>::infinity();
+    double yaw_error = std::numeric_limits<double>::infinity();
+  };
+
   void ekfPredict(double dt);
-  Eigen::VectorXd ekfUpdate(const Eigen::Vector4d & z);
-  double ekfMahalanobis(const Eigen::Vector4d & z) const;
+  Eigen::VectorXd ekfUpdateFace(
+    const ArmorDetection & det,
+    int face_idx,
+    double yaw_meas,
+    bool yaw_valid);
+  double ekfMahalanobisFace(
+    const ArmorDetection & det,
+    int face_idx,
+    double yaw_meas,
+    bool yaw_valid) const;
+  Eigen::Matrix4d measurementNoise(
+    const ArmorDetection & det,
+    double face_yaw,
+    bool yaw_valid) const;
+  AssociationHypothesis associateDetections(
+    const std::vector<ArmorDetection> & detections) const;
+  FacePrediction predictFace(const Eigen::VectorXd & x, int face_idx, double t = 0.0) const;
   Eigen::Vector3d armorFromState(const Eigen::VectorXd & x) const;
   void initFromDetection(const ArmorDetection & det);
-  void handleArmorJump(const ArmorDetection & det, const rclcpp::Time & now);
+  void observeFaceAssociation(
+    int matched_face_idx,
+    const ArmorDetection & det,
+    const rclcpp::Time & now,
+    bool yaw_valid);
+  void updateRadiusFromAssociation(
+    const ArmorDetection & det,
+    int face_idx,
+    bool oblique);
   double unwrapYaw(double raw_yaw);
 
   struct BallisticResult { double pitch, flight_time; bool valid; };
@@ -322,6 +470,15 @@ private:
   bool dz_initialized_ = false;
   double last_yaw_ = 0.0;
   std::string target_id_;
+  TrackerDebugInfo debug_info_;
+  // Previous face selected by computeAim(). This is only face scheduling
+  // hysteresis inside one tracked robot; it never resets or switches the EKF.
+  mutable int last_aim_face_idx_ = 0;
+
+  int last_matched_face_idx_ = -1;
+  rclcpp::Time last_face_assoc_time_;
+  bool last_face_assoc_time_valid_ = false;
+  bool phase_timing_confident_ = false;
 
   // ── Spin rate estimation from face jump timing ──
   // Tracks the ROS time of the last face jump and the direction.
@@ -332,6 +489,9 @@ private:
   bool last_jump_time_valid_ = false;
   double last_jump_dir_ = 0.0;   // sign of last jump (+1 CCW, -1 CW)
   int consecutive_same_dir_jumps_ = 0;
+  // Last vyaw estimate from face-jump timing — used to require two consecutive
+  // CONSISTENT estimates before trusting the spin rate (anti-spurious-jump gate).
+  double last_vyaw_timing_est_ = 0.0;
 };
 
 }  // namespace autoaim

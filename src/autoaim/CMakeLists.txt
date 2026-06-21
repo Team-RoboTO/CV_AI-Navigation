@@ -31,6 +31,7 @@ find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/GimbalCmd.msg"
+  "msg/DebugState.msg"
   "msg/ArmorKeypoint.msg"
   "msg/ArmorKeypointArray.msg"
   DEPENDENCIES std_msgs

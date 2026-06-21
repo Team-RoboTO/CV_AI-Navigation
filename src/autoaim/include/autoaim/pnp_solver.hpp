@@ -31,17 +31,32 @@ struct PnPSolver
 
   /// Preferred solve from 4 YOLO-pose keypoints in image pixels.
   /// Keypoint order MUST be TL, TR, BR, BL.
+  ///
+  /// rvec_alt / has_alt (optional): a single armor plate is planar, so IPPE
+  /// returns TWO pose solutions whose ROTATION (yaw) differs while the position
+  /// is essentially the same. When rvec_alt is non-null it is filled with the
+  /// SECOND solution's rotation and has_alt is set true (false when there is
+  /// only one solution, e.g. the ITERATIVE fallback). The caller uses rvec_alt
+  /// only to recover the alternate yaw for temporal disambiguation; tvec (the
+  /// reliable position) is always taken from the best solution.
   bool solveKeypoints(const std::array<cv::Point2f, 4> & corners_tl_tr_br_bl,
                       cv::Mat & rvec, cv::Mat & tvec, bool & is_large,
                       double * reproj_error = nullptr,
-                      double max_reproj_error = 25.0) const;
+                      double max_reproj_error = 25.0,
+                      cv::Mat * rvec_alt = nullptr,
+                      bool * has_alt = nullptr) const;
 
   bool ready() const { return ready_; }
 
 private:
+  /// Solve one plate model. Fills rvec/tvec with the best (lowest-reprojection)
+  /// solution and, when rvec_alt is non-null, the second IPPE solution's
+  /// rotation (has_alt set accordingly). Returns mean reprojection error [px].
   double solveWithModel(const std::vector<cv::Point3f> & obj_pts,
                         const std::vector<cv::Point2f> & img_pts,
-                        cv::Mat & rvec, cv::Mat & tvec) const;
+                        cv::Mat & rvec, cv::Mat & tvec,
+                        cv::Mat * rvec_alt = nullptr,
+                        bool * has_alt = nullptr) const;
 
   cv::Mat K_, dist_;
   // Object points in TL,TR,BR,BL order for direct YOLO-pose corner use.

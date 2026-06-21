@@ -7,6 +7,7 @@ Subscribes to:
   /detector/armors        (Detection2DArray — YOLO bounding boxes)
   /cmd_vel_AI             (Twist — ABSOLUTE pitch/yaw target in radians + fire command)
   /tracker/aim_pixels     (Twist — aim/impact as 2D pixel coordinates from C++ node)
+  /debug_state            (DebugState — authoritative tracker/fire/debug state)
   /micro_status           (Float32MultiArray — [yaw, pitch, vx, vy, ...])
   /camera_info            (CameraInfo — for fallback projection)
 
@@ -41,6 +42,12 @@ try:
 except ImportError:
     HAVE_KEYPOINTS = False
 
+try:
+    from autoaim.msg import DebugState
+    HAVE_DEBUG_STATE = True
+except ImportError:
+    HAVE_DEBUG_STATE = False
+
 
 def wrap_pi(a: float) -> float:
     while a > math.pi:
@@ -64,6 +71,8 @@ class ViewerNode(Node):
         self.cmd_fire = False
         self.cmd_distance = 0.0
         self.tracking = False
+        self.debug_state = None
+        self.last_debug_state_time = 0.0
 
         # Current measured micro angles from /micro_status [rad]
         self.micro_yaw = None
@@ -73,6 +82,9 @@ class ViewerNode(Node):
         self.micro_pitch_feedback_opposite_sign = self.declare_parameter("micro_pitch_feedback_opposite_sign", True).value
         self.aim_topic_timeout = float(self.declare_parameter("aim_topic_timeout", 0.30).value)
         self.cmd_topic_timeout = float(self.declare_parameter("cmd_topic_timeout", 0.50).value)
+        self.use_debug_state = bool(self.declare_parameter("use_debug_state", True).value)
+        self.debug_state_topic = self.declare_parameter("debug_state_topic", "/debug_state").value
+        self.debug_state_timeout = float(self.declare_parameter("debug_state_timeout", 0.50).value)
         self.fire_lock_yaw = float(self.declare_parameter("fire_lock_yaw", 0.05).value)
         self.fire_lock_pitch = float(self.declare_parameter("fire_lock_pitch", 0.04).value)
         self.debug_image_topic = self.declare_parameter(
@@ -109,6 +121,12 @@ class ViewerNode(Node):
         self.create_subscription(Twist, '/tracker/aim_pixels', self.aim_px_cb, sensor_qos)
         self.create_subscription(Float32MultiArray, '/micro_status', self.micro_status_cb, sensor_qos)
         self.create_subscription(CameraInfo, '/camera_info', self.camera_info_cb, sensor_qos)
+
+        if self.use_debug_state and HAVE_DEBUG_STATE:
+            self.create_subscription(DebugState, self.debug_state_topic, self.debug_state_cb, 10)
+        elif self.use_debug_state:
+            self.get_logger().warn(
+                "autoaim.msg.DebugState not available — falling back to command-derived HUD.")
 
         # Keypoint detections — used when the detector publishes 4-point armor
         # keypoints (PnP-from-keypoints mode). Without this the viewer would
@@ -151,6 +169,10 @@ class ViewerNode(Node):
 
     def keypoint_cb(self, msg):
         self.keypoint_detections = list(msg.detections)
+
+    def debug_state_cb(self, msg):
+        self.debug_state = msg
+        self.last_debug_state_time = time.monotonic()
 
     def micro_status_cb(self, msg):
         if len(msg.data) >= 2:
@@ -195,6 +217,140 @@ class ViewerNode(Node):
 
     def _fmt_bool(self, value: bool) -> str:
         return "Y" if value else "N"
+
+    def _fmt_ms(self, value: float) -> str:
+        return f"{value * 1000.0:.0f} ms"
+
+    def _debug_state_fresh(self, now_mono: float) -> bool:
+        return (
+            self.use_debug_state and
+            self.debug_state is not None and
+            self.last_debug_state_time > 0.0 and
+            (now_mono - self.last_debug_state_time) <= self.debug_state_timeout)
+
+    def _debug_state_color(self, state: str, text_ok, text_info, text_warn, text_bad):
+        if state == "TRACKING":
+            return text_ok
+        if state == "TEMP_LOST":
+            return text_warn
+        if state == "DETECTING":
+            return text_info
+        if state == "LOST":
+            return text_bad
+        return text_warn
+
+    def _debug_hud_lines(self, ds, text_ok, text_info, text_dim, text_warn, text_bad):
+        lock_color = text_ok if ds.yaw_locked and ds.pitch_locked else text_warn
+        yaw_color = text_ok if ds.yaw_locked else text_warn
+        pitch_color = text_ok if ds.pitch_locked else text_warn
+        fire_color = text_ok if ds.cmd_fire else (text_warn if ds.aim_fire else text_dim)
+        margin_color = text_ok if ds.margin >= 0.0 else text_warn
+        state_color = self._debug_state_color(ds.state, text_ok, text_info, text_warn, text_bad)
+
+        lines = [
+            (f"STATE: {ds.state}", state_color),
+            (f"AimFire:{self._fmt_bool(ds.aim_fire)} CmdFire:{self._fmt_bool(ds.cmd_fire)} Hold:{self._fmt_bool(ds.holding)}", fire_color),
+            (f"Lock y/p: {self._fmt_bool(ds.yaw_locked)}, {self._fmt_bool(ds.pitch_locked)}", lock_color),
+            (f"Yaw err: {ds.yaw_error:+.3f} / {ds.yaw_lock_threshold:.3f}", yaw_color),
+            (f"Pitch err: {ds.pitch_error:+.3f} / {ds.pitch_lock_threshold:.3f}", pitch_color),
+            (f"vyaw: {ds.vyaw:+.1f} rad/s ({ds.vyaw_rpm:+.0f} rpm)", text_info),
+            (f"Faces:{ds.faces} Phase:{ds.phase:+.3f} Margin:{ds.margin:+.3f}", margin_color),
+            (f"Flight:{self._fmt_ms(ds.flight_time)} Bias:{self._fmt_ms(ds.prediction_bias)} PredT:{self._fmt_ms(ds.prediction_time)}", text_dim),
+        ]
+
+        if hasattr(ds, "jump_detected"):
+            jump_color = text_ok if ds.vyaw_timing_accepted else (
+                text_info if ds.jump_detected else text_dim)
+            dt_jump = self._fmt_ms(ds.dt_jump) if ds.dt_jump >= 0.0 else "n/a"
+            lines.append((
+                "Jump:"
+                f"{self._fmt_bool(ds.jump_detected)} "
+                f"abs:{ds.jump_abs:.2f} dir:{ds.jump_dir:+.0f} "
+                f"1f:{self._fmt_bool(ds.one_face_jump)} dt:{dt_jump}",
+                jump_color))
+            lines.append((
+                "Timing:"
+                f"est:{ds.vyaw_est_from_timing:+.1f} "
+                f"acc:{self._fmt_bool(ds.vyaw_timing_accepted)} "
+                f"conf:{self._fmt_bool(ds.vyaw_confident)} "
+                f"streak:{ds.consecutive_same_dir_jumps} P:{ds.p_vyaw:.2f}",
+                jump_color))
+
+        if hasattr(ds, "best_face_idx"):
+            lines.append((
+                f"Face:{ds.best_face_idx} checked:{ds.faces_checked} "
+                f"phase:{ds.phase_error:+.3f} win:{ds.fire_window:.3f}",
+                margin_color))
+
+        if hasattr(ds, "face_lookahead_active"):
+            ttw = self._fmt_ms(ds.face_time_to_window) if ds.face_time_to_window >= 0.0 else "n/a"
+            lines.append((
+                f"Lookahead:{self._fmt_bool(ds.face_lookahead_active)} "
+                f"sel:{ds.selected_face_idx} ttw:{ttw} "
+                f"reason:{ds.face_switch_reason}",
+                text_info if ds.face_lookahead_active else text_dim))
+
+        if hasattr(ds, "q_pos") and hasattr(ds, "q_yaw"):
+            # q_pos / q_yaw are STATIC now (the adaptive/NIS q_pos controller was
+            # removed — see INSTRUCTIONS.md "Spinning-Target Tuning").
+            lines.append((f"Q pos/yaw: {ds.q_pos:.2f} / {ds.q_yaw:.2f}", text_dim))
+
+        fire_reason = getattr(ds, "fire_block_reason", "")
+        if fire_reason:
+            lines.insert(2, (
+                f"Fire why: {fire_reason}",
+                text_ok if ds.cmd_fire else text_warn))
+
+        if hasattr(ds, "fire_check_command_locked"):
+            gate_ok = (
+                ds.aim_fire and
+                ds.fire_check_finite_cmd and
+                ds.fire_check_command_valid and
+                ds.fire_check_command_locked and
+                ds.fire_check_not_holding)
+            geom_ok = (
+                ds.fire_check_aim_tracking and
+                ds.fire_check_tracker_tracking and
+                ds.fire_check_target_valid and
+                ds.fire_check_distance_ok and
+                ds.fire_check_margin_ok and
+                ds.fire_check_pixels_ok)
+            lines.insert(3, (
+                "Gate aim/fin/cmd/lock/nohold: "
+                f"{self._fmt_bool(ds.aim_fire)}/"
+                f"{self._fmt_bool(ds.fire_check_finite_cmd)}/"
+                f"{self._fmt_bool(ds.fire_check_command_valid)}/"
+                f"{self._fmt_bool(ds.fire_check_command_locked)}/"
+                f"{self._fmt_bool(ds.fire_check_not_holding)}",
+                text_ok if gate_ok else text_warn))
+            lines.insert(4, (
+                "Geom trk/state/tgt/dist/marg/pix: "
+                f"{self._fmt_bool(ds.fire_check_aim_tracking)}/"
+                f"{self._fmt_bool(ds.fire_check_tracker_tracking)}/"
+                f"{self._fmt_bool(ds.fire_check_target_valid)}/"
+                f"{self._fmt_bool(ds.fire_check_distance_ok)}/"
+                f"{self._fmt_bool(ds.fire_check_margin_ok)}/"
+                f"{self._fmt_bool(ds.fire_check_pixels_ok)}",
+                text_ok if geom_ok else text_warn))
+
+        if ds.pitch_cmd_echo_valid:
+            lines.append((
+                f"Pitch raw/lock/cmd: {ds.pitch_raw:+.3f}/{ds.pitch_lock:+.3f}/{ds.pitch_cmd_echo:+.3f}",
+                text_info))
+        else:
+            lines.append((
+                f"Pitch raw/lock/cmd: {ds.pitch_raw:+.3f}/{ds.pitch_lock:+.3f}/n/a",
+                text_info))
+
+        if ds.pixels_valid:
+            lines.append((
+                f"Aim px:{ds.aim_px_x},{ds.aim_px_y} Imp px:{ds.impact_px_x},{ds.impact_px_y}",
+                text_info if ds.pixels_inside else text_warn))
+        else:
+            lines.append(("Aim px:n/a Imp px:n/a", text_warn))
+
+        lines.append((f"r/dz:{ds.radius:.2f}/{ds.dz:+.2f} Dist:{ds.distance:.2f}m", text_info))
+        return lines
 
     def _micro_pitch_for_lock(self) -> float:
         if self.micro_pitch is None:
@@ -269,7 +425,9 @@ class ViewerNode(Node):
         topic_fresh = (
             self.aim_px is not None and
             (now_mono - self.last_aim_px_time) < self.aim_topic_timeout)
-        actively_tracking = self.tracking and cmd_fresh
+        debug_fresh = self._debug_state_fresh(now_mono)
+        debug_state = self.debug_state if debug_fresh else None
+        actively_tracking = bool(debug_state.tracking) if debug_state is not None else (self.tracking and cmd_fresh)
 
         # YOLO bounding boxes
         for det in self.detections:
@@ -318,12 +476,15 @@ class ViewerNode(Node):
             except (AttributeError, IndexError):
                 continue
 
-        # Aim point. Prefer C++ /tracker/aim_pixels, but if it is missing/stale,
-        # compute it from absolute target minus current micro angle.
+        # Aim point. Prefer /debug_state, then legacy /tracker/aim_pixels, then
+        # a local projection fallback from command minus current micro angle.
         aim_to_draw = None
         aim_source = None
         if actively_tracking:
-            if topic_fresh:
+            if debug_state is not None and debug_state.pixels_valid:
+                aim_to_draw = (int(debug_state.aim_px_x), int(debug_state.aim_px_y))
+                aim_source = "debug-hold" if debug_state.holding else "debug"
+            elif debug_state is None and topic_fresh:
                 aim_to_draw = self.aim_px
                 aim_source = "topic-hold" if self.aim_holding else "topic"
             else:
@@ -337,13 +498,22 @@ class ViewerNode(Node):
             self._draw_aim_marker(frame, ax, ay, w, h, aim_source)
 
         # Impact point from C++: selected armor center / desired bullet impact point.
-        if actively_tracking and topic_fresh and self.imp_px is not None:
-            ix, iy = self.imp_px
+        impact_to_draw = None
+        impact_fire = False
+        if actively_tracking and debug_state is not None and debug_state.pixels_valid:
+            impact_to_draw = (int(debug_state.impact_px_x), int(debug_state.impact_px_y))
+            impact_fire = bool(debug_state.cmd_fire)
+        elif actively_tracking and debug_state is None and topic_fresh and self.imp_px is not None:
+            impact_to_draw = self.imp_px
+            impact_fire = self.fire_px
+
+        if impact_to_draw is not None:
+            ix, iy = impact_to_draw
             if 0 <= ix < w and 0 <= iy < h:
-                color = (0, 255, 0) if self.fire_px else (0, 100, 255)
+                color = (0, 255, 0) if impact_fire else (0, 100, 255)
                 cv2.circle(frame, (ix, iy), 22, color, 3)
                 cv2.drawMarker(frame, (ix, iy), color, cv2.MARKER_TILTED_CROSS, 30, 2)
-                label = "FIRE" if self.fire_px else "HOLD"
+                label = "FIRE" if impact_fire else "HOLD"
                 cv2.putText(frame, label, (ix+25, iy+5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
 
@@ -356,7 +526,10 @@ class ViewerNode(Node):
         text_bad = (0, 0, 255)
 
         lines = []
-        if actively_tracking:
+        if debug_state is not None:
+            lines = self._debug_hud_lines(
+                debug_state, text_ok, text_info, text_dim, text_warn, text_bad)
+        elif actively_tracking:
             lines.append(("STATE: TRACKING", text_ok))
             lines.append((f"Pitch tgt: {self.cmd_pitch:+.3f} rad", text_info))
             lines.append((f"Yaw tgt:   {self.cmd_yaw:+.3f} rad", text_info))
@@ -387,13 +560,18 @@ class ViewerNode(Node):
             else:
                 lines.append(("STATE: SEARCHING", text_dim))
 
-        y_off = 25
+        if self.use_debug_state and HAVE_DEBUG_STATE and self.debug_state is not None and not debug_fresh:
+            lines.insert(0, (f"DEBUG STATE STALE ({self._fmt_age(self.last_debug_state_time)})", text_warn))
+
+        y_off = 20 if debug_state is not None else 25
+        font_scale = 0.43 if debug_state is not None else 0.55
+        line_step = 17 if debug_state is not None else 22
         for i, (line, color) in enumerate(lines):
-            y = y_off + i * 22
-            (tw, th), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+            y = y_off + i * line_step
+            (tw, th), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
             cv2.rectangle(frame, (8, y - th - 4), (18 + tw, y + 6), (0, 0, 0), -1)
             cv2.putText(frame, line, (12, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 1, cv2.LINE_AA)
 
         if self.pub is not None:
             out_msg = self.bridge.cv2_to_imgmsg(frame, 'bgr8')

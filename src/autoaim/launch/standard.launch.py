@@ -17,8 +17,15 @@ DEFAULT_ENGINE = "/workspaces/isaac_ros-dev/AI-models/yolov26_keypoints.engine"
 # Change this to "zed" or "realsense" when this robot's default camera changes.
 DEFAULT_CAMERA = "realsense"
 
+# Main debug switches for the standard launch.
+publish_debug_state = True
+publish_other_debug_messages = False
+
 def autoaim_params():
     return [
+        {"publish_debug_state": publish_debug_state},
+        {"publish_other_debug_messages": publish_other_debug_messages},
+
         # YOLO26 labels: 0=blue armor, 1=grey armor (ignored), 2=red armor.
         # True: read our team color from /micro_status[target_color_status_index]
         #       and pick the enemy class automatically via micro_color_target_classes.
@@ -35,8 +42,8 @@ def autoaim_params():
         {"keypoint_topic": "/detector/armors_keypoints"},
 
         # 0.0 accepted garbage keypoints -> PnP jitter -> fire-lock dropouts.
-        {"min_keypoint_score": 0.3},
-        {"max_reproj_error": 25.0},
+        {"min_keypoint_score": 0.20},
+        {"max_reproj_error": 30.0},
 
         # Use the gimbal angles AT THE IMAGE TIMESTAMP for the camera->odom
         # projection (ring buffer + interpolation) instead of the latest angles.
@@ -47,30 +54,42 @@ def autoaim_params():
         {"max_armor_distance": 6.0},
         {"max_armor_z": 4.0},
         {"confirm_frames": 2},
-        {"lost_timeout": 0.50},
+        {"lost_timeout": 1.00},
+        {"track_grace_misses": 2},
+        # Grace handles single-frame dropouts. Keep TEMP_LOST firing disabled
+        # unless testing shows the bounded coast-fire path is still needed.
+        {"fire_in_temp_lost": False},
+        {"temp_lost_fire_max": 3},
 
-        # 30/40 were very high — probably raised to fight the lag caused by the
-        # missing image<->angle sync (now fixed). High q makes the state track
-        # measurement noise -> jittery commands -> fire-lock dropouts.
-        # Start lower; raise again only if tracking feels sluggish AFTER the fix.
-        {"q_pos": 100.0},
+        # STATIC process noise. The adaptive/NIS q_pos controller was REMOVED:
+        # it adapted only the horizontal center, but a spinner's center is ~still,
+        # so it reacted to yaw/PnP model error and overshot the lead.
+        #   q_pos [(m/s^2)^2]: center accel variance. sqrt(5)=2.2 m/s^2 RMS —
+        #     enough lead for a translating standard chassis without chasing noise.
+        #   q_yaw [(rad/s^2)^2]: spin accel variance. 10 lets vyaw track spin-up/
+        #     down; the face-jump-timing gate does the fast convergence.
+        {"q_pos": 10.0},
         {"q_yaw": 20.0},
         {"q_r": 1e-6},
         {"r_pos_base": 0.05},
         {"r_pos_slope": 0.04},
         {"r_yaw_base": 0.05},
         {"r_yaw_slope": 0.005},
-        {"max_oblique_deg": 65.0},
+        {"max_oblique_deg": 75.0},
 
         # 0.98 at ~100 Hz decays the velocity estimate to ~13%/s — a constant
         # drag that under-leads translating targets. Let q_pos handle the noise.
         {"alpha_pos": 0.995},
-        {"alpha_yaw": 1.00},
+        # alpha_yaw = 1.0 → NO spin damping. A 小陀螺 spins at a roughly constant
+        # rate; damping vyaw between updates only makes the spin estimate decay
+        # and the 4-face phase prediction lag behind. 0.995 quietly bled ~26%/s.
+        {"alpha_yaw": 1.0},
         {"alpha_coast": 0.98},
 
         {"initial_radius": 0.24},
         {"radius_ema_alpha": 0.05},
-        {"initial_dz": 0.05},
+        {"initial_dz": 0.0},
+        {"adapt_dz_enable": False},
 
         {"bullet_speed": 25.0},
         {"gravity": 9.8},
@@ -91,39 +110,67 @@ def autoaim_params():
         {"barrel_offset_y": 0.02},     # <- MEASURE (lens-cover trick, see INSTRUCTIONS.md)
         {"barrel_offset_z": -0.05},
 
-        # 1.0 rad @ ref 1 m -> ~0.33 rad window at 3 m: OK for tuning, loose for
-        # a match. Against a fast spinner, timed shots need ~0.10-0.18 rad with
-        # window_ref_dist ~3.0. Tighten once the static calibration is done.
-        {"angular_window": 1.0},
-        {"window_ref_dist": 1.0},
+        # FIRE WINDOW (facing tolerance on the selected plate).
+        # margin = win - |phase_error|,  win = angular_window * min(ref/range, 1.0).
+        # The min() is now capped at 1.0 (was 2.0): the window only SHRINKS far
+        # away, it no longer DOUBLES up close — that close-range expansion let the
+        # shot fire on a plate up to ~46° off-facing (the "hits the wheels / 45°
+        # to the side" bug). Budget: facing tol (~0.10) + vyaw_unc*horizon
+        # (~0.05-0.18) ≈ 0.15-0.28 rad. 0.35 (20°) at/under 3 m is a safe start;
+        # now that vyaw is gated you can tighten toward 0.25 for tighter groups.
+        {"angular_window": 0.35},
+        {"window_ref_dist": 3.0},
         {"min_fire_dist": 0.2},
         {"max_fire_dist": 6.0},
+        # Face lookahead is aim planning, not shot permission. The fire window
+        # still decides when a shot is safe; lookahead pre-aims an incoming face
+        # so the gimbal is settled when that face enters the unchanged window.
+        {"face_lookahead_enable": True},
+        {"face_lookahead_min_vyaw": 0.35},
+        {"face_lookahead_horizon": 0.35},
+        {"face_switch_hysteresis": 0.08},
+        {"min_face_hold_time": 0.10},
 
-        # 0.005 is essentially ZERO latency compensation. It must cover the FULL
-        # capture->muzzle latency (capture+inference+transport+serial+gimbal),
-        # typically 40-80 ms for this pipeline. Now that the detector stamps with
-        # capture time you can MEASURE it: log (now - header.stamp) at command
-        # publish and add ~15 ms. Too small -> shots trail a mover; too large -> lead.
-        # Measured-latency horizon: the node measures (now − capture stamp)
-        # per frame and adds actuation_latency = serial TX + gimbal settle +
-        # muzzle exit (calibrate: shoot a mover, adjust in 5 ms steps; the node
-        # logs the measured pipeline part every 2 s).
+        # PREDICTION HORIZON = measured(now − capture stamp) + actuation_latency.
+        # actuation_latency is ONLY the post-command fixed delay (serial TX +
+        # gimbal settle + muzzle exit). It must NOT include capture→aim — that is
+        # measured per frame. The old 0.060 double-counted the pipeline, and at
+        # high spin a too-long horizon LEADS the shot into the gap between plates:
+        #   phase error = vyaw * Δt_horizon_error.
+        #   At 300 RPM (31.4 rad/s) every 10 ms of horizon = 0.31 rad ≈ 18° of
+        #   spin. So horizon accuracy of a few ms matters more than anything else
+        #   on a spinner. Calibrate on a mover in 5 ms steps; the node logs the
+        #   measured pipeline part every 2 s.
         {"use_measured_latency": True},
-        {"actuation_latency": 0.020},
-        # Fallback fixed bias, used ONLY if use_measured_latency is False.
-        {"time_bias": 0.045},
+        {"actuation_latency": 0.030},
+        # LEGACY fallback fixed horizon, used ONLY if use_measured_latency=False.
+        # Then it must cover the FULL capture→muzzle latency (40-80 ms typical).
+        {"LEGACY_time_bias": 0.045},
 
         # Must equal the REAL detection rate: ros2 topic hz /detector/armors_keypoints
         # (the ZED grabs at 120 fps — if inference keeps up this should be ~120).
         {"ref_freq": 60.0},
-        {"yaw_jump_thresh": 0.55},
+        # yaw_jump_thresh 1.20 rad (69°): a real face switch is ~90° (1.57 rad);
+        # a 300 RPM spinner moves 31.4/60 = 0.52 rad between 60 Hz frames, so 1.20
+        # sits cleanly between "normal frame" and "face switch".
+        {"yaw_jump_thresh": 1.20},
         {"use_vyaw_from_timing": True},
-        {"vyaw_timing_min_dt": 0.050},
-        {"vyaw_timing_max_dt": 0.500},
-        {"vyaw_fire_threshold": 5.0},
+        {"vyaw_timing_min_dt": 0.025},
+        {"vyaw_timing_max_dt": 0.700},
+        {"vyaw_conf_p_max": 2.0},
+        # ── Anti-spurious-jump gate (stops a PnP flip / bad association from
+        # locking a WRONG vyaw → 45° side shots). A jump only drives the spin
+        # estimator when PnP reproj < vyaw_timing_max_reproj AND two consecutive
+        # same-direction estimates agree within ±vyaw_timing_consistency.
+        {"vyaw_timing_max_reproj": 8.0},     # [px] raise if good spins are ignored
+        {"vyaw_timing_consistency": 0.35},   # ±35%; lower = stricter spin lock
 
-        {"max_match_dist": 0.8},
-        {"maha_threshold": 16.9},
+        {"max_match_dist": 1.1},
+        # maha_threshold: 4-DOF chi-square gate. 99% = 13.3, 99.9% = 18.5. 25 is
+        # intentionally loose (R is obliquity-inflated, so visible-but-oblique
+        # plates still pass and TRACKING does not flicker to TEMP_LOST). Lower
+        # toward ~16 only if false detections are being associated.
+        {"maha_threshold": 25.0},
         {"switch_range_ratio": 0.85},
         {"switch_cooldown": 10},
         {"same_target_identity_dist": 1.0},
@@ -135,19 +182,18 @@ def autoaim_params():
         {"cmd_rate_limit_pitch": 0.0},
         {"fire_lock_yaw": 0.05},
         {"fire_lock_pitch": 0.04},
+        {"fire_lock_k_yaw": 0.0675},
+        {"fire_lock_k_pitch": 0.0625},
+        {"fire_lock_min": 0.015},
+        {"fire_lock_max_yaw": 0.12},
+        {"fire_lock_max_pitch": 0.10},
 
-        # ⚠ THESE TWO MUST BE EQUAL. Both describe the same physical fact —
-        # whether the micro's pitch FEEDBACK has the opposite sign of its pitch
-        # COMMAND. pitch_sign appears SQUARED in the loop, so it cannot absorb
-        # the difference (the old comment claiming independence was wrong).
-        # With True/False, exactly one of two failures is guaranteed:
-        #   - geometry pitch mirrored -> systematic vertical miss (shoots low/high), or
-        #   - pitch lock error = 2x command -> fire only when commanded pitch ~ 0
-        #     ("shoots only sometimes").
-        # Determine the truth empirically: echo /micro_status — field [1] is the
-        # pitch feedback, field [11] is the pitch command echo. With the gimbal
-        # settled on a target: feedback ≈ -command -> set BOTH True;
-        # feedback ≈ +command -> set BOTH False.
+        # Pitch signs have two different jobs:
+        # - feedback_opposite corrects geometry/PnP from raw micro feedback.
+        # - lock_opposite converts raw feedback to command-echo convention.
+        # On this firmware the measured stable target log is:
+        #   micro pitch feedback ~= command echo, so lock_opposite is False.
+        # Geometry still needs the feedback inversion with gimbal.pitch_sign=-1.
         {"micro_pitch_feedback_opposite_sign": True},
         {"micro_pitch_lock_opposite_sign": False},
 
@@ -157,7 +203,7 @@ def autoaim_params():
         {"require_aim_inside_frame": False},
 
         {"use_ego_motion_compensation": True},
-        {"ego_velocity_available": True},
+        {"ego_velocity_available": False},
         {"ego_velocity_body_frame": True},
         {"ego_velocity_scale_x": 1.0},
         {"ego_velocity_scale_y": 1.0},
@@ -209,6 +255,8 @@ def generate_launch_description():
         # Must match micro_pitch_lock_opposite_sign in the autoaim params above,
         # otherwise the pitch-error numbers in the debug overlay are sign-flipped.
         {"micro_pitch_feedback_opposite_sign": False},
+        {"use_debug_state": publish_debug_state},
+        {"debug_state_topic": "/debug_state"},
         {"fire_lock_yaw": 0.05},
         {"fire_lock_pitch": 0.04},
     ]
