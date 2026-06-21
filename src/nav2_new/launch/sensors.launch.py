@@ -79,15 +79,15 @@ def generate_launch_description():
         description='Enable Livox CustomMsg filtering before FAST-LIO'
     )
 
-    filter_min_range_arg = DeclareLaunchArgument('filter_min_range', default_value='0.45')
-    filter_max_range_arg = DeclareLaunchArgument('filter_max_range', default_value='6.0')
-    filter_min_z_arg = DeclareLaunchArgument('filter_min_z', default_value='-0.50')
-    filter_max_z_arg = DeclareLaunchArgument('filter_max_z', default_value='-0.40')
+    filter_min_range_arg = DeclareLaunchArgument('filter_min_range', default_value='0.10')
+    filter_max_range_arg = DeclareLaunchArgument('filter_max_range', default_value='4.0')
+    filter_min_z_arg = DeclareLaunchArgument('filter_min_z', default_value='-3.00')
+    filter_max_z_arg = DeclareLaunchArgument('filter_max_z', default_value='3.00')
     filter_drop_tags_arg = DeclareLaunchArgument('filter_drop_nonzero_tags', default_value='false')
 
     lidar_x_arg = DeclareLaunchArgument('lidar_x', default_value='0.0')
     lidar_y_arg = DeclareLaunchArgument('lidar_y', default_value='0.0')
-    lidar_z_arg = DeclareLaunchArgument('lidar_z', default_value='0.60')
+    lidar_z_arg = DeclareLaunchArgument('lidar_z', default_value='0.65')
 
     livox_driver = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
@@ -193,7 +193,7 @@ def generate_launch_description():
             'angle_increment': 0.015,
             'scan_time': 0.1,
             'range_min': 0.20,
-            'range_max': 10.0,
+            'range_max': 4.0,
             'inf_epsilon': 1.0,
             'use_inf': True,
         }],
@@ -225,9 +225,18 @@ def generate_launch_description():
         parameters=[{
             'input_topic': '/scan',
             'output_topic': '/scan_nav',
-            'persistence_sec': 0.1,
+            'persistence_sec': 0.15,
             'min_range': 0.20,
-            'max_range': 6.0,
+            'max_range': 4.0,
+            # Gate the scan while the turret/head is moving or CV is active.
+            # This prevents a head-mounted Livox from drawing fake obstacles in Nav2.
+            'gate_enabled': True,
+            'gate_topic': '/turret/cmd',
+            'cv_mode_threshold': 0.5,
+            'gate_hold_sec': 0.40,
+            'gate_on_turret_motion': True,
+            'turret_motion_yaw_delta': 0.03,
+            'publish_clear_scan_when_gated': True,
         }],
         output='screen',
     )

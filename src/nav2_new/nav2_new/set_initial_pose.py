@@ -21,6 +21,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from std_msgs.msg import String, Bool
+from builtin_interfaces.msg import Time
 
 
 def yaw_to_quat(yaw: float):
@@ -152,7 +153,9 @@ class SetInitialPose(Node):
             return
 
         msg = PoseWithCovarianceStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
+        # Use time zero so AMCL uses the latest available TF instead of
+        # failing with "extrapolation into the future" during startup.
+        msg.header.stamp = Time()
         msg.header.frame_id = 'map'
         msg.pose.pose.position.x = float(spawn['x'])
         msg.pose.pose.position.y = float(spawn['y'])

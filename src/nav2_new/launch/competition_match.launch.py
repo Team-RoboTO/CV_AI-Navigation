@@ -131,7 +131,7 @@ def generate_launch_description():
         sensors,
 
         # 2s: status adapter can already listen to /micro_status; game status can monitor startup.
-        TimerAction(period=5.0, actions=[micro_status_adapter, game_status_reporter]),
+        TimerAction(period=3.0, actions=[micro_status_adapter, game_status_reporter]),
 
         # 15s: start Nav2 only after Livox/IMU/FAST-LIO have had time to stabilize.
         TimerAction(period=15.0, actions=[nav]),
@@ -140,10 +140,10 @@ def generate_launch_description():
         TimerAction(period=21.0, actions=[nav_match_reset]),
 
         # 24s: seed AMCL initial pose after map_server/amcl are alive.
-        TimerAction(period=24.0, actions=[set_initial_pose]),
+        TimerAction(period=40.0, actions=[set_initial_pose]),
 
         # 28s: start match logic and waypoint execution.
-        TimerAction(period=28.0, actions=[turret_idle_target, waypoint_manager, game_state_manager]),
+        TimerAction(period=55.0, actions=[turret_idle_target, waypoint_manager, game_state_manager]),
 
         rviz,
     ])
