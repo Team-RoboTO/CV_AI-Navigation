@@ -11,59 +11,31 @@ waypoints:
   fine_corridoio:  { x: 3.444, y: 0.381, yaw: 0.000 }
   centro_lab:      { x: 3.508, y: 6.240, yaw: 0.000 }
   scrivania_Leo:   { x: 3.622, y: 2.375, yaw: 0.000 }
+  diagonale_1 :    { x: -0.787, y: 2.140, yaw: 0.000 }
+  diagonale_2:    { x: 0.246, y: 0.596, yaw: 0.000 }
+
+health:
+  retreat_threshold: 120.0
 
 strategies:
-
-  # Il robot resta nello spawn.
   wait_at_spawn:
     red:  [spawn_lab]
     blue: [spawn_lab]
 
-  # Strategia principale quando parte il match.
-  rush_center:
-    red:  [centro_lab, scrivania_Leo,fine_corridoio]
-    blue: [centro_lab, scrivania_Leo,fine_corridoio]
+  # Percorso di andata/ritorno dalla base verso la zona di gioco/centro.
+  percorso:
+    red:  [fine_corridoio, centro_lab]
+    blue: [fine_corridoio, centro_lab]
 
-  # Ritorno zona sicura/spawn quando HP bassa.
+  # Questa è la strategia che deve ripetersi in loop.
+  # Se la tua si chiama hold_center_diagonal, usa quel nome anche nei parametri sopra.
+  center_free_strategy:
+    red:  [diagonale_1, diagonale_2]
+    blue: [diagonale_1, diagonale_2]
+
   retreat_to_spawn:
     red:  [spawn_lab]
     blue: [spawn_lab]
-
-  # Dopo 4 secondi allo spawn torna verso il centro.
-  after_retreat:
-    red:  [fine_corridoio]
-    blue: [fine_corridoio]
-
-  # Centro libero: test semplice, vai al centro.
-  center_free_strategy:
-    red:  [centro_lab]
-    blue: [centro_lab]
-
-  # Centro nostro: test diagonale/laterale.
-  hold_center_diagonal:
-    red:  [scrivania_Leo]
-    blue: [scrivania_Leo]
-
-  # Centro occupato da nemico: strategia alternativa.
-  enemy_center_strategy:
-    red:  [fine_corridoio]
-    blue: [fine_corridoio]
-
-  # Strategie tue originali, puoi tenerle.
-  centro_lab:
-    red:  [centro_lab]
-    blue: [centro_lab]
-
-  percorso:
-    red:  [fine_corridoio, centro_lab, scrivania_Leo]
-    blue: [fine_corridoio, centro_lab, scrivania_Leo]
-
-health:
-  retreat_threshold: 30
-  safe_threshold: 70
-  low_hp_strategy: retreat_to_spawn
-  default_strategy: rush_center
-  hold_strategy: hold_center_diagonal
 
 turret_idle_targets:
   red: fine_corridoio
