@@ -40,12 +40,21 @@ Inverse mapping back to ZED native pixels uses the same dynamic letterbox geomet
 import json
 import math
 import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 import threading
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import cv2
 import numpy as np
+cv2.setNumThreads(1)
+try:
+    cv2.ocl.setUseOpenCL(False)
+except Exception:
+    pass
 import pycuda.driver as cuda
 import pyzed.sl as sl
 import rclpy

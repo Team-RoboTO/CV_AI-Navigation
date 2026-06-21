@@ -152,11 +152,11 @@ def turret_mux_params():
         # Tune sign/zero against your micro convention.
         {"yaw_sign": 1.0},
         {"yaw_zero_offset": 0.0},
-        {"idle_yaw_rate_limit": 0.5},
+        {"idle_yaw_rate_limit": 2.5},
 
 
-        {"idle_recompute_period": 0.10},
-        {"idle_yaw_deadband": 0.07},
+        {"idle_recompute_period": 0.02},
+        {"idle_yaw_deadband": 0.7},
 
         # Pitch: hold the current pitch by default. Use "static" or "target" if needed.
         {"idle_pitch_mode": "hold_last_micro"},
@@ -256,13 +256,13 @@ def generate_launch_description():
             output="screen",
         ),
 
-        Node(
-            package="autoaim",
-            executable="viewer_node.py",
-            name="autoaim_viewer",
-            parameters=viewer_params,
-            output="screen",
-        ),
+        #Node(
+        #    package="autoaim",
+        #    executable="viewer_node.py",
+        #    name="autoaim_viewer",
+        #    parameters=viewer_params,
+        #    output="screen",
+        #),
 
         Node(
             package="autoaim",
@@ -270,6 +270,7 @@ def generate_launch_description():
             name="zed_detector",
             parameters=[zed_config, engine_override],
             output="screen",
+            prefix="taskset -c 9-11 nice -n 8",
             condition=zed_condition,
         ),
 
