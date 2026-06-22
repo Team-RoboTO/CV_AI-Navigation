@@ -1,22 +1,17 @@
 """
-tf_frame_relay - Relay FAST_LIO TF into a planar, head-referenced ROS frame.
+tf_frame_relay - Relay FAST_LIO TF into a planar, head-referenced ROS frame,
+with a micro-odometry stationary translation lock.
 
-FAST_LIO publishes the 3D pose of the LiDAR/IMU rigid body:
+This node intentionally keeps the part that worked in the original package:
+FAST-LIO's camera_init -> body pose is the primary odom -> base_link pose.
 
-    camera_init -> body
+The only added behaviour is:
+- when the micro says the chassis is not translating, freeze x/y exactly;
+- still publish yaw from FAST-LIO, so head/barrel rotation is visible;
+- keep a translation correction offset so releasing the lock does not jump.
 
-This package intentionally uses a head-referenced navigation convention:
-
-    odom -> base_link
-
-where base_link is the planar navigation frame associated with the head/LiDAR
-rigid body, not the chassis center.
-
-Important for SLAM Toolbox:
-- slam_toolbox is 2D, so odom -> base_link must be planar.
-- Do not publish FAST_LIO's raw 3D roll/pitch/z as base_link.
-- This relay converts the FAST_LIO orientation into yaw-only and forces z=0.
-- The Livox mounting flip remains a static TF: base_link -> livox_frame.
+This avoids the failure mode of the later experimental packages where x/y was
+integrated from vx/vy in the wrong reference frame, causing diagonal motion.
 """
 
 import copy
@@ -25,6 +20,7 @@ from typing import Tuple
 
 import rclpy
 from rclpy.node import Node
+from std_msgs.msg import Float32MultiArray
 from tf2_msgs.msg import TFMessage
 
 
@@ -65,6 +61,18 @@ def _quaternion_from_yaw(yaw: float) -> Tuple[float, float, float, float]:
     return 0.0, 0.0, math.sin(half), math.cos(half)
 
 
+def _read_array(data, idx, default=0.0):
+    if idx < 0 or idx >= len(data):
+        return default, False
+    try:
+        v = float(data[idx])
+    except Exception:
+        return default, False
+    if not math.isfinite(v):
+        return default, False
+    return v, True
+
+
 class TFFrameRelay(Node):
     def __init__(self):
         super().__init__('tf_frame_relay')
@@ -77,26 +85,31 @@ class TFFrameRelay(Node):
 
         # Constant transform from FAST_LIO body frame to the ROS-compatible
         # head-referenced base_link frame, expressed as q_body_base in xyzw.
-        # Default = identity. In deepglint-style inverted-driver mode, the
-        # modified Livox driver already applies roll=180 to BOTH cloud and IMU,
-        # so FAST_LIO body is already the head/base frame.
         self.declare_parameter('body_to_base_qx', 0.0)
         self.declare_parameter('body_to_base_qy', 0.0)
         self.declare_parameter('body_to_base_qz', 0.0)
         self.declare_parameter('body_to_base_qw', 1.0)
 
-        # Critical for 2D SLAM: publish a yaw-only odom -> base_link.
         self.declare_parameter('planarize', True)
         self.declare_parameter('force_z_zero', True)
-
-        # Set True when physical clockwise head rotation appears counterclockwise
-        # in RViz. This fixes the yaw convention after planarization.
         self.declare_parameter('invert_yaw', False)
-
-        # Translation sign corrections. ROS convention: +X forward, +Y left.
-        # Keep True if physical forward/left appear as negative X/Y in RViz.
         self.declare_parameter('invert_x', False)
         self.declare_parameter('invert_y', False)
+
+        # Micro gate. Current firmware layout:
+        # data[0] = gimbal yaw (bounded; not used here)
+        # data[1] = pitch (ignored)
+        # data[2] = vx
+        # data[3] = vy
+        self.declare_parameter('use_micro_stationary_gate', True)
+        self.declare_parameter('micro_status_topic', '/micro_status')
+        self.declare_parameter('micro_vx_index', 2)
+        self.declare_parameter('micro_vy_index', 3)
+        self.declare_parameter('micro_vx_sign', 1.0)
+        self.declare_parameter('micro_vy_sign', -1.0)
+        self.declare_parameter('stationary_vxy_threshold', 0.12)
+        self.declare_parameter('micro_timeout_sec', 0.30)
+        self.declare_parameter('log_stationary_gate', True)
 
         input_topic = self.get_parameter('input_topic').value
         self.source_parent_frame = self.get_parameter('source_parent_frame').value
@@ -115,16 +128,93 @@ class TFFrameRelay(Node):
         self.invert_x = bool(self.get_parameter('invert_x').value)
         self.invert_y = bool(self.get_parameter('invert_y').value)
 
+        self.use_micro_stationary_gate = bool(self.get_parameter('use_micro_stationary_gate').value)
+        self.micro_status_topic = self.get_parameter('micro_status_topic').value
+        self.micro_vx_index = int(self.get_parameter('micro_vx_index').value)
+        self.micro_vy_index = int(self.get_parameter('micro_vy_index').value)
+        self.micro_vx_sign = float(self.get_parameter('micro_vx_sign').value)
+        self.micro_vy_sign = float(self.get_parameter('micro_vy_sign').value)
+        self.stationary_vxy_threshold = float(self.get_parameter('stationary_vxy_threshold').value)
+        self.micro_timeout_sec = float(self.get_parameter('micro_timeout_sec').value)
+        self.log_stationary_gate = bool(self.get_parameter('log_stationary_gate').value)
+
+        self.last_micro_time = None
+        self.micro_vx = 0.0
+        self.micro_vy = 0.0
+        self.has_last_output = False
+        self.last_out_x = 0.0
+        self.last_out_y = 0.0
+        self.corr_x = 0.0
+        self.corr_y = 0.0
+        self.hold_x = 0.0
+        self.hold_y = 0.0
+        self.holding_xy = False
+        self.last_gate_state = None
+
         self.sub = self.create_subscription(TFMessage, input_topic, self._on_tf, 100)
         self.pub = self.create_publisher(TFMessage, '/tf', 100)
+        if self.use_micro_stationary_gate:
+            self.micro_sub = self.create_subscription(
+                Float32MultiArray, self.micro_status_topic, self._on_micro_status, 50)
+        else:
+            self.micro_sub = None
 
         self.get_logger().info(
-            f'TF relay active: {self.source_parent_frame}->{self.source_child_frame} '
+            f'TF relay V21 active: FAST-LIO primary {self.source_parent_frame}->{self.source_child_frame} '
             f'=> {self.target_parent_frame}->{self.target_child_frame}; '
-            f'body_to_base_q(xyzw)={self.body_to_base_q}; '
+            f'micro stationary gate={self.use_micro_stationary_gate} topic={self.micro_status_topic} '
+            f'vx[{self.micro_vx_index}]*{self.micro_vx_sign} vy[{self.micro_vy_index}]*{self.micro_vy_sign} '
+            f'th={self.stationary_vxy_threshold:.3f}; '
             f'planarize={self.planarize}; force_z_zero={self.force_z_zero}; '
             f'invert_yaw={self.invert_yaw}; invert_x={self.invert_x}; invert_y={self.invert_y}'
         )
+
+    def _on_micro_status(self, msg: Float32MultiArray):
+        vx, okx = _read_array(msg.data, self.micro_vx_index, 0.0)
+        vy, oky = _read_array(msg.data, self.micro_vy_index, 0.0)
+        if okx:
+            self.micro_vx = self.micro_vx_sign * vx
+        if oky:
+            self.micro_vy = self.micro_vy_sign * vy
+        self.last_micro_time = self.get_clock().now()
+
+    def _micro_fresh(self) -> bool:
+        if self.last_micro_time is None:
+            return False
+        return (self.get_clock().now() - self.last_micro_time).nanoseconds * 1e-9 <= self.micro_timeout_sec
+
+    def _stationary_by_micro(self) -> bool:
+        if not self.use_micro_stationary_gate:
+            return False
+        if not self._micro_fresh():
+            return False
+        return math.hypot(self.micro_vx, self.micro_vy) <= self.stationary_vxy_threshold
+
+    def _apply_stationary_translation_lock(self, raw_x: float, raw_y: float) -> Tuple[float, float]:
+        stationary = self._stationary_by_micro()
+        state = 'stationary_lock' if stationary else ('micro_timeout' if self.use_micro_stationary_gate and not self._micro_fresh() else 'moving_lio_primary')
+        if state != self.last_gate_state and self.log_stationary_gate:
+            self.last_gate_state = state
+            self.get_logger().info(
+                f'TF gate state: {state}; vx={self.micro_vx:.3f} vy={self.micro_vy:.3f} '
+                f'raw=({raw_x:.3f},{raw_y:.3f}) corr=({self.corr_x:.3f},{self.corr_y:.3f})')
+
+        if stationary:
+            if not self.holding_xy:
+                if self.has_last_output:
+                    self.hold_x = self.last_out_x
+                    self.hold_y = self.last_out_y
+                else:
+                    self.hold_x = raw_x + self.corr_x
+                    self.hold_y = raw_y + self.corr_y
+                self.holding_xy = True
+            # Track raw LIO drift with the correction offset so release has no jump.
+            self.corr_x = self.hold_x - raw_x
+            self.corr_y = self.hold_y - raw_y
+            return self.hold_x, self.hold_y
+
+        self.holding_xy = False
+        return raw_x + self.corr_x, raw_y + self.corr_y
 
     def _on_tf(self, msg: TFMessage):
         out = TFMessage()
@@ -157,14 +247,20 @@ class TFFrameRelay(Node):
             t2.transform.rotation.z = q_base[2]
             t2.transform.rotation.w = q_base[3]
 
-            # Convert FAST_LIO planar translation signs to ROS planar conventions.
-            # ROS convention: +X is forward, +Y is left.
+            raw_x = t.transform.translation.x
+            raw_y = t.transform.translation.y
             if self.invert_x:
-                t2.transform.translation.x = -t2.transform.translation.x
+                raw_x = -raw_x
             if self.invert_y:
-                t2.transform.translation.y = -t2.transform.translation.y
+                raw_y = -raw_y
 
-            # The 2D navigation frame must not carry FAST_LIO vertical motion.
+            out_x, out_y = self._apply_stationary_translation_lock(raw_x, raw_y)
+            t2.transform.translation.x = out_x
+            t2.transform.translation.y = out_y
+            self.last_out_x = out_x
+            self.last_out_y = out_y
+            self.has_last_output = True
+
             if self.force_z_zero:
                 t2.transform.translation.z = 0.0
 

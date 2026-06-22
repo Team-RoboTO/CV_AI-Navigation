@@ -24,8 +24,8 @@ strategies:
 
   # Percorso di andata/ritorno dalla base verso la zona di gioco/centro.
   percorso:
-    red:  [fine_corridoio, centro_lab]
-    blue: [fine_corridoio, centro_lab]
+    red:  [fine_corridoio, scrivania_Leo]
+    blue: [fine_corridoio, scrivania_Leo]
 
   # Questa è la strategia che deve ripetersi in loop.
   # Se la tua si chiama hold_center_diagonal, usa quel nome anche nei parametri sopra.
@@ -38,8 +38,8 @@ strategies:
     blue: [spawn_lab]
 
 turret_idle_targets:
-  red: fine_corridoio
-  blue: fine_corridoio
+  red: centro_lab
+  blue: centro_lab
 
 
 # --- Arena metadata (for documentation only) --------------------------------

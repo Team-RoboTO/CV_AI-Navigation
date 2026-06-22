@@ -38,6 +38,10 @@ def generate_launch_description():
     lidar_z_arg = DeclareLaunchArgument('lidar_z', default_value='0.6')
     start_sensors_arg = DeclareLaunchArgument('start_sensors', default_value='true')
     start_rviz_arg = DeclareLaunchArgument('rviz', default_value='false')
+    stationary_vxy_threshold_arg = DeclareLaunchArgument('stationary_vxy_threshold', default_value='0.06')
+    micro_timeout_sec_arg = DeclareLaunchArgument('micro_timeout_sec', default_value='0.30')
+    micro_vy_sign_arg = DeclareLaunchArgument('micro_vy_sign', default_value='-1.0')
+    publish_fastlio_debug_tf_arg = DeclareLaunchArgument('publish_fastlio_debug_tf', default_value='false')
 
     params_file_arg = DeclareLaunchArgument(
         'params_file',
@@ -45,11 +49,11 @@ def generate_launch_description():
     )
     waypoints_file_arg = DeclareLaunchArgument(
         'waypoints_file',
-        default_value=os.path.join(pkg_share, 'config', 'arena_waypoints.yaml'),
+        default_value=os.path.join(pkg_share, 'config', 'arena_waypoints_lab.yaml'),
     )
     match_params_file_arg = DeclareLaunchArgument(
         'match_params_file',
-        default_value=os.path.join(pkg_share, 'config', 'match_manager_params.yaml'),
+        default_value=os.path.join(pkg_share, 'config', 'match_manager_params_lab.yaml'),
     )
 
     sensors = IncludeLaunchDescription(
@@ -59,6 +63,10 @@ def generate_launch_description():
             'mount': LaunchConfiguration('mount'),
             'lidar_z': LaunchConfiguration('lidar_z'),
             'rviz': 'false',
+            'stationary_vxy_threshold': LaunchConfiguration('stationary_vxy_threshold'),
+            'micro_timeout_sec': LaunchConfiguration('micro_timeout_sec'),
+            'micro_vy_sign': LaunchConfiguration('micro_vy_sign'),
+            'publish_fastlio_debug_tf': LaunchConfiguration('publish_fastlio_debug_tf'),
         }.items(),
     )
 
@@ -125,6 +133,7 @@ def generate_launch_description():
     return LaunchDescription([
         map_arg, team_arg, use_sim_time_arg, use_composition_arg,
         mount_arg, lidar_z_arg, start_sensors_arg, start_rviz_arg,
+        stationary_vxy_threshold_arg, micro_timeout_sec_arg, micro_vy_sign_arg, publish_fastlio_debug_tf_arg,
         params_file_arg, waypoints_file_arg, match_params_file_arg,
 
         # 0s: sensors first.

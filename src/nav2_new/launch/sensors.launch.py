@@ -2,6 +2,11 @@
 """
 sensors.launch.py – Livox Mid-360 head-referenced pipeline.
 
+V21 principle:
+- Keep the original behaviour that worked well while moving: FAST-LIO pose is primary for odom->base_link.
+- Use micro vx/vy only as a stationary gate: if chassis is not translating, freeze x/y exactly but keep yaw from FAST-LIO.
+- This avoids fake translation during head rotation without integrating vx/vy in the wrong frame.
+
 Optimized mode:
 - FAST-LIO uses raw /livox/lidar
 - Nav2/AMCL receive /scan directly from /livox/lidar through livox_to_scan_node
@@ -16,11 +21,11 @@ Important:
 import os
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction, GroupAction
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
-from launch_ros.actions import Node
+from launch_ros.actions import Node, SetRemap
 from launch_ros.substitutions import FindPackageShare
 from ament_index_python.packages import get_package_share_directory
 
@@ -58,6 +63,11 @@ def launch_setup(context, *args, **kwargs):
         executable="tf_frame_relay",
         name="tf_frame_relay",
         parameters=[{
+            "input_topic": "/tf_fastlio",
+            "source_parent_frame": "camera_init",
+            "source_child_frame": "body",
+            "target_parent_frame": "odom",
+            "target_child_frame": "base_link",
             "body_to_base_qx": iqx,
             "body_to_base_qy": iqy,
             "body_to_base_qz": iqz,
@@ -67,6 +77,15 @@ def launch_setup(context, *args, **kwargs):
             "invert_yaw": False,
             "invert_x": False,
             "invert_y": False,
+            "use_micro_stationary_gate": LaunchConfiguration("use_micro_stationary_gate"),
+            "micro_status_topic": "/micro_status",
+            "micro_vx_index": 2,
+            "micro_vy_index": 3,
+            "micro_vx_sign": 1.0,
+            "micro_vy_sign": LaunchConfiguration("micro_vy_sign"),
+            "stationary_vxy_threshold": LaunchConfiguration("stationary_vxy_threshold"),
+            "micro_timeout_sec": LaunchConfiguration("micro_timeout_sec"),
+            "log_stationary_gate": LaunchConfiguration("log_stationary_gate"),
         }],
         output="screen",
     )
@@ -79,6 +98,17 @@ def generate_launch_description():
 
     mount_arg = DeclareLaunchArgument("mount", default_value="normal")
     rviz_arg = DeclareLaunchArgument("rviz", default_value="false")
+
+    use_micro_stationary_gate_arg = DeclareLaunchArgument("use_micro_stationary_gate", default_value="true")
+    stationary_vxy_threshold_arg = DeclareLaunchArgument("stationary_vxy_threshold", default_value="0.06")
+    micro_timeout_sec_arg = DeclareLaunchArgument("micro_timeout_sec", default_value="0.30")
+    micro_vy_sign_arg = DeclareLaunchArgument("micro_vy_sign", default_value="-1.0")
+    log_stationary_gate_arg = DeclareLaunchArgument("log_stationary_gate", default_value="true")
+    publish_fastlio_debug_tf_arg = DeclareLaunchArgument(
+        "publish_fastlio_debug_tf",
+        default_value="false",
+        description="Publish odom->camera_init so raw FAST-LIO body appears in RViz. Keep false in match to avoid ghost TF."
+    )
 
     use_livox_filter_arg = DeclareLaunchArgument(
         "use_livox_filter",
@@ -140,6 +170,7 @@ def generate_launch_description():
         package="tf2_ros",
         executable="static_transform_publisher",
         name="odom_to_camera_init",
+        condition=IfCondition(LaunchConfiguration("publish_fastlio_debug_tf")),
         arguments=[
             "--x", "0", "--y", "0", "--z", "0",
             "--qx", "0", "--qy", "0", "--qz", "0", "--qw", "1",
@@ -234,20 +265,25 @@ def generate_launch_description():
         output="screen",
     )
 
-    fast_lio = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([
-            PathJoinSubstitution([
-                FindPackageShare("fast_lio"),
-                "launch",
-                "mapping.launch.py",
-            ])
-        ]),
-        launch_arguments={
-            "config_path": os.path.join(pkg_share, "config"),
-            "config_file": "mid360.yaml",
-            "rviz": LaunchConfiguration("rviz"),
-        }.items(),
-    )
+    fast_lio = GroupAction([
+        # Keep raw FAST-LIO camera_init->body off the public /tf tree.
+        # tf_frame_relay consumes it privately on /tf_fastlio and publishes the guarded odom->base_link.
+        SetRemap(src="/tf", dst="/tf_fastlio"),
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource([
+                PathJoinSubstitution([
+                    FindPackageShare("fast_lio"),
+                    "launch",
+                    "mapping.launch.py",
+                ])
+            ]),
+            launch_arguments={
+                "config_path": os.path.join(pkg_share, "config"),
+                "config_file": "mid360.yaml",
+                "rviz": LaunchConfiguration("rviz"),
+            }.items(),
+        )
+    ])
 
     scan_memory_filter = Node(
         package="nav2_new",
@@ -280,6 +316,12 @@ def generate_launch_description():
     return LaunchDescription([
         mount_arg,
         rviz_arg,
+        use_micro_stationary_gate_arg,
+        stationary_vxy_threshold_arg,
+        micro_timeout_sec_arg,
+        micro_vy_sign_arg,
+        log_stationary_gate_arg,
+        publish_fastlio_debug_tf_arg,
 
         use_livox_filter_arg,
         filter_min_range_arg,
