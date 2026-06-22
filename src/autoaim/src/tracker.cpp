@@ -142,27 +142,52 @@ Eigen::Matrix4d Tracker::measurementNoise(
       std::pow(det.x - ego_x_, 2) +
       std::pow(det.y - ego_y_, 2) +
       std::pow(det.z - cfg_.gimbal_height, 2));
-  const double ps = cfg_.r_pos_base + cfg_.r_pos_slope * rel_range;
+  // ── ANISOTROPIC position noise (monocular-PnP aware) ──
+  // PnP localises a small planar plate precisely in BEARING (pixel-accurate) but
+  // poorly in DEPTH (range). Isotropic noise forced the EKF to over-smooth the
+  // precise lateral channel just to tolerate depth noise, so it LAGGED a
+  // translating target and OVERSHOT on stop. Split it: radial (along the line of
+  // sight) = large and range-growing (weak depth); tangential (perpendicular) =
+  // small (strong bearing). Vertical z uses the tangential scale. WORKLOG §4b.
+  const double s_rad = cfg_.r_pos_base + cfg_.r_pos_slope * rel_range;
+  const double s_tan = cfg_.r_pos_tang_base + cfg_.r_pos_tang_slope * rel_range;
   const double ys = cfg_.r_yaw_base + cfg_.r_yaw_slope * rel_range;
 
   double xyz_f = 1.0;
   double yaw_f = 1.0;
+  double bearing = 0.0;
   const double dx = det.x - ego_x_;
   const double dy = det.y - ego_y_;
   if (dx * dx + dy * dy > 0.01) {
-    const double bearing = std::atan2(dy, dx);
+    bearing = std::atan2(dy, dx);
     const double face_a =
       std::abs(angles::shortest_angular_distance(face_yaw, bearing));
     const double cf = std::cos(face_a);
     xyz_f = 1.0 / std::max(cf * cf, 0.04);
     yaw_f = 1.0 / std::max(std::pow(std::abs(cf), 4.0), 1e-4);
+    // U-shaped yaw trust: ALSO distrust near face-on, where PnP yaw is poorly
+    // observable (small yaw barely changes the image — the planar flip regime).
+    // Without this, a static near-frontal plate feeds yaw noise straight into
+    // vyaw as phantom spin and the facing/fire margin wanders. See WORKLOG §4.
+    const double sf = std::abs(std::sin(face_a));
+    yaw_f /= std::max(sf * sf, cfg_.yaw_facing_obs_floor);
     if (face_a > cfg_.max_oblique_deg * M_PI / 180.0) {
       yaw_f = 1e6;
     }
   }
 
+  // Rotate diag(radial, tangential) by the bearing into odom x,y. Obliquity
+  // (xyz_f) inflates both — an edge-on plate degrades the whole position fix.
+  // Eigenvalues stay {vr, vt} > 0, so R is positive-definite.
+  const double vr = s_rad * s_rad * xyz_f;
+  const double vt = s_tan * s_tan * xyz_f;
+  const double cb = std::cos(bearing);
+  const double sb = std::sin(bearing);
   Eigen::Matrix4d R = Eigen::Matrix4d::Zero();
-  R(0, 0) = R(1, 1) = R(2, 2) = ps * ps * xyz_f;
+  R(0, 0) = vr * cb * cb + vt * sb * sb;
+  R(1, 1) = vr * sb * sb + vt * cb * cb;
+  R(0, 1) = R(1, 0) = (vr - vt) * cb * sb;
+  R(2, 2) = vt;  // vertical ~ tangential (bearing) precision
   R(3, 3) = yaw_valid ? ys * ys * yaw_f : 1e6;
   return R;
 }
@@ -317,6 +342,11 @@ Tracker::AssociationHypothesis Tracker::associateDetections(
   const std::vector<ArmorDetection> & detections) const
 {
   AssociationHypothesis best;
+  // Comparison key for `best`: the raw Mahalanobis plus the IPPE alternate
+  // penalty. Stored separately so best.mahalanobis stays RAW (the match gate
+  // must not see the penalty), while selection between the two yaw solutions of
+  // the same face gets the hysteresis bias. See WORKLOG §4 (cause 3).
+  double best_cmp = std::numeric_limits<double>::infinity();
 
   struct YawHypothesis
   {
@@ -356,10 +386,15 @@ Tracker::AssociationHypothesis Tracker::associateDetections(
           std::numeric_limits<double>::infinity();
         const double m =
           ekfMahalanobisFace(det, face_idx, yaw_meas, yh.valid);
+        // IPPE hysteresis: the alternate (runner-up) yaw solution must beat the
+        // primary by cfg_.ippe_alt_penalty to win, so near-face-on noise cannot
+        // flip the chosen solution frame-to-frame (WORKLOG §4, cause 3). Only the
+        // SELECTION key carries the penalty; best.mahalanobis stays raw.
+        const double m_cmp = m + (yh.id == 1 ? cfg_.ippe_alt_penalty : 0.0);
 
         if (!best.valid ||
-            m < best.mahalanobis ||
-            (std::abs(m - best.mahalanobis) < 1e-6 &&
+            m_cmp < best_cmp ||
+            (std::abs(m_cmp - best_cmp) < 1e-6 &&
              position_error < best.position_error))
         {
           best.valid = true;
@@ -371,6 +406,7 @@ Tracker::AssociationHypothesis Tracker::associateDetections(
           best.mahalanobis = m;
           best.position_error = position_error;
           best.yaw_error = yaw_error;
+          best_cmp = m_cmp;
         }
       }
     }
@@ -894,6 +930,17 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
   // arriving late on the next plate. Keep the spin-confidence gate so untrusted
   // phase estimates do not re-enable wrong four-face prediction.
   const bool spin_phase_trusted = phaseConfident();
+  // Apply the vyaw (rotational) lead to the AIM only for a CONFIRMED spinning
+  // top. A translating target leaks its position innovation into vyaw through the
+  // EKF position↔yaw coupling (phantom spin, e.g. vyaw≈-0.1 on a straight-moving
+  // enemy); leading the aim by that phantom rotation drifts the shot. Translation
+  // lead (vxc,vyc) ALWAYS applies — only the rotation is gated. WORKLOG §4b.
+  const bool apply_spin_lead =
+    phase_timing_confident_ && std::abs(x_(7)) >= cfg_.face_lookahead_min_vyaw;
+  Eigen::VectorXd x_aim = x_;
+  if (!apply_spin_lead) {
+    x_aim(7) = 0.0;
+  }
   const bool face_lookahead_active =
     cfg_.face_lookahead_enable &&
     spin_phase_trusted &&
@@ -987,7 +1034,7 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
 
     for (int face_slot = 0; face_slot < faces_to_check; face_slot++) {
       const int fi = face_indices[face_slot];
-      const FacePrediction face = predictFace(x_, fi, pred_t);
+      const FacePrediction face = predictFace(x_aim, fi, pred_t);
       const double fy = face.yaw;
       const double fx = face.position.x();
       const double fpy = face.position.y();
@@ -1030,7 +1077,7 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
       double margin = win - err;
 
       auto eval_phase = [&](double t_eval) {
-        const FacePrediction eval_face = predictFace(x_, fi, t_eval);
+        const FacePrediction eval_face = predictFace(x_aim, fi, t_eval);
         const double bx = barrel_x_now + robot_vx * t_eval;
         const double by = barrel_y_now + robot_vy * t_eval;
         const double dx_eval = eval_face.position.x() - bx;
@@ -1247,11 +1294,21 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
   aim.rel_yaw   = std::clamp(aim.rel_yaw, -max_rad, max_rad);
   aim.rel_pitch = std::clamp(aim.rel_pitch, -max_rad, max_rad);
 
+  // Facing gate. The strict margin (plate within the facing window at impact) is
+  // a SPINNER timing gate. For a non-spinning target the plate sits at a fixed
+  // angle and the gimbal is locked on its center (Stage B downstream), so fire
+  // on lock and only reject a genuinely edge-on plate beyond static_facing_max.
+  // This removes the static fire/no-fire flicker that occurred when a slightly
+  // canted plate sat right on the window edge while perfectly aimed. WORKLOG §4.
+  const bool spinning = std::abs(x_(7)) >= cfg_.face_lookahead_min_vyaw;
+  const bool facing_ok = spinning ?
+    (best.margin >= 0.0) :
+    (std::abs(best.phase_error) <= cfg_.static_facing_max);
   aim.fire = best.valid &&
     fireStatePermits() &&
     best.range >= cfg_.min_fire_dist &&
     best.range <= cfg_.max_fire_dist &&
-    best.margin >= 0.0;
+    facing_ok;
 
   return aim;
 }

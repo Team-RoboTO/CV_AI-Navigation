@@ -153,11 +153,29 @@ struct TrackerConfig
   double q_r               = 1e-6;
 
   // EKF measurement noise (higher = trust measurements less, smoother)
+  // RADIAL (along line of sight / depth) position noise: PnP depth is the weak
+  // axis, so this is large and grows with range.
   double r_pos_base        = 0.05;
   double r_pos_slope       = 0.04;
+  // TANGENTIAL (perpendicular to the line of sight) position noise: bearing is
+  // pixel-precise, so this is much smaller. Splitting radial vs tangential lets
+  // the EKF track a translating target tightly in the lateral channel (good
+  // FOLLOWING, less overshoot on stop) without depth noise destabilising it.
+  // Set tang == base/slope to recover the old isotropic behaviour. WORKLOG §4b.
+  double r_pos_tang_base   = 0.025;
+  double r_pos_tang_slope  = 0.010;
   double r_yaw_base        = 0.05;
   double r_yaw_slope       = 0.005;
   double max_oblique_deg   = 65.0;
+  // ── Yaw observability (U-shaped trust vs obliquity) ──
+  // PnP yaw is poorly observable BOTH near face-on (small yaw barely changes the
+  // projected shape — the planar flip regime) AND at extreme obliquity (few
+  // pixels). The base model already distrusts the oblique side (1/|cos|^4); this
+  // floor adds the near-face-on side: yaw noise is inflated by 1/max(sin^2(a),
+  // floor), where a is the bearing-vs-face angle. Lower floor = distrust frontal
+  // yaw MORE (stronger guard against phantom spin on a static frontal plate).
+  // 0.05 ≈ up to 20x noise at dead-on; raise toward 1.0 to disable the U-shape.
+  double yaw_facing_obs_floor = 0.05;
 
   // Velocity damping: v *= alpha each frame (at ref_freq Hz).
   // alpha_yaw should be 1.0 (NO spin damping): a 小陀螺 spins at a roughly
@@ -210,6 +228,16 @@ struct TrackerConfig
   double window_ref_dist   = 3.0;
   double min_fire_dist     = 0.3;
   double max_fire_dist     = 6.0;
+  // Static-target facing cap [rad]. The strict facing window (margin >= 0) is a
+  // SPINNER timing gate: only fire while a plate sweeps through facing-you. For
+  // a NON-spinning target (|vyaw| < face_lookahead_min_vyaw) the plate sits at a
+  // fixed angle and the gimbal is already locked on its center, so we fire on
+  // lock and only reject a genuinely edge-on/garbage plate beyond this cap.
+  // 0.6 rad ≈ 34°: a plate canted that far is still a solid center hit; past it
+  // the plate is too oblique to trust. Bullet-economy safe: fire still needs
+  // command_locked + range downstream. Set equal to angular_window to restore
+  // the old strict-everywhere behavior. See WORKLOG §4.
+  double static_facing_max = 0.6;
 
   // Face lookahead is aim planning, not fire permission. The fire window below
   // still decides whether a shot is safe; lookahead only lets the gimbal settle
@@ -243,6 +271,15 @@ struct TrackerConfig
   // face_idx transitions instead of raw yaw jumps.
   double yaw_jump_thresh   = 0.50;
   double maha_threshold    = 13.3;
+  // IPPE alternate-solution hysteresis [chi-square units]. A planar plate has two
+  // PnP yaw solutions; the tracker normally keeps whichever is closer to its
+  // predicted yaw (lowest Mahalanobis). Near face-on the two are nearly tied, so
+  // tiny prediction drift flips the choice frame-to-frame, injecting a yaw step
+  // → phantom vyaw spike → fire flicker. The runner-up (alternate) solution must
+  // now beat the primary (PnP best-reproj) by THIS much Mahalanobis to be chosen.
+  // A genuine face rotation makes the primary clearly wrong and easily overcomes
+  // it; only noise-level flips are suppressed. 0 = old behavior. See WORKLOG §4.
+  double ippe_alt_penalty  = 1.0;
 
   // ── SPIN RATE ESTIMATION FROM FACE JUMP TIMING ──
   // vyaw estimated directly from dt between consecutive 90° face jumps.

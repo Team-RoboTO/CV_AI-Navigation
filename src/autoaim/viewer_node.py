@@ -563,9 +563,9 @@ class ViewerNode(Node):
         if self.use_debug_state and HAVE_DEBUG_STATE and self.debug_state is not None and not debug_fresh:
             lines.insert(0, (f"DEBUG STATE STALE ({self._fmt_age(self.last_debug_state_time)})", text_warn))
 
-        y_off = 20 if debug_state is not None else 25
-        font_scale = 0.43 if debug_state is not None else 0.55
-        line_step = 17 if debug_state is not None else 22
+        y_off = 10 if debug_state is not None else 25
+        font_scale = 0.34 if debug_state is not None else 0.55
+        line_step = 14 if debug_state is not None else 22
         for i, (line, color) in enumerate(lines):
             y = y_off + i * line_step
             (tw, th), _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)

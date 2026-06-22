@@ -66,13 +66,27 @@ def autoaim_params():
         # so it reacted to yaw/PnP model error and overshot the lead.
         #   q_pos [(m/s^2)^2]: center accel variance. sqrt(5)=2.2 m/s^2 RMS —
         #     enough lead for a translating standard chassis without chasing noise.
-        #   q_yaw [(rad/s^2)^2]: spin accel variance. 10 lets vyaw track spin-up/
-        #     down; the face-jump-timing gate does the fast convergence.
+        #   q_yaw [(rad/s^2)^2]: spin accel variance. LOWERED 20 -> 7: 20 let vyaw
+        #     absorb near-frontal PnP-yaw noise as PHANTOM spin on a static target
+        #     (vyaw wandered to -2.8 rpm while the enemy stood still), which pushed
+        #     the fire margin over its edge → fire/no-fire flicker (WORKLOG §4).
+        #     The face-jump-timing gate, not q_yaw, does the fast spin-up
+        #     convergence, so 7 keeps real spinners while killing the drift.
         {"q_pos": 10.0},
-        {"q_yaw": 20.0},
+        {"q_yaw": 7.0},
         {"q_r": 1e-6},
+        # Position measurement noise is ANISOTROPIC (WORKLOG §4b):
+        #   r_pos_*      = RADIAL (depth / along line of sight) — PnP's weak axis,
+        #                  large and range-growing.
+        #   r_pos_tang_* = TANGENTIAL (lateral / bearing) — pixel-precise, small.
+        # Splitting them lets the gimbal FOLLOW a moving enemy tightly without
+        # depth noise destabilising the track. Lower r_pos_tang_* = tighter, more
+        # responsive lateral follow (watch for jitter); raise toward r_pos_* to
+        # recover the old isotropic over-smoothed behaviour.
         {"r_pos_base": 0.05},
         {"r_pos_slope": 0.04},
+        {"r_pos_tang_base": 0.025},
+        {"r_pos_tang_slope": 0.010},
         {"r_yaw_base": 0.05},
         {"r_yaw_slope": 0.005},
         {"max_oblique_deg": 75.0},
@@ -122,6 +136,21 @@ def autoaim_params():
         {"window_ref_dist": 3.0},
         {"min_fire_dist": 0.2},
         {"max_fire_dist": 6.0},
+        # ── STATIC FIRE-FLICKER FIXES (WORKLOG §4) ──
+        # The strict facing window above is a SPINNER timing gate. A non-spinning,
+        # slightly-canted plate sat right on its edge while perfectly aimed, so
+        # noise toggled fire on/off. These three relax/stabilise the static path
+        # WITHOUT widening the spinner window (do NOT raise angular_window):
+        #   static_facing_max: when |vyaw| < face_lookahead_min_vyaw, fire a LOCKED
+        #     plate up to this facing angle (0.6 rad ≈ 34°) instead of the strict
+        #     margin. Bullet-safe: still needs command_locked + range.
+        {"static_facing_max": 0.6},
+        #   yaw_facing_obs_floor: U-shaped yaw trust — distrust frontal PnP yaw
+        #     (poorly observable) so it cannot drive phantom spin. Lower = stricter.
+        {"yaw_facing_obs_floor": 0.05},
+        #   ippe_alt_penalty: Mahalanobis hysteresis so the IPPE alternate yaw
+        #     solution cannot flip frame-to-frame near face-on (the spike trigger).
+        {"ippe_alt_penalty": 1.0},
         # Face lookahead is aim planning, not shot permission. The fire window
         # still decides when a shot is safe; lookahead pre-aims an incoming face
         # so the gimbal is settled when that face enters the unchanged window.

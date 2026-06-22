@@ -53,6 +53,11 @@ public:
     cfg.q_r              = declare_parameter("q_r", 1e-6);
     cfg.r_pos_base       = declare_parameter("r_pos_base", 0.05);
     cfg.r_pos_slope      = declare_parameter("r_pos_slope", 0.04);
+    // Tangential (lateral/bearing) position noise — see TrackerConfig / WORKLOG §4b.
+    // Much smaller than radial: bearing is pixel-precise, so the EKF can follow a
+    // moving target tightly laterally without depth noise destabilising it.
+    cfg.r_pos_tang_base  = declare_parameter("r_pos_tang_base", 0.025);
+    cfg.r_pos_tang_slope = declare_parameter("r_pos_tang_slope", 0.010);
     cfg.r_yaw_base       = declare_parameter("r_yaw_base", 0.05);
     cfg.r_yaw_slope      = declare_parameter("r_yaw_slope", 0.005);
     cfg.max_oblique_deg  = declare_parameter("max_oblique_deg", 65.0);
@@ -104,6 +109,17 @@ public:
     cfg.switch_range_ratio = declare_parameter("switch_range_ratio", 0.85);
     cfg.switch_cooldown  = declare_parameter("switch_cooldown", 10);
     cfg.same_target_identity_dist = declare_parameter("same_target_identity_dist", 1.0);
+    // ── Static-fire-flicker fixes (WORKLOG §4) ──
+    // static_facing_max: facing cap [rad] used INSTEAD of the strict margin when
+    //   the target is not spinning — fire a locked, near-static plate even if it
+    //   is slightly canted (the old margin sat right on the window edge → flicker).
+    // yaw_facing_obs_floor: U-shaped yaw-trust floor; distrust frontal PnP yaw so
+    //   it cannot drive phantom spin on a static plate (lower = distrust more).
+    // ippe_alt_penalty: Mahalanobis hysteresis so the IPPE alternate yaw solution
+    //   cannot flip frame-to-frame near face-on.
+    cfg.static_facing_max     = declare_parameter("static_facing_max", 0.6);
+    cfg.yaw_facing_obs_floor  = declare_parameter("yaw_facing_obs_floor", 0.05);
+    cfg.ippe_alt_penalty      = declare_parameter("ippe_alt_penalty", 1.0);
 
     tracker_ = std::make_unique<Tracker>(cfg);
     cfg_ = cfg;
@@ -413,16 +429,16 @@ private:
       return "too_far";
     }
 
-    if (aim.fire_margin < 0.0) {
-      return "fire_window_margin";
-    }
-
     if (!tracker_->fireStatePermits()) {
       return std::string("tracker_") + trackerStateName(state);
     }
 
+    // aim.fire folds the facing gate (strict margin for spinners, relaxed
+    // static-facing cap otherwise — WORKLOG §4). Past the range checks above and
+    // a valid tracker state, a false aim.fire here means the facing gate rejected
+    // the shot, so this stays the canonical "fire_window_margin" reason.
     if (!aim.fire) {
-      return "aim_fire_false";
+      return "fire_window_margin";
     }
 
     if (!finite_cmd) {
