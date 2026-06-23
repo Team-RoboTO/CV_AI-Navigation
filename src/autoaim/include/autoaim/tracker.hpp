@@ -120,6 +120,8 @@ struct TrackerDebugInfo
   bool vyaw_timing_accepted = false;
 
   bool phase_confident = false;
+  bool static_confirmed = false;
+  bool confirmed_spin = false;
   int matched_face_idx = -1;
   double association_mahalanobis = -1.0;
   bool association_yaw_valid = false;
@@ -266,11 +268,11 @@ struct TrackerConfig
 
   // Match gates
   double max_match_dist    = 0.5;
-  // Legacy tuning surface retained for launch compatibility. Face changes are
-  // now normal face-indexed associations; spin timing is observed from matched
-  // face_idx transitions instead of raw yaw jumps.
+  // Minimum raw-yaw / face-index jump accepted as a visible-plate handoff.
+  // Raw yaw gives the first bootstrap before face_idx timing has converged.
   double yaw_jump_thresh   = 0.50;
   double maha_threshold    = 13.3;
+  double face_index_switch_penalty = 4.0;
   // IPPE alternate-solution hysteresis [chi-square units]. A planar plate has two
   // PnP yaw solutions; the tracker normally keeps whichever is closer to its
   // predicted yaw (lowest Mahalanobis). Near face-on the two are nearly tied, so
@@ -462,11 +464,25 @@ private:
     const ArmorDetection & det,
     const rclcpp::Time & now,
     bool yaw_valid);
+  bool observeRawYawHandoff(
+    const ArmorDetection & det,
+    double yaw_meas,
+    const rclcpp::Time & now,
+    bool yaw_valid);
+  void resetSpinTiming();
+  void feedSpinTimingJump(
+    double jump_abs,
+    double yaw_dir,
+    const ArmorDetection & det,
+    const rclcpp::Time & now,
+    bool yaw_valid);
   void updateRadiusFromAssociation(
     const ArmorDetection & det,
     int face_idx,
     bool oblique);
   double unwrapYaw(double raw_yaw);
+  bool confirmedSpin() const;
+  bool staticConfirmed() const;
 
   struct BallisticResult { double pitch, flight_time; bool valid; };
   BallisticResult solveBallistic(double ground_dist, double dz) const;
@@ -516,6 +532,21 @@ private:
   rclcpp::Time last_face_assoc_time_;
   bool last_face_assoc_time_valid_ = false;
   bool phase_timing_confident_ = false;
+  int static_observation_count_ = 0;
+
+  // Last accepted observed armor. When spin phase is not confirmed, aiming at the
+  // directly observed plate is safer than reconstructing a four-face model from a
+  // yaw state that may be wrong by one face.
+  bool last_observed_armor_valid_ = false;
+  Eigen::Vector3d last_observed_armor_pos_ = Eigen::Vector3d::Zero();
+  double last_observed_armor_yaw_ = 0.0;
+  int last_observed_face_idx_ = 0;
+
+  // Raw yaw handoff bootstrap: detects the first ~90 deg visible-plate yaw jump
+  // before the EKF has enough vyaw to produce matched_face_idx transitions.
+  bool last_raw_rel_yaw_valid_ = false;
+  double last_raw_rel_yaw_unwrapped_ = 0.0;
+  rclcpp::Time last_raw_rel_yaw_time_;
 
   // ── Spin rate estimation from face jump timing ──
   // Tracks the ROS time of the last face jump and the direction.

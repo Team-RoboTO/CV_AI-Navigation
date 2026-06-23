@@ -330,12 +330,23 @@ bool Tracker::fireStatePermits() const
     phaseConfident();
 }
 
+bool Tracker::confirmedSpin() const
+{
+  return phase_timing_confident_ &&
+    std::abs(x_(7)) >= cfg_.face_lookahead_min_vyaw;
+}
+
+bool Tracker::staticConfirmed() const
+{
+  return
+    !phase_timing_confident_ &&
+    static_observation_count_ >= 3 &&
+    std::abs(x_(7)) < cfg_.face_lookahead_min_vyaw;
+}
+
 bool Tracker::phaseConfident() const
 {
-  if (std::abs(x_(7)) < cfg_.face_lookahead_min_vyaw) {
-    return true;
-  }
-  return phase_timing_confident_;
+  return confirmedSpin() || staticConfirmed();
 }
 
 Tracker::AssociationHypothesis Tracker::associateDetections(
@@ -390,7 +401,15 @@ Tracker::AssociationHypothesis Tracker::associateDetections(
         // primary by cfg_.ippe_alt_penalty to win, so near-face-on noise cannot
         // flip the chosen solution frame-to-frame (WORKLOG §4, cause 3). Only the
         // SELECTION key carries the penalty; best.mahalanobis stays raw.
-        const double m_cmp = m + (yh.id == 1 ? cfg_.ippe_alt_penalty : 0.0);
+        double m_cmp = m + (yh.id == 1 ? cfg_.ippe_alt_penalty : 0.0);
+        // Before spin phase is timing-confirmed, do not let tiny Mahalanobis
+        // differences relabel the visible plate as another face. That wrong-face
+        // lock is what produces the "ghost robot" state in log3.
+        if (!confirmedSpin() && last_matched_face_idx_ >= 0 &&
+            face_idx != last_matched_face_idx_)
+        {
+          m_cmp += cfg_.face_index_switch_penalty;
+        }
 
         if (!best.valid ||
             m_cmp < best_cmp ||
@@ -431,15 +450,14 @@ void Tracker::initFromDetection(const ArmorDetection & det)
   target_generation_++;
   detect_count_ = 0;  lost_count_ = 0;
   switch_cooldown_counter_ = cfg_.switch_cooldown;
-  // Reset timing estimator — new target has unknown spin phase/rate
-  last_jump_time_valid_ = false;
-  last_jump_dir_ = 0.0;
-  consecutive_same_dir_jumps_ = 0;
-  last_vyaw_timing_est_ = 0.0;
+  resetSpinTiming();
   last_matched_face_idx_ = 0;
   last_face_assoc_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
   last_face_assoc_time_valid_ = false;
-  phase_timing_confident_ = false;
+  last_observed_armor_valid_ = true;
+  last_observed_armor_pos_ = Eigen::Vector3d(det.x, det.y, det.z);
+  last_observed_armor_yaw_ = yaw;
+  last_observed_face_idx_ = 0;
 }
 
 // =========================================================================
@@ -531,6 +549,120 @@ bool Tracker::shouldSwitch(const ArmorDetection & candidate) const
   return new_range < cur_range * cfg_.switch_range_ratio;
 }
 
+void Tracker::resetSpinTiming()
+{
+  last_jump_time_valid_ = false;
+  last_jump_dir_ = 0.0;
+  consecutive_same_dir_jumps_ = 0;
+  last_vyaw_timing_est_ = 0.0;
+  phase_timing_confident_ = false;
+  static_observation_count_ = 0;
+  last_raw_rel_yaw_valid_ = false;
+  last_raw_rel_yaw_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+}
+
+void Tracker::feedSpinTimingJump(
+  double jump_abs,
+  double yaw_dir,
+  const ArmorDetection & det,
+  const rclcpp::Time & now,
+  bool yaw_valid)
+{
+  debug_info_.jump_detected = true;
+  debug_info_.jump_abs = jump_abs;
+  debug_info_.jump_dir = yaw_dir;
+  debug_info_.one_face_jump = std::abs(jump_abs - M_PI / 2.0) < M_PI / 4.0;
+
+  const bool reproj_ok =
+    det.reproj_error >= 0.0 && det.reproj_error <= cfg_.vyaw_timing_max_reproj;
+  const bool transition_credible =
+    cfg_.use_vyaw_from_timing && debug_info_.one_face_jump && yaw_valid && reproj_ok;
+
+  if (transition_credible && last_jump_time_valid_) {
+    const double dt_jump = (now - last_jump_time_).seconds();
+    const bool same_dir = yaw_dir * last_jump_dir_ > 0.0;
+    debug_info_.dt_jump = dt_jump;
+
+    if (same_dir && dt_jump >= cfg_.vyaw_timing_min_dt &&
+        dt_jump <= cfg_.vyaw_timing_max_dt)
+    {
+      const double vyaw_est = (M_PI / 2.0) / dt_jump * yaw_dir;
+      debug_info_.vyaw_est_from_timing = vyaw_est;
+      const bool consistent =
+        consecutive_same_dir_jumps_ >= 1 &&
+        std::abs(vyaw_est - last_vyaw_timing_est_) <=
+          cfg_.vyaw_timing_consistency * std::max(std::abs(vyaw_est), 1e-3);
+
+      consecutive_same_dir_jumps_++;
+      last_vyaw_timing_est_ = vyaw_est;
+
+      if (consecutive_same_dir_jumps_ >= 2 && consistent) {
+        const double blend = (consecutive_same_dir_jumps_ >= 3) ? 0.70 : 0.50;
+        x_(7) = blend * vyaw_est + (1.0 - blend) * x_(7);
+        P_(7, 7) = std::min(P_(7, 7), 1.5);
+        phase_timing_confident_ = true;
+        static_observation_count_ = 0;
+        debug_info_.vyaw_timing_accepted = true;
+      }
+    } else if (!same_dir) {
+      consecutive_same_dir_jumps_ = 0;
+      last_vyaw_timing_est_ = 0.0;
+      phase_timing_confident_ = false;
+    }
+  } else if (!transition_credible) {
+    consecutive_same_dir_jumps_ = 0;
+    last_vyaw_timing_est_ = 0.0;
+    phase_timing_confident_ = false;
+    last_jump_time_valid_ = false;
+  }
+
+  if (transition_credible) {
+    last_jump_time_ = now;
+    last_jump_time_valid_ = true;
+    last_jump_dir_ = yaw_dir;
+  }
+}
+
+bool Tracker::observeRawYawHandoff(
+  const ArmorDetection & det,
+  double yaw_meas,
+  const rclcpp::Time & now,
+  bool yaw_valid)
+{
+  if (!cfg_.use_vyaw_from_timing || !yaw_valid || det.yaw_replaced_by_bearing) {
+    return false;
+  }
+
+  const double bearing = std::atan2(det.y - ego_y_, det.x - ego_x_);
+  const double rel_yaw = angles::normalize_angle(yaw_meas - bearing);
+  if (!last_raw_rel_yaw_valid_) {
+    last_raw_rel_yaw_unwrapped_ = rel_yaw;
+    last_raw_rel_yaw_time_ = now;
+    last_raw_rel_yaw_valid_ = true;
+    return false;
+  }
+
+  const double next_unwrapped =
+    last_raw_rel_yaw_unwrapped_ +
+    angles::shortest_angular_distance(last_raw_rel_yaw_unwrapped_, rel_yaw);
+  const double jump = next_unwrapped - last_raw_rel_yaw_unwrapped_;
+  const double jump_abs = std::abs(jump);
+  last_raw_rel_yaw_unwrapped_ = next_unwrapped;
+  last_raw_rel_yaw_time_ = now;
+
+  // A real visible-plate handoff is roughly 90 deg. Smaller changes are normal
+  // yaw noise/motion; very large changes are usually wrap or a bad pose.
+  if (jump_abs < cfg_.yaw_jump_thresh || jump_abs > 2.2) {
+    return false;
+  }
+
+  // When the visible-plate yaw jumps one way, the physical spin phase moves the
+  // opposite way in the four-face model convention.
+  const double yaw_dir = -std::copysign(1.0, jump);
+  feedSpinTimingJump(jump_abs, yaw_dir, det, now, yaw_valid);
+  return debug_info_.one_face_jump;
+}
+
 // =========================================================================
 // FACE TRANSITION OBSERVER — spin timing only, never EKF ownership.
 // =========================================================================
@@ -565,57 +697,14 @@ void Tracker::observeFaceAssociation(
     const bool one_face_jump = std::abs(face_step) == 1;
     // If visible face index increments, the robot yaw moved the opposite way.
     const double yaw_dir = one_face_jump ? -static_cast<double>(face_step) : 0.0;
-    debug_info_.jump_detected = true;
-    debug_info_.jump_abs = std::abs(face_step) * M_PI / 2.0;
-    debug_info_.jump_dir = yaw_dir;
-    debug_info_.one_face_jump = one_face_jump;
-
-    const bool reproj_ok =
-      det.reproj_error >= 0.0 && det.reproj_error <= cfg_.vyaw_timing_max_reproj;
-    const bool transition_credible =
-      cfg_.use_vyaw_from_timing && one_face_jump && yaw_valid && reproj_ok;
-
-    if (transition_credible && last_jump_time_valid_) {
-      const double dt_jump = (now - last_jump_time_).seconds();
-      const bool same_dir = yaw_dir * last_jump_dir_ > 0.0;
-      debug_info_.dt_jump = dt_jump;
-
-      if (same_dir && dt_jump >= cfg_.vyaw_timing_min_dt &&
-          dt_jump <= cfg_.vyaw_timing_max_dt)
-      {
-        const double vyaw_est = (M_PI / 2.0) / dt_jump * yaw_dir;
-        debug_info_.vyaw_est_from_timing = vyaw_est;
-        const bool consistent =
-          consecutive_same_dir_jumps_ >= 1 &&
-          std::abs(vyaw_est - last_vyaw_timing_est_) <=
-            cfg_.vyaw_timing_consistency * std::max(std::abs(vyaw_est), 1e-3);
-
-        consecutive_same_dir_jumps_++;
-        last_vyaw_timing_est_ = vyaw_est;
-
-        if (consecutive_same_dir_jumps_ >= 2 && consistent) {
-          const double blend = (consecutive_same_dir_jumps_ >= 3) ? 0.70 : 0.50;
-          x_(7) = blend * vyaw_est + (1.0 - blend) * x_(7);
-          P_(7, 7) = std::min(P_(7, 7), 1.5);
-          phase_timing_confident_ = true;
-          debug_info_.vyaw_timing_accepted = true;
-        }
-      } else if (!same_dir) {
-        consecutive_same_dir_jumps_ = 0;
-        last_vyaw_timing_est_ = 0.0;
-        phase_timing_confident_ = false;
-      }
-    } else if (!transition_credible) {
-      consecutive_same_dir_jumps_ = 0;
-      last_vyaw_timing_est_ = 0.0;
-      phase_timing_confident_ = false;
-      last_jump_time_valid_ = false;
-    }
-
-    if (transition_credible) {
-      last_jump_time_ = now;
-      last_jump_time_valid_ = true;
-      last_jump_dir_ = yaw_dir;
+    if (one_face_jump) {
+      feedSpinTimingJump(std::abs(face_step) * M_PI / 2.0, yaw_dir, det, now, yaw_valid);
+    } else {
+      debug_info_.jump_detected = true;
+      debug_info_.jump_abs = std::abs(face_step) * M_PI / 2.0;
+      debug_info_.jump_dir = 0.0;
+      debug_info_.one_face_jump = false;
+      resetSpinTiming();
     }
   }
 
@@ -671,6 +760,8 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
   debug_info_ = TrackerDebugInfo{};
   debug_info_.state_yaw = x_(6);
   debug_info_.phase_confident = phaseConfident();
+  debug_info_.static_confirmed = staticConfirmed();
+  debug_info_.confirmed_spin = confirmedSpin();
   debug_info_.last_matched_face_idx = last_matched_face_idx_;
 
   if (switch_cooldown_counter_ > 0) switch_cooldown_counter_--;
@@ -737,6 +828,7 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
   if (matched && assoc.det != nullptr) {
     const double state_yaw_before_update = x_(6);
     const ArmorDetection & best_det = *assoc.det;
+    const double radius_before_update = x_(8);
     const FacePrediction face_before_update =
       predictFace(x_, assoc.face_idx, 0.0);
     const double bearing = std::atan2(best_det.y - ego_y_, best_det.x - ego_x_);
@@ -754,11 +846,42 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
     debug_info_.reproj_error = best_det.reproj_error;
     debug_info_.selected_class_id = best_det.class_id;
 
+    const bool raw_handoff_observed =
+      observeRawYawHandoff(best_det, assoc.yaw_meas, now, assoc.yaw_valid);
+    last_observed_armor_valid_ = true;
+    last_observed_armor_pos_ = Eigen::Vector3d(best_det.x, best_det.y, best_det.z);
+    last_observed_armor_yaw_ = assoc.yaw_meas;
+    last_observed_face_idx_ = assoc.face_idx;
+
     x_ = ekfUpdateFace(best_det, assoc.face_idx, assoc.yaw_meas, assoc.yaw_valid);
-    updateRadiusFromAssociation(best_det, assoc.face_idx, oblique);
+    const bool static_stable_observation =
+      !raw_handoff_observed &&
+      !phase_timing_confident_ &&
+      assoc.yaw_valid &&
+      assoc.yaw_error < 0.15 &&
+      std::abs(x_(7)) < cfg_.face_lookahead_min_vyaw &&
+      (last_matched_face_idx_ < 0 || assoc.face_idx == last_matched_face_idx_);
+    if (static_stable_observation) {
+      static_observation_count_ = std::min(static_observation_count_ + 1, 1000);
+    } else if (
+      raw_handoff_observed ||
+      confirmedSpin() ||
+      !assoc.yaw_valid ||
+      assoc.yaw_error > 0.25 ||
+      std::abs(x_(7)) >= cfg_.face_lookahead_min_vyaw)
+    {
+      static_observation_count_ = 0;
+    }
+
+    if (confirmedSpin() || staticConfirmed()) {
+      updateRadiusFromAssociation(best_det, assoc.face_idx, oblique);
+    } else {
+      x_(8) = radius_before_update;
+    }
     observeFaceAssociation(assoc.face_idx, best_det, now, assoc.yaw_valid);
   } else if (assoc.valid) {
     debug_info_.matched = false;
+    static_observation_count_ = 0;
   }
 
   // ── SAFETY CLAMPS ──
@@ -794,6 +917,8 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
   double wy = angles::normalize_angle(x_(6));
   if (wy != x_(6)) { x_(6) = wy; last_yaw_ = wy; }
   debug_info_.phase_confident = phaseConfident();
+  debug_info_.static_confirmed = staticConfirmed();
+  debug_info_.confirmed_spin = confirmedSpin();
 
   // ── STATE MACHINE ──
   if (state_ == DETECTING) {
@@ -816,8 +941,8 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
         last_aim_face_idx_ = 0;
         last_matched_face_idx_ = -1;
         last_face_assoc_time_valid_ = false;
-        last_jump_time_valid_ = false;
-        phase_timing_confident_ = false;
+        last_observed_armor_valid_ = false;
+        resetSpinTiming();
       }
     }
   } else if (state_ == TRACKING) {
@@ -834,8 +959,8 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
       last_aim_face_idx_ = 0;
       last_matched_face_idx_ = -1;
       last_face_assoc_time_valid_ = false;
-      last_jump_time_valid_ = false;
-      phase_timing_confident_ = false;
+      last_observed_armor_valid_ = false;
+      resetSpinTiming();
     }
   }
 }
@@ -922,6 +1047,8 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
   // (or the fixed time_bias fallback). See TrackerConfig.
   double pred_t = predictionBias() + dist_now / std::max(cfg_.bullet_speed, 1.0);
   constexpr int FACES = 4;
+  const bool confirmed_spin = confirmedSpin();
+  const bool static_confirmed = staticConfirmed();
 
   // Face lookahead is aim planning, not fire permission. The fire window still
   // decides whether a shot is safe (margin >= 0). Lookahead merely points the
@@ -929,32 +1056,31 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
   // fire-valid, avoiding the old failure mode of tracking an outgoing face and
   // arriving late on the next plate. Keep the spin-confidence gate so untrusted
   // phase estimates do not re-enable wrong four-face prediction.
-  const bool spin_phase_trusted = phaseConfident();
   // Apply the vyaw (rotational) lead to the AIM only for a CONFIRMED spinning
   // top. A translating target leaks its position innovation into vyaw through the
   // EKF position↔yaw coupling (phantom spin, e.g. vyaw≈-0.1 on a straight-moving
   // enemy); leading the aim by that phantom rotation drifts the shot. Translation
   // lead (vxc,vyc) ALWAYS applies — only the rotation is gated. WORKLOG §4b.
-  const bool apply_spin_lead =
-    phase_timing_confident_ && std::abs(x_(7)) >= cfg_.face_lookahead_min_vyaw;
   Eigen::VectorXd x_aim = x_;
-  if (!apply_spin_lead) {
+  if (!confirmed_spin) {
     x_aim(7) = 0.0;
   }
   const bool face_lookahead_active =
     cfg_.face_lookahead_enable &&
-    spin_phase_trusted &&
-    std::abs(x_(7)) >= cfg_.face_lookahead_min_vyaw;
+    confirmed_spin;
   std::array<int, FACES> face_indices{};
   int faces_to_check = 0;
-  if (spin_phase_trusted) {
+  const int held_face =
+    (last_observed_armor_valid_ && last_observed_face_idx_ >= 0 &&
+     last_observed_face_idx_ < FACES) ?
+    last_observed_face_idx_ :
+    ((last_matched_face_idx_ >= 0 && last_matched_face_idx_ < FACES) ?
+      last_matched_face_idx_ : 0);
+  if (confirmed_spin) {
     for (int i = 0; i < FACES; ++i) {
       face_indices[faces_to_check++] = i;
     }
   } else {
-    const int held_face =
-      (last_matched_face_idx_ >= 0 && last_matched_face_idx_ < FACES) ?
-      last_matched_face_idx_ : 0;
     face_indices[faces_to_check++] = held_face;
   }
   aim.faces_checked = faces_to_check;
@@ -1034,7 +1160,19 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
 
     for (int face_slot = 0; face_slot < faces_to_check; face_slot++) {
       const int fi = face_indices[face_slot];
-      const FacePrediction face = predictFace(x_aim, fi, pred_t);
+      FacePrediction face;
+      if (!confirmed_spin && last_observed_armor_valid_ && fi == held_face) {
+        face.idx = fi;
+        face.yaw = last_observed_armor_yaw_;
+        face.radius = (fi % 2 == 0) ? x_(8) : other_radius_;
+        face.z_offset = (fi % 2 == 1) ? dz_ : 0.0;
+        face.position = last_observed_armor_pos_ + Eigen::Vector3d(
+          x_(1) * pred_t,
+          x_(3) * pred_t,
+          x_(5) * pred_t);
+      } else {
+        face = predictFace(x_aim, fi, pred_t);
+      }
       const double fy = face.yaw;
       const double fx = face.position.x();
       const double fpy = face.position.y();
@@ -1212,7 +1350,7 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
     if (choice == FaceChoice::Fallback) {
       if (!cfg_.face_lookahead_enable) {
         fallback_reason = "fallback_lookahead_disabled";
-      } else if (!spin_phase_trusted) {
+      } else if (!confirmed_spin) {
         fallback_reason = "fallback_phase_not_confident";
       } else if (std::abs(x_(7)) < cfg_.face_lookahead_min_vyaw) {
         fallback_reason = "fallback_spin_below_min";
@@ -1300,10 +1438,11 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
   // on lock and only reject a genuinely edge-on plate beyond static_facing_max.
   // This removes the static fire/no-fire flicker that occurred when a slightly
   // canted plate sat right on the window edge while perfectly aimed. WORKLOG §4.
-  const bool spinning = std::abs(x_(7)) >= cfg_.face_lookahead_min_vyaw;
-  const bool facing_ok = spinning ?
+  const bool facing_ok = confirmed_spin ?
     (best.margin >= 0.0) :
-    (std::abs(best.phase_error) <= cfg_.static_facing_max);
+    (static_confirmed ?
+      (std::abs(best.phase_error) <= cfg_.static_facing_max) :
+      (best.margin >= 0.0));
   aim.fire = best.valid &&
     fireStatePermits() &&
     best.range >= cfg_.min_fire_dist &&

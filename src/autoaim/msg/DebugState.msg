@@ -26,6 +26,8 @@ float64 vyaw_est_from_timing
 bool vyaw_timing_accepted
 bool vyaw_confident
 bool phase_confident
+bool static_confirmed
+bool confirmed_spin
 int32 consecutive_same_dir_jumps
 float64 p_vyaw
 # q_pos and q_yaw are now STATIC process-noise values (the adaptive/NIS q_pos

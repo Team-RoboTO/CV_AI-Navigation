@@ -99,6 +99,7 @@ public:
     cfg.max_match_dist   = declare_parameter("max_match_dist", 0.5);
     cfg.yaw_jump_thresh  = declare_parameter("yaw_jump_thresh", 0.50);
     cfg.maha_threshold   = declare_parameter("maha_threshold", 13.3);
+    cfg.face_index_switch_penalty = declare_parameter("face_index_switch_penalty", 4.0);
     cfg.use_vyaw_from_timing = declare_parameter("use_vyaw_from_timing", true);
     cfg.vyaw_timing_min_dt   = declare_parameter("vyaw_timing_min_dt", 0.020);
     cfg.vyaw_timing_max_dt   = declare_parameter("vyaw_timing_max_dt", 0.400);
@@ -433,12 +434,17 @@ private:
       return std::string("tracker_") + trackerStateName(state);
     }
 
-    // aim.fire folds the facing gate (strict margin for spinners, relaxed
-    // static-facing cap otherwise — WORKLOG §4). Past the range checks above and
-    // a valid tracker state, a false aim.fire here means the facing gate rejected
-    // the shot, so this stays the canonical "fire_window_margin" reason.
+    // aim.fire folds the facing gate: strict margin for confirmed spin or unknown
+    // phase, relaxed static-facing cap only after static is confirmed.
     if (!aim.fire) {
-      return "fire_window_margin";
+      const auto & tracker_debug = tracker_->debugInfo();
+      if (tracker_debug.confirmed_spin) {
+        return "spin_window_margin";
+      }
+      if (tracker_debug.static_confirmed) {
+        return "static_facing_margin";
+      }
+      return "phase_unknown_window_margin";
     }
 
     if (!finite_cmd) {
@@ -1252,6 +1258,8 @@ private:
     msg.vyaw_timing_accepted = tracker_debug.vyaw_timing_accepted;
     msg.vyaw_confident = tracker_->vyawConfident();
     msg.phase_confident = tracker_->phaseConfident();
+    msg.static_confirmed = tracker_debug.static_confirmed;
+    msg.confirmed_spin = tracker_debug.confirmed_spin;
     msg.consecutive_same_dir_jumps = tracker_->consecutiveSameDirJumps();
     msg.p_vyaw = tracker_->pVyaw();
 
@@ -1316,7 +1324,13 @@ private:
       aim.target_valid &&
       aim.distance >= cfg_.min_fire_dist &&
       aim.distance <= cfg_.max_fire_dist;
-    const bool margin_ok = aim.target_valid && aim.fire_margin >= 0.0;
+    const bool facing_ok =
+      aim.target_valid &&
+      (tracker_debug.confirmed_spin ?
+        aim.fire_margin >= 0.0 :
+        (tracker_debug.static_confirmed ?
+          std::abs(aim.face_phase_error) <= cfg_.static_facing_max :
+          aim.fire_margin >= 0.0));
     const bool pixels_ok = !require_aim_inside_frame_ || pixels_inside;
 
     msg.fire_block_reason = fire_block_reason;
@@ -1324,7 +1338,7 @@ private:
     msg.fire_check_tracker_tracking = tracker_tracking;
     msg.fire_check_target_valid = aim.target_valid;
     msg.fire_check_distance_ok = distance_ok;
-    msg.fire_check_margin_ok = margin_ok;
+    msg.fire_check_margin_ok = facing_ok;
     msg.fire_check_finite_cmd = finite_cmd;
     msg.fire_check_pixels_ok = pixels_ok;
     msg.fire_check_command_valid = command_valid;

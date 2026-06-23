@@ -200,6 +200,9 @@ def autoaim_params():
         # plates still pass and TRACKING does not flicker to TEMP_LOST). Lower
         # toward ~16 only if false detections are being associated.
         {"maha_threshold": 25.0},
+        # Extra Mahalanobis penalty for changing face index before spin timing is
+        # confirmed. Prevents wrong-face lock-in from a single noisy association.
+        {"face_index_switch_penalty": 4.0},
         {"switch_range_ratio": 0.85},
         {"switch_cooldown": 10},
         {"same_target_identity_dist": 1.0},

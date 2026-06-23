@@ -24,9 +24,10 @@ If you are a new session / new device, do this in order:
    ros2 run rqt_image_view rqt_image_view /tracker/debug_image   # viewer HUD
    ```
 4. The single most useful artifact is `/debug_state`. The field glossary is in
-   **§6**. A captured sample lives in `log1.txt` (root of repo) and is the basis
-   of the §4 diagnosis. `ricerca1.md` (root) is the Chinese-pipeline survey +
-   retrofit roadmap that drives the §5 backlog.
+   **§6**. Captured samples live in `log1.txt`/`log2.txt`/`log3.txt` (root of
+   repo) and are the basis of the §4/§4b/§4c diagnoses. `ricerca1.md` is the
+   Chinese-pipeline survey + retrofit roadmap that drives §5; `ricerca2.md`
+   adds later notes used in the §4c rework decision.
 5. Key source files and what lives in them:
 
    | File | Role |
@@ -433,11 +434,149 @@ spin-down**. `alpha_coast=0.98` (barely damped) = **off-screen drift**.
 ~0.1 s; aiming at "now" still misses). Also: the §4 static fix (`q_yaw↓` + U-shape)
 **conflicts** with spinning — the two regimes need opposite yaw-trust.
 
-### 4c.3 Fix — deferred to a focused rework
-User chose to **write the plan and implement later**. Full plan (quick wins +
-spin-bootstrap rework + regime-adaptive yaw trust + face-association stability +
-dz/raised-armor + validation protocol) is in **`IMPLEMENTATION_PLAN.md`**. Nothing
-implemented for §4c yet.
+### 4c.3 User prompts and review context (2026-06-23)
+
+The 2026-06-23 session started as a review request, not an implementation request:
+the user asked to inspect the changed code, logs, `WORKLOG.md`, and the intended
+implementation before judging the previous agent's work. The critical prompt was
+the `log3.txt` issue report, summarized in the user's own terms:
+
+- there is still a lot of overshoot;
+- when the enemy rotates and our robot is stationary, `vyaw` is completely wrong;
+- armor following is bad: it does not move to the first/next armor, does not follow
+  low-rate rotations well, and jumps hard when aiming at a raised incoming armor;
+- it overestimates target motion in forward/back/side movement and visually aims
+  too far;
+- it keeps reporting no-fire due to window margin;
+- when the robot exits the screen, our aim keeps drifting slightly in that exit
+  direction;
+- sometimes the aim sits far beside the enemy as if tracking a ghost robot, then
+  takes too long to recalibrate after the spin stops.
+
+Follow-up prompts asked whether the proposed `IMPLEMENTATION_PLAN.md` rework was
+better than a quick fix / safety patch, then asked to also inspect `ricerca1.md`
+and `ricerca2.md` for ideas. Final instruction: **apply the rework judged best at
+the root of the problem.**
+
+### 4c.4 Decision: apply a targeted root rework, not only a safety patch
+
+The safety-only patch would have prevented some unsafe fire decisions, but it
+would not have fixed the state corruption behind the ghost aim. The full plan had
+larger long-term items (trajectory fire gate, latency ledger, gimbal delay model),
+but those are not needed to break the immediate `log3` failure loop.
+
+Chosen implementation slice:
+
+1. **Separate regimes explicitly.** `phaseConfident()` is now the union of
+   `confirmedSpin()` and `staticConfirmed()`. A target with unknown phase is no
+   longer treated as "static enough" merely because `|vyaw|` is currently small.
+2. **Bootstrap spin from raw visible-plate yaw handoff.** Reintroduce a raw-yaw
+   handoff observer, but as a bounded timing input rather than the old EKF owner.
+   This detects the first ~90° visible-plate jump before `matched_face_idx`
+   transitions are reliable, breaking the catch-22.
+3. **Keep face-index timing as a second source.** The old `observeFaceAssociation`
+   timing path still feeds the same estimator once face indices really start
+   changing, so the rework does not depend on raw yaw forever.
+4. **Stabilize association before spin confirmation.** Add
+   `face_index_switch_penalty`: before spin timing is confirmed, a different face
+   must beat the held face by more than a tiny Mahalanobis fluctuation. This
+   targets the wrong-face lock that produced the ghost robot.
+5. **Aim at the observed armor while phase is unknown.** When spin is not
+   confirmed, `computeAim()` no longer reconstructs all four faces from a yaw
+   state that may be off by one face. It uses the last directly observed armor
+   position/yaw plus translational lead only. Full four-face scheduling returns
+   only after `confirmedSpin()`.
+6. **Freeze geometry learning while phase is unknown.** Radius/dz updates from
+   uncertain associations are blocked until either static or spin is confirmed.
+   This prevents a raised/entering armor or wrong face label from poisoning the
+   robot geometry.
+7. **Make unknown phase conservative for firing.** The relaxed static-facing gate
+   is allowed only under `staticConfirmed()`. Unknown phase and confirmed spin both
+   require strict `margin >= 0`.
+8. **Improve debug, not just behavior.** `/debug_state` now exposes
+   `static_confirmed` and `confirmed_spin`, the viewer shows the active regime, and
+   fire-block reasons distinguish `phase_unknown_window_margin`,
+   `spin_window_margin`, and `static_facing_margin`.
+
+Why this exact slice:
+
+- It addresses the state failure first. In `log3`, prediction was not merely a bit
+  too aggressive; the EKF was aiming from a wrong face/yaw state. More tuning on
+  lead would not fix that.
+- It keeps the old bullet-safety principle: no firing on unknown spinner phase.
+- It avoids a full MHT/IMM/PLL rewrite. `ricerca1.md`/`ricerca2.md` both point
+  toward disciplined robot-centric tracking, latency accounting, and trajectory
+  fire decisions, but not toward adding heavy probabilistic machinery before the
+  basic spin handoff is reliable.
+- It preserves the 2026-06-22 static/moving fixes but removes their dangerous
+  side effect: "small `vyaw`" no longer means "safe static target" until the target
+  has actually been stable for multiple observations.
+
+### 4c.5 Fixes — **APPLIED 2026-06-23** (build OK)
+
+Files changed:
+
+- `src/autoaim/include/autoaim/tracker.hpp`
+  - Added `TrackerDebugInfo::{static_confirmed, confirmed_spin}`.
+  - Added `TrackerConfig::face_index_switch_penalty` (default 4.0).
+  - Added helpers/state for raw-yaw handoff bootstrap, last observed armor, regime
+    checks, and shared spin-timing reset/feed functions.
+- `src/autoaim/src/tracker.cpp`
+  - Added `confirmedSpin()` / `staticConfirmed()` and changed `phaseConfident()` to
+    require one of those real regimes.
+  - Factored spin timing into `feedSpinTimingJump()`.
+  - Added `observeRawYawHandoff()`: unwraps raw relative yaw (`yaw_meas - bearing`)
+    and accepts only bounded ~90° jumps (`yaw_jump_thresh` to 2.2 rad) as visible
+    armor handoffs.
+  - Kept `observeFaceAssociation()` as a face-index timing source, now feeding the
+    same jump estimator.
+  - Added association hysteresis through `face_index_switch_penalty` before spin is
+    confirmed.
+  - Stored the last accepted observed armor and used it for aim while spin is not
+    confirmed.
+  - Blocked radius/dz learning while phase is unknown.
+  - Changed facing/fire gate: confirmed spin => strict margin; static confirmed =>
+    relaxed static cap; unknown phase => strict margin.
+  - Reset spin timing/observed armor state on target loss.
+- `src/autoaim/src/autoaim_node.cpp`
+  - Declared `face_index_switch_penalty`.
+  - Published `static_confirmed` / `confirmed_spin`.
+  - Updated fire-block reason semantics for the three regimes.
+- `src/autoaim/msg/DebugState.msg`
+  - Added `static_confirmed` and `confirmed_spin`.
+- `src/autoaim/viewer_node.py`
+  - Added HUD regime line: spin/static/phase.
+- `src/autoaim/launch/standard.launch.py`
+  - Set `face_index_switch_penalty = 4.0` for the standard robot.
+
+Verification:
+
+```bash
+git diff --check
+colcon build --packages-select autoaim --symlink-install --allow-overriding autoaim
+```
+
+Both passed on 2026-06-23 after the rework.
+
+### 4c.6 Known remaining risks / likely next changes
+
+- **`vyawConfident()` name is now misleading.** It aliases `phaseConfident()`, which
+  can be true for `staticConfirmed()`. This is acceptable for current code paths
+  but should be renamed/deprecated or changed to `confirmedSpin()` in the debug
+  surface to avoid future confusion.
+- **Raw yaw handoff sign must be validated on robot.** The convention currently
+  uses `yaw_dir = -sign(raw_yaw_jump)`, matching the four-face model convention.
+  If `log4` shows accepted jumps with inverted `vyaw`, flip this sign.
+- **Debug should expose jump source next.** Useful fields for `log4`: `jump_source`
+  (`raw_yaw` vs `face_idx`), `raw_rel_yaw`, `raw_yaw_jump`,
+  `raw_handoff_accepted`. This will make spin-bootstrap failures obvious.
+- **Unknown-phase TEMP_LOST/coast should become more conservative.** If the target
+  exits the screen and aim still drifts, damp or freeze translational velocity much
+  faster while phase is unknown and detections are stale.
+- **Longer-term clean design:** split the tracker into two modes:
+  directly-observed armor tracker before phase confirmation, robot-center/four-face
+  tracker after spin confirmation. The current rework already applies that idea to
+  aim planning, but the EKF update still uses the center+face measurement model.
 
 ---
 
@@ -482,11 +621,11 @@ Also queued (smaller, from the §4 work): **PnP yaw via normal vector** instead 
 | Field | Meaning |
 |---|---|
 | `state` / `state_id` | LOST / DETECTING / TRACKING / TEMP_LOST |
-| `aim_fire` | Stage A result: `tracking && range_ok && margin≥0` |
+| `aim_fire` | Stage A result: tracker target solution + range + regime-specific facing gate |
 | `cmd_fire` / `fire_decision` | Final fire (Stage A **and** Stage B lock) |
 | `yaw_locked`/`pitch_locked` | Stage B: gimbal within range-scaled lock tol |
 | `yaw_error`/`pitch_error` | command vs micro feedback [rad] |
-| `margin` / `fire_margin` | `fire_window − |phase_error|`; **< 0 ⇒ block reason `fire_window_margin`** |
+| `margin` / `fire_margin` | `fire_window − |phase_error|`; required `>=0` for confirmed spin and unknown phase |
 | `phase` / `phase_error` | facing angle: plate normal vs line of sight [rad] |
 | `fire_window` | `angular_window · min(window_ref_dist/range,1)` |
 | `vyaw` / `vyaw_rpm` | estimated spin rate (state `x(7)`) |
@@ -497,37 +636,57 @@ Also queued (smaller, from the §4 work): **PnP yaw via normal vector** instead 
 | `matched_face_idx` / `last_matched_face_idx` | which of the 4 faces matched |
 | `association_yaw_hypothesis` | 0=primary IPPE, 1=alternate IPPE, −1=position-only |
 | `face_switch_reason` | why this aim face was chosen (`fire_valid`, `incoming_lookahead`, `fallback_*`, `hysteresis_hold_*`) |
-| `phase_confident` | honest spin confidence (timing-based, not just small P) |
+| `phase_confident` | true when either `confirmed_spin` or `static_confirmed` is true |
+| `confirmed_spin` | spin timing has accepted consistent same-direction ~90° handoffs and `|vyaw|` is above the spin threshold |
+| `static_confirmed` | multiple stable same-face observations with low yaw error and low `|vyaw|`; only then static relaxed facing gate is allowed |
 | `prediction_time` / `flight_time` / `prediction_bias` | horizon breakdown [s] |
 | `radius` / `dz` | EKF radius `x(8)` / armor-pair height step |
-| `fire_block_reason` | first failing gate (e.g. `fire_window_margin`, `yaw_unlocked`) |
+| `fire_block_reason` | first failing gate (e.g. `phase_unknown_window_margin`, `spin_window_margin`, `static_facing_margin`, `yaw_unlocked`) |
 
 ---
 
-## 7. Next action — ON-ROBOT VALIDATION (fixes applied, build OK)
+## 7. Next action — ON-ROBOT VALIDATION (2026-06-23 rework applied, build OK)
 
 Code is in and compiles. Validate on the standard robot:
 
 1. Relaunch (`standard.launch.py` is symlink-installed; C++ was rebuilt).
-2. **Static face-off** (the original failing case): both robots still, facing.
-   Expect `fire_block_reason` to stay `firing` while `command_locked` holds; the
-   on/off flicker should be gone. Watch `vyaw_rpm` — it should now sit near 0
-   (not wander to ±2–3 rpm).
-3. **Spinner regression check**: against a real 小陀螺, confirm it still only fires
-   in the facing window (`face_switch_reason=fire_valid`, `margin≥0`), still locks
-   `vyaw_rpm` within ~2 jumps, and does NOT shoot the wheels/45° off. If the
-   spinner path regressed, the suspect is `q_yaw=7` (raise toward 12) or the
-   U-shape (raise `yaw_facing_obs_floor` toward 0.15).
-4. **Bench yaw-bias check** (§4.6): squared robots → is `phase ≈ 0` (real cant,
+2. Capture a fresh `log4.txt` with `/debug_state` while reproducing the old
+   `log3` spinner case. First fields to inspect:
+   - `confirmed_spin` should become true after consistent handoffs;
+   - `jump_detected`, `one_face_jump`, `dt_jump`, `vyaw_est_from_timing`,
+     `vyaw_timing_accepted`, `consecutive_same_dir_jumps`;
+   - `matched_face_idx` should no longer stay wrong forever while the visible
+     armor changes;
+   - before `confirmed_spin`, `faces_checked` should be 1 and
+     `face_lookahead_active` false;
+   - after `confirmed_spin`, `faces_checked` should become 4 and lookahead can
+     schedule incoming faces.
+3. **Spin sign check:** if accepted jumps make `vyaw_rpm` plausible magnitude but
+   opposite direction, flip the sign in `observeRawYawHandoff()`.
+4. **Ghost aim check:** while `confirmed_spin=false`, the aim should stay on/near
+   the directly observed armor, not a reconstructed armor beside the robot.
+5. **Static face-off regression:** both robots still, facing. Expect
+   `static_confirmed=true` after a few stable frames; `cmd_fire` should stay
+   stable while `command_locked` holds.
+6. **Moving-target regression:** strafing/receding target should still show reduced
+   overshoot from §4b. If aim drifts after detections disappear, apply the next
+   unknown-phase coast damping from §4c.6.
+7. **Bench yaw-bias check** (§4.6): squared robots → is `phase ≈ 0` (real cant,
    done) or `≈ 0.3` (PnP-yaw bias → switch yaw extraction to the normal vector)?
-5. Tuning knobs if needed: `static_facing_max` (down for stricter static fire),
-   `ippe_alt_penalty` (up if flips persist), `yaw_facing_obs_floor` (down for more
-   frontal-yaw distrust).
 
-If validated, mirror the three params + `q_yaw` into `hero`/`sentry` launches and
-commit.
+If validated, mirror `face_index_switch_penalty` plus the earlier §4 parameters
+into `hero`/`sentry` launches and commit.
 
 ### Reasoning ledger (most recent first)
+- **2026-06-23 (applied)** — User asked to apply the best root rework after
+  reviewing `WORKLOG.md`, `IMPLEMENTATION_PLAN.md`, `log3.txt`,
+  `ricerca1.md`, and `ricerca2.md`. Implemented the §4c focused rework:
+  explicit static/spin regimes, raw-yaw handoff bootstrap, shared jump timing,
+  pre-confirmation face-index penalty, observed-armor aim path while phase is
+  unknown, geometry-learning freeze before phase confirmation, conservative
+  unknown-phase fire gate, and new debug flags/reasons. `git diff --check` OK;
+  `colcon build --packages-select autoaim --symlink-install --allow-overriding
+  autoaim` OK.
 - **2026-06-22 (diagnosis, deferred)** — Diagnosed spinning-enemy failure from
   `log3.txt` (§4c): **spin-bootstrap catch-22** — refactor replaced raw-yaw-jump
   detection with face-index transitions, which can't start from `vyaw≈0`, so
@@ -553,5 +712,3 @@ commit.
   absorbed and deleted `prompt1.md`.
 - **2026-06-21** (`8982bc9`) — Implemented the multi-face refactor (§2) and the
   spinning revision (§3). DebugState expanded; viewer HUD updated.
-</content>
-</invoke>

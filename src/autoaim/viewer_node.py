@@ -275,6 +275,12 @@ class ViewerNode(Node):
                 f"conf:{self._fmt_bool(ds.vyaw_confident)} "
                 f"streak:{ds.consecutive_same_dir_jumps} P:{ds.p_vyaw:.2f}",
                 jump_color))
+            if hasattr(ds, "confirmed_spin") and hasattr(ds, "static_confirmed"):
+                lines.append((
+                    f"Regime spin:{self._fmt_bool(ds.confirmed_spin)} "
+                    f"static:{self._fmt_bool(ds.static_confirmed)} "
+                    f"phase:{self._fmt_bool(ds.phase_confident)}",
+                    text_info if ds.confirmed_spin else text_dim))
 
         if hasattr(ds, "best_face_idx"):
             lines.append((
