@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <deque>
 #include <limits>
 #include <string>
 #include <vector>
@@ -87,6 +88,25 @@ struct AimResult
   double face_margin            = 0.0;
   double face_phase_error       = 0.0;
   std::string face_switch_reason;
+
+  // ── Geometric / asymmetric fire gate (WORKLOG §4d) ──
+  // facing_ok is the single physical facing decision actually folded into `fire`
+  // (replaces the old three-regime margin logic). approaching is true when the
+  // selected plate is rotating INTO facing-you (or the target is static): the
+  // gate is then generous (fire_window_approach); when the plate is leaving it is
+  // strict (fire_window_leave). This mirrors the asymmetric window strong RM teams
+  // use (e.g. COD 55°/20°) and converts correct tracking into real DPS without
+  // wasting balls on a plate already rotating away. See ricerca2.md.
+  bool   facing_ok   = false;
+  bool   approaching = false;
+
+  // ── Impact-inside-plate gate (WORKLOG §4e) ──
+  // impact_inside is the physical fire trigger (predicted bullet impact lands on
+  // the selected plate's board); the lateral/vertical fields are the signed
+  // metric miss [m] for tuning/HUD. impact_inside is folded into `fire`.
+  bool   impact_inside   = false;
+  double impact_lateral  = 0.0;  // [m] horizontal miss of impact vs plate centre
+  double impact_vertical = 0.0;  // [m] vertical   miss of impact vs plate centre
 };
 
 struct FacePrediction
@@ -128,6 +148,17 @@ struct TrackerDebugInfo
   int association_yaw_hypothesis = 0;
   int last_matched_face_idx = -1;
   bool face_transition_observed = false;
+
+  // Raw selected detection (odom, pre-EKF) + spin observer internals, for offline
+  // replay and geometry inspection (WORKLOG §4d).
+  double det_x_raw = 0.0;
+  double det_y_raw = 0.0;
+  double det_z_raw = 0.0;
+  double det_yaw_raw = 0.0;
+  double spin_centroid_x = 0.0;
+  double spin_centroid_y = 0.0;
+  double spin_omega = 0.0;
+  int spin_invalid_streak = 0;
 };
 
 // ── All config in one struct ──
@@ -178,6 +209,33 @@ struct TrackerConfig
   // yaw MORE (stronger guard against phantom spin on a static frontal plate).
   // 0.05 ≈ up to 20x noise at dead-on; raise toward 1.0 to disable the U-shape.
   double yaw_facing_obs_floor = 0.05;
+  // ── REGIME-ADAPTIVE yaw trust (WORKLOG §4d) ──
+  // The U-shape + low q_yaw above are tuned for the STATIC case (kill phantom
+  // spin). They CONFLICT with a real spinner: they make the EKF refuse to follow
+  // a rotating yaw, so vyaw never tracks and the face index never advances (the
+  // log3/bag failure). When the position-based spin observer says the target is
+  // spinning, switch to these "spin" values instead: disable the near-face-on
+  // distrust (floor → 1.0) and raise the spin process noise so the EKF tracks the
+  // rotation. Set *_spin equal to the static values to disable the adaptation.
+  double yaw_facing_obs_floor_spin = 1.0;   // disable U-shape while spinning
+  double q_yaw_spin                = 40.0;  // [(rad/s^2)^2] track rotation (lowered 80→40: 80 let the IPPE-flipping frontal yaw inject ±23 rpm noise into vyaw, WORKLOG §4e)
+
+  // ── REGIME-ADAPTIVE CENTER process noise + damping (WORKLOG §4e) ──
+  // A 小陀螺's CENTER is ~stationary; only the armor orbits it. But a single
+  // front-plate per frame cannot cleanly separate "center translating" from
+  // "armor orbiting", so with the normal q_pos the EKF center CHASES the orbiting
+  // armor — its position wobbles and its velocity becomes a PHANTOM 0.3–1.2 m/s
+  // (bag 193335) that is led into the aim (32 mrad mean, up to 241 mrad) → the
+  // left-right overshoot and the "salti avanti/indietro". Neither the observer
+  // centroid nor a windowed slope of the EKF center is clean enough to use as the
+  // velocity (both inherit the orbit). The correct, in-pattern fix (mirrors
+  // q_yaw_spin) is to make the center STIFF while spinning: a small q_pos_spin +
+  // strong alpha_pos_spin damp the phantom velocity to ~0 and let the center
+  // converge to the orbit's true mean. A genuinely translating spinner still
+  // follows (slowly) — and under-leading is far cheaper on balls than the
+  // overshoot. Set *_spin equal to the static values to disable the adaptation.
+  double q_pos_spin    = 0.8;   // [(m/s^2)^2] stiff center while spinning
+  double alpha_pos_spin = 0.90; // strong velocity damping while spinning
 
   // Velocity damping: v *= alpha each frame (at ref_freq Hz).
   // alpha_yaw should be 1.0 (NO spin damping): a 小陀螺 spins at a roughly
@@ -240,6 +298,58 @@ struct TrackerConfig
   // command_locked + range downstream. Set equal to angular_window to restore
   // the old strict-everywhere behavior. See WORKLOG §4.
   double static_facing_max = 0.6;
+
+  // ── ASYMMETRIC GEOMETRIC FIRE GATE (WORKLOG §4d) ──
+  // Replaces the brittle three-regime facing logic (confirmed-spin / static /
+  // "unknown") that left almost every real frame in the strict "unknown" bucket
+  // and never fired on a slightly-moving or spinning enemy (see the bag analysis).
+  // Single physical rule: the selected plate must be within an ANGULAR window of
+  // facing-you, ASYMMETRIC by rotation sense — generous while the plate rotates
+  // INTO view (we are about to have a clean shot, and the lead points the gimbal
+  // there), strict while it rotates AWAY (a leaving plate is a wasted ball). A
+  // static plate counts as "approaching" (fixed favourable geometry). Works
+  // uniformly for static / translating / spinning, so it removes the regime
+  // dependency for fire permission. Bullet economy stays safe: fire still needs
+  // command_locked (Stage B) + range + finite command downstream.
+  // Distance-scaled like the old window (only shrinks far away, never grows).
+  // Set asymmetric_fire_enable=false to fall back to the old three-regime logic.
+  bool   asymmetric_fire_enable = true;
+  double fire_window_approach   = 0.60;  // [rad] ≈34° generous (plate entering / static)
+  double fire_window_leave      = 0.25;  // [rad] ≈14° strict   (plate leaving)
+
+  // ── IMPACT-INSIDE-PLATE fire gate (WORKLOG §4e — the wheel-shot fix) ──
+  // The asymmetric window above is an ELIGIBILITY filter ("is this plate square
+  // enough to be worth a shot"). It is NOT sufficient as the fire trigger, and
+  // using it as such caused the dominant bug: with center-aim ON, the gimbal
+  // points at the spin centre's FACING POINT (where a square plate would sit),
+  // but fire was permitted whenever the rotating selected plate was within 0.60
+  // rad (34°). Those are two different points — the bullet flew to the facing
+  // point while the actual plate was up to r·sin(34°)≈0.12 m (a full plate width)
+  // around the ring → it hit the wheels/air. Bag 193335: fires at |phase| up to
+  // 0.597 rad. This is COD/Tongji's two-stage gate: phase_ok (window, selection)
+  // AND aim_ok (predicted impact error tiny). Here aim_ok is PHYSICAL: the
+  // predicted bullet impact (= where the gimbal is aimed) must land inside the
+  // selected plate's rectangle at impact time. For NON-center aim (static /
+  // translating) the aim IS the plate centre, so this is trivially satisfied and
+  // the asymmetric window still guards obliquity — it only bites the center-aim
+  // spinner case, exactly where it must. Half-sizes are conservative so a pass is
+  // a real centre hit; set fire_require_impact_inside=false to restore old gate.
+  bool   fire_require_impact_inside = true;
+  double plate_half_width  = 0.065;  // [m] half armor-board width  (hit tolerance)
+  double plate_half_height = 0.050;  // [m] half armor-board height (hit tolerance)
+
+  // ── CENTER-AIM for a confirmed spinner (WORKLOG §4d round 3) ──
+  // Chasing individual plates on a fast top means slewing the gimbal ~90° every
+  // handoff (≈0.25 s at 60 rpm) — physically impossible to settle, so the gimbal
+  // never locks and the aim looks random (bag …190343: incoming_lookahead 59% of
+  // frames, cmd_yaw jumps up to 400 mrad). Strong teams instead AIM AT THE SPIN
+  // CENTER (a near-stationary point) and FIRE when a plate is predicted to be
+  // facing at impact. With this on, when confirmed_spin the aim azimuth/pitch
+  // point at the "facing point" (the spin center pushed one radius toward the
+  // barrel = where a facing plate sits), so cmd_yaw is steady and the gimbal can
+  // lock; the fire decision still requires a plate within the facing window at
+  // impact. Set false to restore per-face chase aiming.
+  bool   spin_aim_center_enable = true;
 
   // Face lookahead is aim planning, not fire permission. The fire window below
   // still decides whether a shot is safe; lookahead only lets the gimbal settle
@@ -304,6 +414,42 @@ struct TrackerConfig
   //     vyaw_timing_consistency (relative). Only then do we blend/tighten P.
   double vyaw_timing_max_reproj   = 8.0;   // [px] max reproj err to trust a jump for timing
   double vyaw_timing_consistency  = 0.35;  // successive vyaw timing estimates must agree within ±35%
+
+  // ── POSITION-BASED SPIN OBSERVER (WORKLOG §4d) — the real bootstrap fix ──
+  // The §4c raw-yaw handoff bootstrap never triggered in practice (jump_detected
+  // 0/374 on a genuine ~100 rpm spinner) because it needs a clean per-frame ~90°
+  // yaw step plus two consecutive same-direction consistent estimates, which the
+  // planar-PnP yaw flip (IPPE) and irregular frame rate destroy. This observer
+  // instead estimates spin from the ARMOR POSITION, which is pixel-accurate and
+  // immune to the yaw flip: over a sliding window the centroid of the recent raw
+  // armor detections approximates the spin center, and the MEDIAN angular
+  // velocity of the armor about that centroid (rejecting the ~90° handoff steps
+  // as outliers) is the spin rate. Direction falls out of the sign. This breaks
+  // the catch-22 without the EKF owning the estimate — it feeds vyaw as a blended
+  // observation, exactly like the timing path. Set enable=false to disable.
+  bool   spin_observer_enable   = true;
+  double spin_obs_window        = 0.45;  // [s] sliding window of raw detections
+  int    spin_obs_min_samples   = 4;     // min in-face angular-velocity samples
+  double spin_obs_handoff_da    = 1.0;   // [rad] |Δangle| above this = handoff frame, rejected
+  double spin_obs_min_radius    = 0.05;  // [m] armor-to-centroid below this = not an orbit (reject translation/noise)
+  double spin_obs_consistency   = 0.6;   // robust MAD/|median| must be below this to confirm spin
+  double spin_obs_sign_majority = 0.70;  // fraction of samples that must share the median sign
+  double spin_obs_vyaw_blend    = 0.5;   // blend factor of observer vyaw into x_(7) when confirmed
+  // One-time EKF re-seed on the rising edge of confirmed spin: the EKF center
+  // ghosts (orbits with the armor) before spin is tracked, so the four-face
+  // model aims at a phantom robot. When spin is fast enough that the windowed
+  // centroid is a good center estimate, snap the center + yaw phase to the
+  // observer geometry once, then let the EKF track. Gated on a high omega so the
+  // centroid spans enough arc. Set enable=false to keep the pure-blend behaviour.
+  bool   spin_obs_reseed_enable    = true;
+  double spin_obs_reseed_min_omega = 4.0;  // [rad/s] min |omega| to trust centroid as center
+  // Hold confirmed spin through brief observer dropouts (detector misses /
+  // handoff-heavy windows) so the regime + aim do not flicker on/off frame to
+  // frame. Only after this many CONSECUTIVE invalid observer frames is the spin
+  // released (vyaw bled, phase confidence dropped). WORKLOG §4d round 2.
+  int    spin_lost_grace        = 6;
+  double spin_obs_max_omega     = 40.0;  // [rad/s] reject observer estimates above this as bad-center spikes
+  double spin_obs_outlier_ratio = 2.5;   // once confirmed, ignore an estimate that differs from vyaw by >this factor
 
   // ── TARGET SWITCHING ──
   // POLICY: always prefer the closest enemy (highest hit probability).
@@ -469,6 +615,11 @@ private:
     double yaw_meas,
     const rclcpp::Time & now,
     bool yaw_valid);
+  /// Position-based spin observer (WORKLOG §4d). Pushes the raw armor detection
+  /// into a sliding window and recomputes the robust spin rate from the median
+  /// in-face angular velocity about the windowed centroid. Sets spin_omega_est_
+  /// / spin_omega_valid_ / spin_centroid_*_. Immune to the planar-PnP yaw flip.
+  void updateSpinObserver(const ArmorDetection & det, const rclcpp::Time & now);
   void resetSpinTiming();
   void feedSpinTimingJump(
     double jump_abs,
@@ -560,6 +711,32 @@ private:
   // Last vyaw estimate from face-jump timing — used to require two consecutive
   // CONSISTENT estimates before trusting the spin rate (anti-spurious-jump gate).
   double last_vyaw_timing_est_ = 0.0;
+
+  // ── Position-based spin observer state (WORKLOG §4d) ──
+  // Sliding window of recent RAW armor detections (odom x,y + time). The median
+  // angular velocity of the armor about the windowed centroid is the spin rate,
+  // robust to the planar-PnP yaw flip and to the ~90° handoff steps.
+  // x,y = raw armor position; cx,cy = per-frame center estimate (armor pushed
+  // back along the line of sight by the radius — IPPE-immune, see §4d).
+  struct SpinSample {
+    double t = 0.0; double x = 0.0; double y = 0.0; double cx = 0.0; double cy = 0.0;
+  };
+  std::deque<SpinSample> spin_samples_;
+  double spin_omega_est_ = 0.0;    // robust spin rate [rad/s], signed
+  bool   spin_omega_valid_ = false;
+  double spin_centroid_x_ = 0.0;
+  double spin_centroid_y_ = 0.0;
+  // Regime flag used by the EKF this frame (q_yaw / yaw-trust). Set from the
+  // observer verdict of the PREVIOUS frame so predict/associate can read it
+  // before this frame's observer runs.
+  bool   spinning_regime_ = false;
+  // Rising-edge latch for the one-time EKF re-seed (ghost fix). Reset on loss.
+  bool   was_confirmed_spin_ = false;
+  // Re-seed only ONCE per spin episode (repeated re-seeds snapped the center
+  // every confirmed_spin toggle → pd spikes / aim jumps). WORKLOG §4d round 2.
+  bool   spin_reseed_done_ = false;
+  // Consecutive invalid-observer frames, for the spin-hold grace.
+  int    spin_invalid_streak_ = 0;
 };
 
 }  // namespace autoaim

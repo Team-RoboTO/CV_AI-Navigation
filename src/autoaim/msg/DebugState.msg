@@ -52,6 +52,13 @@ float64 prediction_time
 float64 margin
 float64 distance
 
+# Impact-inside-plate fire gate (WORKLOG §4e). impact_inside is the physical fire
+# trigger (predicted bullet impact lands on the selected plate board);
+# impact_lateral/vertical are the signed metric miss [m] for tuning.
+bool impact_inside
+float64 impact_lateral
+float64 impact_vertical
+
 float64 cmd_yaw
 float64 cmd_pitch
 float64 micro_yaw
@@ -70,6 +77,28 @@ int32 impact_px_y
 
 float64 radius
 float64 dz
+
+# ── Raw inputs + state for OFFLINE REPLAY and geometry inspection (WORKLOG §4d) ──
+# det_*_raw: the raw selected armor detection in odom (BEFORE EKF), so a bag can be
+#   replayed through the tracker / the spin observer re-run offline.
+# ego_*: robot position in odom this frame.
+# state_*: EKF center position + velocity (state_yaw/vyaw/radius are above).
+# spin_*: position-based spin observer internals.
+float64 det_x_raw
+float64 det_y_raw
+float64 det_z_raw
+float64 det_yaw_raw
+float64 ego_x
+float64 ego_y
+float64 state_xc
+float64 state_vxc
+float64 state_yc
+float64 state_vyc
+float64 state_vza
+float64 spin_centroid_x
+float64 spin_centroid_y
+float64 spin_omega
+int32 spin_invalid_streak
 
 bool matched
 float64 mahalanobis

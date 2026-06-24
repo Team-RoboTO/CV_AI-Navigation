@@ -122,6 +122,38 @@ public:
     cfg.yaw_facing_obs_floor  = declare_parameter("yaw_facing_obs_floor", 0.05);
     cfg.ippe_alt_penalty      = declare_parameter("ippe_alt_penalty", 1.0);
 
+    // ── Spin-bootstrap rework + geometric fire gate (WORKLOG §4d) ──
+    // Position-based spin observer (the real bootstrap fix): estimates spin from
+    // the armor orbit, immune to the IPPE yaw flip that killed the §4c bootstrap.
+    cfg.spin_observer_enable  = declare_parameter("spin_observer_enable", true);
+    cfg.spin_obs_window       = declare_parameter("spin_obs_window", 0.45);
+    cfg.spin_obs_min_samples  = declare_parameter("spin_obs_min_samples", 4);
+    cfg.spin_obs_handoff_da   = declare_parameter("spin_obs_handoff_da", 1.0);
+    cfg.spin_obs_min_radius   = declare_parameter("spin_obs_min_radius", 0.05);
+    cfg.spin_obs_consistency  = declare_parameter("spin_obs_consistency", 0.6);
+    cfg.spin_obs_sign_majority = declare_parameter("spin_obs_sign_majority", 0.70);
+    cfg.spin_obs_vyaw_blend   = declare_parameter("spin_obs_vyaw_blend", 0.5);
+    cfg.spin_obs_reseed_enable = declare_parameter("spin_obs_reseed_enable", true);
+    cfg.spin_obs_reseed_min_omega = declare_parameter("spin_obs_reseed_min_omega", 4.0);
+    cfg.spin_lost_grace       = declare_parameter("spin_lost_grace", 6);
+    cfg.spin_obs_max_omega    = declare_parameter("spin_obs_max_omega", 40.0);
+    cfg.spin_obs_outlier_ratio = declare_parameter("spin_obs_outlier_ratio", 2.5);
+    // Regime-adaptive yaw trust: track a rotating yaw while spinning.
+    cfg.yaw_facing_obs_floor_spin = declare_parameter("yaw_facing_obs_floor_spin", 1.0);
+    cfg.q_yaw_spin            = declare_parameter("q_yaw_spin", 40.0);
+    // Regime-adaptive center stiffness while spinning (WORKLOG §4e).
+    cfg.q_pos_spin            = declare_parameter("q_pos_spin", 0.8);
+    cfg.alpha_pos_spin        = declare_parameter("alpha_pos_spin", 0.90);
+    // Asymmetric geometric fire gate (replaces the three-regime facing logic).
+    cfg.asymmetric_fire_enable = declare_parameter("asymmetric_fire_enable", true);
+    cfg.fire_window_approach  = declare_parameter("fire_window_approach", 0.60);
+    cfg.fire_window_leave     = declare_parameter("fire_window_leave", 0.25);
+    cfg.spin_aim_center_enable = declare_parameter("spin_aim_center_enable", true);
+    // Impact-inside-plate fire gate (WORKLOG §4e — the wheel-shot fix).
+    cfg.fire_require_impact_inside = declare_parameter("fire_require_impact_inside", true);
+    cfg.plate_half_width      = declare_parameter("plate_half_width", 0.065);
+    cfg.plate_half_height     = declare_parameter("plate_half_height", 0.050);
+
     tracker_ = std::make_unique<Tracker>(cfg);
     cfg_ = cfg;
 
@@ -434,10 +466,22 @@ private:
       return std::string("tracker_") + trackerStateName(state);
     }
 
-    // aim.fire folds the facing gate: strict margin for confirmed spin or unknown
-    // phase, relaxed static-facing cap only after static is confirmed.
+    // aim.fire folds the facing gate. With the asymmetric geometric gate
+    // (WORKLOG §4d) the block reason distinguishes whether the plate failed the
+    // generous approaching window or the strict leaving window; the legacy
+    // three-regime reasons are kept for asymmetric_fire_enable=false.
     if (!aim.fire) {
       const auto & tracker_debug = tracker_->debugInfo();
+      // The plate passed the facing/eligibility window but the predicted bullet
+      // impact falls off its board (the center-aim spinner case: no plate is at
+      // the facing point yet). WORKLOG §4e — distinguishes "waiting for a plate"
+      // from "plate too oblique".
+      if (cfg_.fire_require_impact_inside && aim.facing_ok && !aim.impact_inside) {
+        return "impact_outside_plate";
+      }
+      if (cfg_.asymmetric_fire_enable) {
+        return aim.approaching ? "facing_window_approach" : "facing_window_leave";
+      }
       if (tracker_debug.confirmed_spin) {
         return "spin_window_margin";
       }
@@ -1282,6 +1326,9 @@ private:
     msg.prediction_time = aim.prediction_time;
     msg.margin = aim.fire_margin;
     msg.distance = aim.distance;
+    msg.impact_inside = aim.impact_inside;
+    msg.impact_lateral = aim.impact_lateral;
+    msg.impact_vertical = aim.impact_vertical;
 
     msg.cmd_yaw = yaw_target_micro;
     msg.cmd_pitch = pitch_target_micro;
@@ -1301,6 +1348,23 @@ private:
 
     msg.radius = tracker_->radius();
     msg.dz = tracker_->dz();
+
+    // Raw inputs + state for offline replay / geometry inspection (WORKLOG §4d).
+    msg.det_x_raw = tracker_debug.det_x_raw;
+    msg.det_y_raw = tracker_debug.det_y_raw;
+    msg.det_z_raw = tracker_debug.det_z_raw;
+    msg.det_yaw_raw = tracker_debug.det_yaw_raw;
+    msg.ego_x = robot_x_;
+    msg.ego_y = robot_y_;
+    msg.state_xc = x(0);
+    msg.state_vxc = x(1);
+    msg.state_yc = x(2);
+    msg.state_vyc = x(3);
+    msg.state_vza = x(5);
+    msg.spin_centroid_x = tracker_debug.spin_centroid_x;
+    msg.spin_centroid_y = tracker_debug.spin_centroid_y;
+    msg.spin_omega = tracker_debug.spin_omega;
+    msg.spin_invalid_streak = tracker_debug.spin_invalid_streak;
 
     msg.matched = tracker_debug.matched;
     msg.mahalanobis = tracker_debug.mahalanobis;
@@ -1324,13 +1388,10 @@ private:
       aim.target_valid &&
       aim.distance >= cfg_.min_fire_dist &&
       aim.distance <= cfg_.max_fire_dist;
-    const bool facing_ok =
-      aim.target_valid &&
-      (tracker_debug.confirmed_spin ?
-        aim.fire_margin >= 0.0 :
-        (tracker_debug.static_confirmed ?
-          std::abs(aim.face_phase_error) <= cfg_.static_facing_max :
-          aim.fire_margin >= 0.0));
+    // facing_ok is now computed inside computeAim (asymmetric geometric gate,
+    // WORKLOG §4d) and folded into aim.fire; mirror it directly instead of
+    // re-deriving the regime logic here (which had drifted out of sync).
+    const bool facing_ok = aim.target_valid && aim.facing_ok;
     const bool pixels_ok = !require_aim_inside_frame_ || pixels_inside;
 
     msg.fire_block_reason = fire_block_reason;

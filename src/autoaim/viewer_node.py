@@ -276,10 +276,14 @@ class ViewerNode(Node):
                 f"streak:{ds.consecutive_same_dir_jumps} P:{ds.p_vyaw:.2f}",
                 jump_color))
             if hasattr(ds, "confirmed_spin") and hasattr(ds, "static_confirmed"):
+                # WORKLOG §4d: vyaw_est_from_timing now carries the position-based
+                # spin observer estimate [rad/s]; consecutive_same_dir_jumps its
+                # in-face sample count.
+                obs_rpm = ds.vyaw_est_from_timing * 60.0 / (2.0 * math.pi)
                 lines.append((
                     f"Regime spin:{self._fmt_bool(ds.confirmed_spin)} "
                     f"static:{self._fmt_bool(ds.static_confirmed)} "
-                    f"phase:{self._fmt_bool(ds.phase_confident)}",
+                    f"obsω:{obs_rpm:+.0f}rpm n:{ds.consecutive_same_dir_jumps}",
                     text_info if ds.confirmed_spin else text_dim))
 
         if hasattr(ds, "best_face_idx"):
@@ -287,6 +291,14 @@ class ViewerNode(Node):
                 f"Face:{ds.best_face_idx} checked:{ds.faces_checked} "
                 f"phase:{ds.phase_error:+.3f} win:{ds.fire_window:.3f}",
                 margin_color))
+
+        # Impact-inside-plate gate (WORKLOG §4e): predicted bullet miss vs plate.
+        if hasattr(ds, "impact_inside"):
+            imp_color = text_ok if ds.impact_inside else text_warn
+            lines.append((
+                f"Impact:{self._fmt_bool(ds.impact_inside)} "
+                f"lat:{ds.impact_lateral*1000:+.0f}mm vert:{ds.impact_vertical*1000:+.0f}mm",
+                imp_color))
 
         if hasattr(ds, "face_lookahead_active"):
             ttw = self._fmt_ms(ds.face_time_to_window) if ds.face_time_to_window >= 0.0 else "n/a"

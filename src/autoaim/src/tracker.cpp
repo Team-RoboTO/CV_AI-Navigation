@@ -63,7 +63,11 @@ void Tracker::ekfPredict(double dt)
     // Aggressive damping: no measurement to correct, so decay velocity fast
     b = a = std::pow(cfg_.alpha_coast, dt * cfg_.ref_freq);
   } else {
-    b = std::pow(cfg_.alpha_pos, dt * cfg_.ref_freq);
+    // Regime-adaptive center damping: while spinning, bleed the phantom center
+    // velocity (orbit leak) fast so it is not led into the aim. WORKLOG §4e.
+    const double alpha_pos_eff =
+      spinning_regime_ ? cfg_.alpha_pos_spin : cfg_.alpha_pos;
+    b = std::pow(alpha_pos_eff, dt * cfg_.ref_freq);
     a = std::pow(cfg_.alpha_yaw, dt * cfg_.ref_freq);
   }
 
@@ -91,8 +95,16 @@ void Tracker::ekfPredict(double dt)
     Q(i,i) = std::pow(t,4)/4*s2;  Q(i,i+1) = std::pow(t,3)/2*s2;
     Q(i+1,i) = Q(i,i+1);          Q(i+1,i+1) = t*t*s2;
   };
-  block(0, cfg_.q_pos); block(2, cfg_.q_pos); block(4, cfg_.q_pos);
-  block(6, cfg_.q_yaw);
+  // Regime-adaptive spin process noise: when the position-based spin observer
+  // says the target is spinning, trust the rotating yaw far more so the EKF
+  // tracks it instead of smoothing it away (the log3/bag failure). WORKLOG §4d.
+  const double q_yaw_eff = spinning_regime_ ? cfg_.q_yaw_spin : cfg_.q_yaw;
+  // While spinning, a small q_pos_spin keeps the horizontal CENTER stiff so the
+  // EKF stops chasing the orbiting armor (phantom velocity). The vertical channel
+  // (block 4) keeps the normal q_pos — z is not orbit-contaminated. WORKLOG §4e.
+  const double q_pos_eff = spinning_regime_ ? cfg_.q_pos_spin : cfg_.q_pos;
+  block(0, q_pos_eff); block(2, q_pos_eff); block(4, cfg_.q_pos);
+  block(6, q_yaw_eff);
   Q(8,8) = std::pow(t,4)/4 * cfg_.q_r;
 
   x_ = xn;
@@ -169,8 +181,13 @@ Eigen::Matrix4d Tracker::measurementNoise(
     // observable (small yaw barely changes the image — the planar flip regime).
     // Without this, a static near-frontal plate feeds yaw noise straight into
     // vyaw as phantom spin and the facing/fire margin wanders. See WORKLOG §4.
+    // Regime-adaptive floor: while spinning, raise the floor (→1.0) so the
+    // near-face-on distrust is disabled and yaw innovations move vyaw/yaw. While
+    // static, keep the low floor that guards against phantom spin. WORKLOG §4d.
+    const double yaw_floor =
+      spinning_regime_ ? cfg_.yaw_facing_obs_floor_spin : cfg_.yaw_facing_obs_floor;
     const double sf = std::abs(std::sin(face_a));
-    yaw_f /= std::max(sf * sf, cfg_.yaw_facing_obs_floor);
+    yaw_f /= std::max(sf * sf, yaw_floor);
     if (face_a > cfg_.max_oblique_deg * M_PI / 180.0) {
       yaw_f = 1e6;
     }
@@ -559,6 +576,14 @@ void Tracker::resetSpinTiming()
   static_observation_count_ = 0;
   last_raw_rel_yaw_valid_ = false;
   last_raw_rel_yaw_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+  // Position-based spin observer state (WORKLOG §4d).
+  spin_samples_.clear();
+  spin_omega_est_ = 0.0;
+  spin_omega_valid_ = false;
+  spinning_regime_ = false;
+  was_confirmed_spin_ = false;
+  spin_reseed_done_ = false;
+  spin_invalid_streak_ = 0;
 }
 
 void Tracker::feedSpinTimingJump(
@@ -597,9 +622,15 @@ void Tracker::feedSpinTimingJump(
       last_vyaw_timing_est_ = vyaw_est;
 
       if (consecutive_same_dir_jumps_ >= 2 && consistent) {
-        const double blend = (consecutive_same_dir_jumps_ >= 3) ? 0.70 : 0.50;
-        x_(7) = blend * vyaw_est + (1.0 - blend) * x_(7);
-        P_(7, 7) = std::min(P_(7, 7), 1.5);
+        // The POSITION observer is the proven spin authority (WORKLOG §4d/§4e).
+        // While it asserts spin, this IPPE-noisy yaw-timing path must NOT also
+        // write vyaw — double-writing was a source of the ±23 rpm vyaw jitter.
+        // It may still RAISE confidence (additive), never own the rate.
+        if (!spinning_regime_) {
+          const double blend = (consecutive_same_dir_jumps_ >= 3) ? 0.70 : 0.50;
+          x_(7) = blend * vyaw_est + (1.0 - blend) * x_(7);
+          P_(7, 7) = std::min(P_(7, 7), 1.5);
+        }
         phase_timing_confident_ = true;
         static_observation_count_ = 0;
         debug_info_.vyaw_timing_accepted = true;
@@ -607,13 +638,21 @@ void Tracker::feedSpinTimingJump(
     } else if (!same_dir) {
       consecutive_same_dir_jumps_ = 0;
       last_vyaw_timing_est_ = 0.0;
-      phase_timing_confident_ = false;
+      // Do NOT drop spin confidence while the position observer holds it: a
+      // single noisy raw-yaw reversal used to toggle confirmed_spin → the aim
+      // flipped center-aim↔face-chase → the gimbal lost lock. The observer's
+      // spin_lost_grace is the single owner of spin release now. WORKLOG §4e.
+      if (!spinning_regime_) {
+        phase_timing_confident_ = false;
+      }
     }
   } else if (!transition_credible) {
     consecutive_same_dir_jumps_ = 0;
     last_vyaw_timing_est_ = 0.0;
-    phase_timing_confident_ = false;
     last_jump_time_valid_ = false;
+    if (!spinning_regime_) {
+      phase_timing_confident_ = false;
+    }
   }
 
   if (transition_credible) {
@@ -661,6 +700,134 @@ bool Tracker::observeRawYawHandoff(
   const double yaw_dir = -std::copysign(1.0, jump);
   feedSpinTimingJump(jump_abs, yaw_dir, det, now, yaw_valid);
   return debug_info_.one_face_jump;
+}
+
+// =========================================================================
+// POSITION-BASED SPIN OBSERVER (WORKLOG §4d) — the real spin bootstrap.
+//
+// Why this exists: the §4c raw-yaw handoff bootstrap never fired in practice
+// (jump_detected 0/374 on a genuine ~100 rpm spinner) because it depends on a
+// clean per-frame ~90° yaw step plus two consecutive same-direction consistent
+// estimates — destroyed by the planar-PnP yaw flip and irregular frame rate.
+//
+// Physics: a spinning robot's center is ~fixed; the visible armor sits on a
+// circle of radius r around it and orbits at the spin rate ω. So:
+//   - the centroid of the recent RAW armor positions ≈ the spin center (the
+//     orbit averages out over a window that spans a good fraction of a turn);
+//   - the angular velocity of the armor about that centroid = ω, EXCEPT at the
+//     ~90° handoff frames where the visible plate jumps to its neighbour.
+// We therefore take the MEDIAN of the per-frame angular velocities, rejecting
+// the handoff steps (|Δangle| > spin_obs_handoff_da) as outliers. Position is
+// pixel-accurate, so this is immune to the IPPE yaw ambiguity that killed the
+// yaw-based bootstrap. A translating (non-orbiting) target is rejected because
+// its armor sits ~on top of the moving centroid (radius < spin_obs_min_radius)
+// and its angular-velocity samples do not share a consistent sign.
+// =========================================================================
+void Tracker::updateSpinObserver(const ArmorDetection & det, const rclcpp::Time & now)
+{
+  if (!cfg_.spin_observer_enable) {
+    spin_omega_valid_ = false;
+    return;
+  }
+
+  const double t = now.seconds();
+  // Per-frame center estimate: the visible plate faces the camera, so its normal
+  // points roughly back at us and the spin CENTER sits behind the plate at one
+  // radius ALONG THE LINE OF SIGHT. Pushing the armor back by the radius along
+  // the bearing (NOT the flipping PnP yaw) gives an IPPE-immune center estimate
+  // that is the same for every face — far better than the raw-position centroid,
+  // which is biased toward the camera because we only ever see the front plate
+  // (validated offline: centroid badly underestimates ω, this recovers it). §4d.
+  const double bearing = std::atan2(det.y - ego_y_, det.x - ego_x_);
+  const double r_est = std::clamp(x_(8), 0.10, 0.40);
+  const double ecx = det.x + r_est * std::cos(bearing);
+  const double ecy = det.y + r_est * std::sin(bearing);
+  spin_samples_.push_back({t, det.x, det.y, ecx, ecy});
+  while (!spin_samples_.empty() &&
+         t - spin_samples_.front().t > cfg_.spin_obs_window) {
+    spin_samples_.pop_front();
+  }
+
+  const int n = static_cast<int>(spin_samples_.size());
+  if (n < cfg_.spin_obs_min_samples + 1) {
+    spin_omega_valid_ = false;
+    return;
+  }
+
+  // Windowed mean of the per-frame center estimates ≈ the spin center.
+  double cx = 0.0, cy = 0.0;
+  for (const auto & s : spin_samples_) { cx += s.cx; cy += s.cy; }
+  cx /= n; cy /= n;
+  spin_centroid_x_ = cx;
+  spin_centroid_y_ = cy;
+  debug_info_.spin_centroid_x = cx;
+  debug_info_.spin_centroid_y = cy;
+
+  // Per-frame in-face angular velocities of the armor about the centroid.
+  std::vector<double> omegas;
+  omegas.reserve(n);
+  for (size_t i = 1; i < spin_samples_.size(); ++i) {
+    const auto & a = spin_samples_[i - 1];
+    const auto & b = spin_samples_[i];
+    const double ra = std::hypot(a.x - cx, a.y - cy);
+    const double rb = std::hypot(b.x - cx, b.y - cy);
+    // Reject non-orbit geometry (translation / noise sitting on the centroid).
+    if (ra < cfg_.spin_obs_min_radius || rb < cfg_.spin_obs_min_radius) {
+      continue;
+    }
+    const double dt = b.t - a.t;
+    if (dt <= 1e-4) {
+      continue;
+    }
+    const double aa = std::atan2(a.y - cy, a.x - cx);
+    const double ab = std::atan2(b.y - cy, b.x - cx);
+    const double da = angles::shortest_angular_distance(aa, ab);
+    // A ~90° handoff frame is not in-face rotation: reject as an outlier.
+    if (std::abs(da) > cfg_.spin_obs_handoff_da) {
+      continue;
+    }
+    omegas.push_back(da / dt);
+  }
+
+  if (static_cast<int>(omegas.size()) < cfg_.spin_obs_min_samples) {
+    spin_omega_valid_ = false;
+    return;
+  }
+
+  std::sort(omegas.begin(), omegas.end());
+  const double med = omegas[omegas.size() / 2];
+
+  // Robust spread (median absolute deviation) and sign agreement.
+  std::vector<double> dev;
+  dev.reserve(omegas.size());
+  int sign_agree = 0;
+  const double med_sign = (med >= 0.0) ? 1.0 : -1.0;
+  for (double w : omegas) {
+    dev.push_back(std::abs(w - med));
+    if (w * med_sign > 0.0) ++sign_agree;
+  }
+  std::sort(dev.begin(), dev.end());
+  const double mad = dev[dev.size() / 2];
+  const double sign_frac =
+    static_cast<double>(sign_agree) / static_cast<double>(omegas.size());
+
+  const bool consistent =
+    std::abs(med) > 1e-3 &&
+    mad <= cfg_.spin_obs_consistency * std::abs(med) &&
+    sign_frac >= cfg_.spin_obs_sign_majority;
+
+  spin_omega_est_ = med;
+  spin_omega_valid_ =
+    consistent && std::abs(med) >= cfg_.face_lookahead_min_vyaw;
+
+  // Surface on the existing debug fields (no msg change needed): vyaw_est_from_
+  // timing now carries the observer estimate, consecutive_same_dir_jumps (a
+  // tracker member published via consecutiveSameDirJumps()) the in-face sample
+  // count, jump_detected the per-frame verdict.
+  debug_info_.vyaw_est_from_timing = spin_omega_est_;
+  debug_info_.spin_omega = spin_omega_est_;
+  consecutive_same_dir_jumps_ = static_cast<int>(omegas.size());
+  debug_info_.jump_detected = spin_omega_valid_;
 }
 
 // =========================================================================
@@ -758,6 +925,10 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
                      const rclcpp::Time & now)
 {
   debug_info_ = TrackerDebugInfo{};
+  // Regime flag for THIS frame's predict/associate/measurementNoise, taken from
+  // the spin observer's verdict on the PREVIOUS frame (the observer for this
+  // frame runs after the EKF update below). WORKLOG §4d.
+  spinning_regime_ = spin_omega_valid_;
   debug_info_.state_yaw = x_(6);
   debug_info_.phase_confident = phaseConfident();
   debug_info_.static_confirmed = staticConfirmed();
@@ -840,6 +1011,11 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
     debug_info_.matched = true;
     debug_info_.mahalanobis = assoc.mahalanobis;
     debug_info_.oblique = oblique;
+    // Raw selected detection for offline replay (WORKLOG §4d).
+    debug_info_.det_x_raw = best_det.x;
+    debug_info_.det_y_raw = best_det.y;
+    debug_info_.det_z_raw = best_det.z;
+    debug_info_.det_yaw_raw = best_det.yaw;
     debug_info_.det_yaw = assoc.yaw_meas;
     debug_info_.state_yaw = state_yaw_before_update;
     debug_info_.yaw_replaced_by_bearing = best_det.yaw_replaced_by_bearing;
@@ -854,6 +1030,77 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
     last_observed_face_idx_ = assoc.face_idx;
 
     x_ = ekfUpdateFace(best_det, assoc.face_idx, assoc.yaw_meas, assoc.yaw_valid);
+
+    // ── POSITION-BASED SPIN OBSERVER (WORKLOG §4d) ──
+    // Runs on the RAW detection, independent of the face-index association. When
+    // it confirms a real spin it blends its (IPPE-immune) rate into vyaw and
+    // marks phase timing confident — breaking the §4c bootstrap catch-22 that
+    // left confirmed_spin=0/374 on a genuine spinner.
+    updateSpinObserver(best_det, now);
+    // Decide whether THIS frame's observer estimate is usable: valid, physically
+    // sane, and (once we already track a spin) not a gross outlier vs the current
+    // vyaw — a bad-center frame can spike ω to absurd values and, blended in,
+    // makes the rpm jump 0↔70 and the aim wander (WORKLOG §4d round 2).
+    bool obs_usable =
+      spin_omega_valid_ && std::abs(spin_omega_est_) <= cfg_.spin_obs_max_omega;
+    if (obs_usable && phase_timing_confident_ &&
+        std::abs(x_(7)) > cfg_.face_lookahead_min_vyaw) {
+      const double ratio =
+        std::abs(spin_omega_est_) / std::max(std::abs(x_(7)), 1e-3);
+      if (ratio > cfg_.spin_obs_outlier_ratio ||
+          ratio < 1.0 / cfg_.spin_obs_outlier_ratio) {
+        obs_usable = false;  // ignore this frame, keep the tracked spin
+      }
+    }
+
+    if (obs_usable) {
+      spin_invalid_streak_ = 0;
+      const double blend = std::clamp(cfg_.spin_obs_vyaw_blend, 0.0, 1.0);
+      x_(7) = blend * spin_omega_est_ + (1.0 - blend) * x_(7);
+      P_(7, 7) = std::min(P_(7, 7), 1.5);
+      phase_timing_confident_ = true;
+      static_observation_count_ = 0;
+      debug_info_.vyaw_timing_accepted = true;
+
+      // ── One-time ghost fix: re-seed center + yaw phase from observer geometry,
+      // ONCE per spin episode (WORKLOG §4d). Before spin is tracked the EKF
+      // center orbits with the armor (the "ghost"); when the observer confirms a
+      // fast spin the windowed centroid is a good center estimate, so snap
+      // center/phase to it once and let the EKF re-converge. Doing it on every
+      // confirmed_spin toggle (round 1) snapped the center repeatedly → pd spikes
+      // and a wandering aim, so it is now latched by spin_reseed_done_.
+      if (cfg_.spin_obs_reseed_enable && !spin_reseed_done_ && confirmedSpin() &&
+          std::abs(spin_omega_est_) >= cfg_.spin_obs_reseed_min_omega) {
+        x_(0) = spin_centroid_x_;
+        x_(2) = spin_centroid_y_;
+        // predictFace: armor = center − r·[cosθ,sinθ] ⇒ dir(center→armor)=θ+π.
+        const double a = std::atan2(best_det.y - spin_centroid_y_,
+                                    best_det.x - spin_centroid_x_);
+        const double theta_obs = angles::normalize_angle(a - M_PI);
+        const int seed_idx = ((assoc.face_idx % 4) + 4) % 4;
+        const double offset = seed_idx * M_PI / 2.0;
+        x_(6) = angles::normalize_angle(theta_obs - offset);
+        last_yaw_ = x_(6);
+        // Let the EKF re-converge: inflate center/yaw covariance.
+        P_(0, 0) = std::max(P_(0, 0), 0.20);
+        P_(2, 2) = std::max(P_(2, 2), 0.20);
+        P_(6, 6) = std::max(P_(6, 6), 0.20);
+        spin_reseed_done_ = true;
+      }
+    } else if (cfg_.spin_observer_enable && phase_timing_confident_) {
+      // Brief observer dropout (detector miss / handoff-heavy window / outlier):
+      // HOLD the spin for spin_lost_grace frames so the regime + aim don't
+      // flicker; only after sustained loss bleed vyaw and release confidence
+      // (fast spin-down recovery, §3.2). WORKLOG §4d round 2.
+      if (++spin_invalid_streak_ > cfg_.spin_lost_grace) {
+        x_(7) *= 0.5;
+        if (std::abs(x_(7)) < cfg_.face_lookahead_min_vyaw) {
+          phase_timing_confident_ = false;
+          spin_reseed_done_ = false;  // allow a fresh re-seed on the next spin-up
+        }
+      }
+    }
+
     const bool static_stable_observation =
       !raw_handoff_observed &&
       !phase_timing_confident_ &&
@@ -919,6 +1166,9 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
   debug_info_.phase_confident = phaseConfident();
   debug_info_.static_confirmed = staticConfirmed();
   debug_info_.confirmed_spin = confirmedSpin();
+  debug_info_.spin_invalid_streak = spin_invalid_streak_;
+  // Latch confirmed-spin for the one-time re-seed rising-edge detection (§4d).
+  was_confirmed_spin_ = confirmedSpin();
 
   // ── STATE MACHINE ──
   if (state_ == DETECTING) {
@@ -1048,7 +1298,6 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
   double pred_t = predictionBias() + dist_now / std::max(cfg_.bullet_speed, 1.0);
   constexpr int FACES = 4;
   const bool confirmed_spin = confirmedSpin();
-  const bool static_confirmed = staticConfirmed();
 
   // Face lookahead is aim planning, not fire permission. The fire window still
   // decides whether a shot is safe (margin >= 0). Lookahead merely points the
@@ -1256,17 +1505,39 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
         time_to_window = std::numeric_limits<double>::infinity();
       }
 
+      // ── Asymmetric facing gate, PER FACE (WORKLOG §4d, round 2) ──
+      // fire_valid MUST match the actual fire gate, otherwise face SELECTION and
+      // fire PERMISSION disagree: the old `margin>=0` (strict 0.35 window) marked
+      // a currently-facing plate as NOT fire-valid, so lookahead switched the aim
+      // to the incoming face ~90° away (phase ≈ −1.3) — the gimbal then pointed at
+      // the side of the robot, never locked, never fired ("l'aim esce dal robot").
+      // Tying fire_valid to the asymmetric window keeps the aim on the plate the
+      // gate would actually fire at.
+      const bool face_static =
+        !confirmed_spin && std::abs(x_(7)) < cfg_.face_lookahead_min_vyaw;
+      const bool face_approaching = approaching || face_static;
+      double facing_gate;
+      if (cfg_.asymmetric_fire_enable) {
+        const double ds_gate =
+          std::min(cfg_.window_ref_dist / std::max(range, 0.5), 1.0);
+        facing_gate =
+          (face_approaching ? cfg_.fire_window_approach : cfg_.fire_window_leave) *
+          ds_gate;
+      } else {
+        facing_gate = win;  // legacy: equivalent to margin >= 0
+      }
+
       Face c;
       c.idx = fi;
       c.x = fx; c.y = fpy; c.z = fz;
       c.range = range; c.bearing = bearing;
       c.abs_pitch = bal.pitch; c.flight_time = bal.flight_time;
       c.phase_error = phase_error;
-      c.fire_window = win;
+      c.fire_window = facing_gate;
       c.margin = margin; c.vis = vis; c.valid = true;
       c.phase_error_future = phase_error_future;
       c.margin_future = margin_future;
-      c.fire_valid = margin >= 0.0;
+      c.fire_valid = err <= facing_gate;
       c.time_to_window = time_to_window;
       c.approaching = approaching;
       c.incoming =
@@ -1371,18 +1642,53 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
   // Absolute target angles in the IMU/odom startup frame.
   // These are destinations: the microcontroller should compare them with
   // its measured yaw/pitch, not add them to the previous target.
-  aim.abs_yaw   = angles::normalize_angle(best.bearing);
-  aim.abs_pitch = best.abs_pitch;
+  //
+  // CENTER-AIM (WORKLOG §4d round 3): for a confirmed spinner, point the gimbal
+  // at the spin center's "facing point" (the near point of the armor ring, one
+  // radius toward the barrel) instead of chasing the selected rotating face. The
+  // center bearing is near-stationary, so cmd_yaw is steady and the gimbal can
+  // actually lock; the fire decision below still requires a real plate within the
+  // facing window at impact (best.fire_valid), so we only shoot when a plate is
+  // there. This replaces the per-handoff 90° aim jumps that prevented lock.
+  bool center_aimed = false;
+  if (confirmed_spin && cfg_.spin_aim_center_enable) {
+    const double bxf = barrel_x_now + robot_vx * pred_t;
+    const double byf = barrel_y_now + robot_vy * pred_t;
+    const double cxi = x_(0) + x_(1) * pred_t;
+    const double cyi = x_(2) + x_(3) * pred_t;
+    const double czi = x_(4) + x_(5) * pred_t;
+    const double bc = std::atan2(cyi - byf, cxi - bxf);
+    const double r_face = std::clamp(x_(8), 0.10, 0.40);
+    const double fpx = cxi - r_face * std::cos(bc);
+    const double fpy = cyi - r_face * std::sin(bc);
+    const double fpz = czi;  // dz=0 model: armor ring at center height
+    const double gd = std::hypot(fpx - bxf, fpy - byf);
+    const auto bal = solveBallistic(gd, fpz - barrel_z);
+    if (bal.valid) {
+      aim.abs_yaw   = angles::normalize_angle(std::atan2(fpy - byf, fpx - bxf));
+      aim.abs_pitch = bal.pitch;
+      aim.distance  = std::sqrt(gd * gd + (fpz - barrel_z) * (fpz - barrel_z));
+      aim.target_x  = fpx;
+      aim.target_y  = fpy;
+      aim.target_z  = fpz;
+      aim.flight_time = bal.flight_time;
+      center_aimed = true;
+    }
+  }
+  if (!center_aimed) {
+    aim.abs_yaw   = angles::normalize_angle(best.bearing);
+    aim.abs_pitch = best.abs_pitch;
+    aim.distance  = best.range;
+    aim.target_x  = best.x;
+    aim.target_y  = best.y;
+    aim.target_z  = best.z;
+  }
 
   // Relative angular error from current measured head orientation to target.
   // Used for fire gating/debug; not sent as the main command.
   aim.rel_yaw   = angles::shortest_angular_distance(cur_yaw, aim.abs_yaw);
   aim.rel_pitch = aim.abs_pitch - cur_pitch;
-  aim.distance  = best.range;
   aim.target_valid = true;
-  aim.target_x = best.x;
-  aim.target_y = best.y;
-  aim.target_z = best.z;
   aim.best_face_idx = best.idx;
   aim.selected_face_idx = best.idx;
   aim.phase_error = best.phase_error;
@@ -1438,16 +1744,51 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
   // on lock and only reject a genuinely edge-on plate beyond static_facing_max.
   // This removes the static fire/no-fire flicker that occurred when a slightly
   // canted plate sat right on the window edge while perfectly aimed. WORKLOG §4.
-  const bool facing_ok = confirmed_spin ?
-    (best.margin >= 0.0) :
-    (static_confirmed ?
-      (std::abs(best.phase_error) <= cfg_.static_facing_max) :
-      (best.margin >= 0.0));
+  // ── ASYMMETRIC GEOMETRIC FACING GATE (WORKLOG §4d) ──
+  // Single physical rule replacing the old three-regime margin logic that left
+  // almost every real frame in the strict "unknown phase" bucket and never fired
+  // on a slightly-moving or spinning enemy. The plate must be within an angular
+  // window of facing-you, ASYMMETRIC by rotation sense: generous while it rotates
+  // INTO view (or the target is static — fixed favourable geometry), strict while
+  // it rotates AWAY (a leaving plate would waste a ball). Distance-scaled so it
+  // only shrinks far away. Bullet economy stays safe: fire still needs
+  // command_locked + range + finite command downstream.
+  // facing_ok is now decided PER FACE as best.fire_valid (the asymmetric gate),
+  // so face selection and fire permission use one consistent rule. WORKLOG §4d.
+  const bool is_static_now =
+    !confirmed_spin && std::abs(x_(7)) < cfg_.face_lookahead_min_vyaw;
+  const bool facing_ok = best.fire_valid;
+  aim.facing_ok = facing_ok;
+  aim.approaching = best.approaching || is_static_now;
+
+  // ── IMPACT-INSIDE-PLATE gate (WORKLOG §4e — the wheel-shot fix) ──
+  // Physical fire trigger: the predicted bullet impact (= where the gimbal is
+  // commanded: aim.abs_yaw/abs_pitch) must land inside the selected plate's board
+  // at impact time. best.bearing/best.abs_pitch point at the plate CENTRE, so the
+  // angular gap × range is the metric miss. With center-aim ON the command points
+  // at the spin centre's facing point, NOT at best's centre, so a plate that is
+  // merely within the 0.60 facing window but far around the ring yields a large
+  // lateral miss and is correctly refused — we fire only when a plate actually
+  // sweeps through the facing point. For non-center aim the command IS the plate
+  // centre (gap≈0 ⇒ inside), so the asymmetric window remains the only active
+  // gate there. This subsumes the old instantaneous `margin` into a physical hit
+  // test (COD/Tongji two-stage gate; roadmap #1, ricerca1.md).
+  const double d_az = angles::shortest_angular_distance(best.bearing, aim.abs_yaw);
+  const double d_el = aim.abs_pitch - best.abs_pitch;
+  aim.impact_lateral  = best.range * std::sin(d_az);
+  aim.impact_vertical = best.range * std::sin(d_el);
+  const bool impact_inside =
+    !cfg_.fire_require_impact_inside ||
+    (std::abs(aim.impact_lateral)  <= cfg_.plate_half_width &&
+     std::abs(aim.impact_vertical) <= cfg_.plate_half_height);
+  aim.impact_inside = impact_inside;
+
   aim.fire = best.valid &&
     fireStatePermits() &&
     best.range >= cfg_.min_fire_dist &&
     best.range <= cfg_.max_fire_dist &&
-    facing_ok;
+    facing_ok &&
+    impact_inside;
 
   return aim;
 }

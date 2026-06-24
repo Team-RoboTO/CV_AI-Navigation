@@ -580,6 +580,370 @@ Both passed on 2026-06-23 after the rework.
 
 ---
 
+## 4d. ACTIVE INVESTIGATION — spin bootstrap dead + fire black-hole (2026-06-23, REWORK APPLIED)
+
+### 4d.1 Symptoms (reported, this round)
+Validating the §4c rework on the standard robot, three issues with the new build:
+1. **Static**: `vyaw` looks off (a few −0.x rpm) on a robot that is dead still.
+2. **Slightly moving enemy**: a shot that would clearly hit is never fired —
+   always blocked by the window/phase margin. "Doesn't make sense."
+3. **Hard spinner** (captured in `bagsa/debug_stateY20260623_172232`): never fires,
+   always `phase_unknown_window_margin`. **The grave one.**
+
+Artifacts: `log4_still.txt` (the STATIC case — it now fires fine) and the rosbag
+`bagsa/…` (374 `/debug_state` msgs, the SPINNER case).
+
+### 4d.2 Evidence — the bag is a real ~100 rpm spinner the tracker can't see
+Deserialised the 374 msgs (`/tmp/analyze_bag.py`, `/tmp/spin_analysis.py`):
+
+| Metric | Value | Reading |
+|---|---|---|
+| rate | **43 Hz**, dt 10–80 ms, 9 dropouts | launch `ref_freq=60` is wrong; dt irregular |
+| handoffs (det_yaw steps >0.6) | 56, every **~147 ms**, 42 +dir / 14 −dir | **real spin ≈ 10.7 rad/s ≈ 102 rpm**, one way, IPPE-polluted |
+| `confirmed_spin` | **0/374** | the §4c bootstrap NEVER fires |
+| `jump_detected` / `vyaw_timing_accepted` | **0/374** | `observeRawYawHandoff` never calls the estimator |
+| `matched_face_idx` | **0 for all 374** | face never advances (pinned) |
+| `vyaw_rpm` | noise ±3 rpm, 101 sign flips, mean 0.10 | should be ~+100 rpm one-way |
+| `fire_block_reason` | `phase_unknown_window_margin` **240/374**, `firing` 38/374 | matches symptom #3 |
+| `aim_fire` / `cmd_fire` | 35% / **10%** | basically never shoots |
+| counterfactual | `|phase|≤0.6`: **70%** fireable; `≤0.96` (55°): **86%** | tracking is fine, the GATE throws it away |
+
+### 4d.3 Root cause — TWO defects that compound
+**R1 — the spin bootstrap is UNREACHABLE.** `observeRawYawHandoff` needs a per-frame
+`rel_yaw` step in `[yaw_jump_thresh=1.20, 2.2]` AND `one_face_jump` AND two
+consecutive **same-direction** estimates consistent within ±35% with dt∈[25,700] ms.
+On a real spinner the handoffs (~147 ms) are polluted by an IPPE flip almost every
+other frame (assoc hypothesis 241 primary / 133 alternate), so "two consecutive
+same-direction consistent" essentially never holds. On top of that the face index
+is **pinned to 0** by `face_index_switch_penalty=4.0` (added pre-`confirmedSpin`), so
+the second timing source (`observeFaceAssociation`) is dead too, and `q_yaw=7` +
+the U-shaped yaw distrust (§4 Fix 2, tuned for STATIC) make the EKF refuse to track
+the rotating yaw. Three independent locks all close the path to `confirmed_spin`.
+
+**R2 — "unknown phase" is a fire black-hole.** The §4c gate was three regimes:
+`confirmed_spin → margin≥0` / `static_confirmed → |phase|≤0.6` / **else → margin≥0
+(strict)**. Anything that is neither spin-confirmed (R1 ⇒ never) nor a perfectly
+stable static plate lands in the strict "unknown" bucket and is refused. That single
+mechanism explains all three symptoms: #3 (spinner stuck unknown), #2 (a slightly
+moving plate falls out of `static_confirmed` on vyaw noise but never reaches
+`confirmed_spin` → unknown → strict), #1 (residual phantom vyaw from the same yaw
+distrust). It is a **regime-classification** failure, not a tuning problem.
+
+**Why the §4c raw-yaw bootstrap was the wrong primitive:** yaw is the IPPE-ambiguous
+channel. Using a discrete yaw "handoff" to bootstrap spin, then hard-gating fire on
+that confirmation, makes the whole system hostage to the noisiest signal.
+
+### 4d.4 The rework (APPLIED 2026-06-23, build OK) — three pieces
+
+**(A) Position-based spin observer (the real bootstrap).** `Tracker::
+updateSpinObserver()` estimates spin from the ARMOR ORBIT, immune to the IPPE yaw
+flip. Physics: the spin center sits behind the visible (front-facing) plate at one
+radius ALONG THE LINE OF SIGHT, so the per-frame center estimate is `armor +
+r·[cos(bearing), sin(bearing)]` (bearing = pixel-accurate; **not** the flipping PnP
+yaw). The windowed mean of those is the center; the **median** armor angular
+velocity about it is ω, with the ~90° handoff frames rejected as `|Δangle|>1.0`
+outliers. Confirmed only with enough in-face samples, low robust spread (MAD), and
+a sign majority. Offline validation (`/tmp/test_observer3.py`): ω=10.7 → est 10.0,
+valid 100%; direction correct; **static and pure translation correctly NOT
+confirmed**. The earlier raw-position centroid badly underestimated ω (the front-arc
+bias) — the line-of-sight center estimate is what fixed it.
+- On confirm it blends ω into `x_(7)` (like the timing path) and sets
+  `phase_timing_confident_`. On a full window with no spin it bleeds `vyaw` fast
+  (×0.5/frame) and releases confidence → fast spin-down recovery (§3.2).
+- **Ghost fix:** on the RISING EDGE of confirmed fast spin (`|ω|≥reseed_min_omega`)
+  it re-seeds the EKF center + yaw phase ONCE from the observer geometry (centroid +
+  observed-armor angle), then inflates P so the EKF re-converges. Before this the
+  EKF center orbits with the armor (the §4c "ghost") and the four-face model aims at
+  a phantom robot.
+
+**(B) Regime-adaptive yaw trust.** While `spinning_regime_` (observer verdict of the
+previous frame): `q_yaw → q_yaw_spin=80` in `ekfPredict`, and the U-shape floor →
+`yaw_facing_obs_floor_spin=1.0` in `measurementNoise` (trust the rotating frontal
+yaw). Static keeps the old anti-phantom values. The face index also de-pins
+automatically once `confirmedSpin()` (the existing penalty is gated on
+`!confirmedSpin()`).
+
+**(C) Asymmetric geometric fire gate (replaces the three regimes).** In
+`computeAim`, one physical rule: the selected plate must be within an angular window
+of facing-you, **generous while approaching / static** (`fire_window_approach=0.60`),
+**strict while leaving** (`fire_window_leave=0.25`), distance-scaled (only shrinks
+far away). This is the COD-2026 55°/20° idea (`ricerca2.md`) and roadmap #1 of
+`ricerca1.md`. It works uniformly for static / translating / spinning, killing the
+"unknown phase" black-hole. Bullet economy stays safe: fire still needs
+`command_locked` (Stage B) + range + finite command. Set `asymmetric_fire_enable=
+false` to restore the three-regime logic. `aim.facing_ok`/`aim.approaching` now carry
+the decision; the node mirrors them (removed the drifted duplicate logic) and reports
+`facing_window_approach`/`facing_window_leave`.
+
+### 4d.5 Files changed
+- `tracker.hpp`: `SpinSample`/observer state, `was_confirmed_spin_`,
+  `spinning_regime_`; config (`spin_observer_*`, `spin_obs_reseed_*`,
+  `q_yaw_spin`, `yaw_facing_obs_floor_spin`, `asymmetric_fire_enable`,
+  `fire_window_approach/leave`); `AimResult::{facing_ok, approaching}`;
+  `updateSpinObserver` decl.
+- `tracker.cpp`: `updateSpinObserver()`; regime-adaptive `ekfPredict`/
+  `measurementNoise`; observer blend + spin-down + rising-edge re-seed in
+  `update()`; asymmetric gate in `computeAim`; observer reset in `resetSpinTiming`.
+- `autoaim_node.cpp`: declare new params; `fireBlockReason` asymmetric reasons;
+  debug `facing_ok` mirrors `aim.facing_ok`.
+- `standard.launch.py`: all §4d params.
+- `viewer_node.py`: regime HUD shows observer ω (rpm) + sample count.
+
+### 4d.6 On-robot validation protocol (REQUIRED — not yet run on hardware)
+1. **Spinner (the bag case):** `confirmed_spin` should latch true within ~0.3–0.5 s;
+   viewer `obsω` ≈ true rpm with correct sign; `matched_face_idx` cycles 0→1→2→3;
+   `cmd_fire` rises sharply from 10%. If `obsω` sign is inverted vs reality, the
+   observer math is sign-correct by construction — suspect the bearing/ego frame.
+2. **Ghost check:** while confirming, the aim must snap onto the robot (re-seed), not
+   sit beside it. If it still ghosts at the true spin rate, raise
+   `spin_obs_reseed_min_omega` is wrong direction — lower it / check centroid.
+3. **Static (log4 regression):** must still fire, `confirmed_spin=false`, `vyaw≈0`,
+   no flicker (asymmetric approach window = old static cap).
+4. **Slightly-moving:** should now fire when geometrically hitting (was the #2 bug).
+5. **Spin-down:** stop the spinner → `confirmed_spin` drops, `vyaw→0` within a few
+   frames; aim settles.
+6. **Bullet economy:** watch for over-firing on plates that are leaving — if so,
+   lower `fire_window_leave` toward 0.18.
+7. **Medium spin (2–5 rad/s):** the observer is marginal there (offline valid_frac
+   ~0.5); it falls back to the asymmetric gate on the observed armor. If medium
+   spinners under-fire, relax `spin_obs_consistency` toward 0.8 (watch translation
+   false-positives) or lower `spin_obs_reseed_min_omega`.
+8. Fix `ref_freq` to the real detector rate (was 60, bag shows 43).
+
+### 4d.7 Known risks / next
+- The re-seed snaps the EKF state — kept behind `spin_obs_reseed_enable` and gated on
+  fast spin (centroid only ≈ center when the window spans a good arc). Validate it
+  does not introduce a transient jump on borderline spins.
+- Medium-spin confirmation is the weak spot (see step 7). A cleaner long-term fix is
+  a proper circle/center estimate (or the robot-centric reprojection tracker, roadmap
+  #7) so spin is observed continuously instead of via a windowed median.
+- `observeRawYawHandoff` is now redundant as the primary bootstrap; left in as a
+  secondary timing source. Consider removing once the observer is proven on hardware.
+
+### 4d.8 Round 2 — second bag (`bagsa/debug_state…182411`, REWORK round 1 ON robot)
+The §4d round-1 build was run on the robot. **It broke the catch-22**: `confirmed_spin`
+363/486 (75%), `matched_face_idx` cycles 0→1→2→3, `faces_checked=4`, `aim_fire` up to
+52%, vyaw tracks ~60–80 rpm. But user reports persist: (a) slight enemy translation
+still doesn't fire; (b) on rotation the aim "exits the robot" and the rpm oscillates
+0↔70↔0. Bag confirms: `cmd_fire` still **9%**; `yaw_locked` only 35%; block reasons
+split between `facing_window_*` (203) and `yaw/pitch_unlocked` (211).
+
+**Two distinct round-2 bugs found from the time series:**
+
+1. **Selection ↔ gate DISCONNECT (the dominant fire-blocker).** Face *selection*
+   still used the old strict `fire_valid = margin>=0` (0.35 window) while the *fire
+   gate* used the new asymmetric 0.60 window. So a currently-facing plate (|phase|
+   ~0.4–0.5) was NOT "fire-valid", lookahead switched the aim to the **incoming
+   face ~90° away** (`face_switch_reason=incoming_lookahead`, phase ≈ −1.3), the
+   gimbal pointed at the side of the robot, never locked, never fired — exactly
+   "l'aim esce dal robot". **Fix:** `c.fire_valid` now uses the same per-face
+   asymmetric window as the gate; `facing_ok = best.fire_valid` (one source of
+   truth). The aim stays on the plate the gate would actually fire at; lookahead
+   only engages when no face is within the window.
+
+2. **Spin estimate flicker (the 0↔70 rpm).** Three causes: (i) the re-seed fired on
+   EVERY `confirmed_spin` rising edge, and confirmed_spin toggled frame-to-frame, so
+   the center was snapped repeatedly → `pd` spikes (up to 1.0 m) and a wandering
+   aim; (ii) a single observer-invalid frame (detector miss / handoff-heavy window)
+   halved vyaw and dropped confidence; (iii) bad-center frames spiked ω up to
+   179 rpm and the 0.5 blend injected that into vyaw. **Fixes:** re-seed **once per
+   spin episode** (`spin_reseed_done_`); **hold** confirmed spin through
+   `spin_lost_grace=6` invalid frames before releasing; **reject** observer ω above
+   `spin_obs_max_omega=40 rad/s` or differing from current vyaw by >`spin_obs_
+   outlier_ratio=2.5`×; lower blend 0.5→**0.35** (smoother rpm).
+
+**Round-2 build OK. On-robot re-validation pending** (same §4d.6 protocol; expect
+`yaw_locked` and `cmd_fire` to rise sharply, rpm to be steady, aim to stay on the
+plate). If translation-following is still soft AFTER this, it is the §4b lead tuning
+(`q_pos`/`alpha_pos`), a separate axis.
+
+**Round-2 additions (also applied, build OK):**
+- **`DebugState` now carries the raw inputs + state** for OFFLINE replay (so the
+  next bag can be re-run through the spin observer / EKF without the robot):
+  `det_x_raw/det_y_raw/det_z_raw/det_yaw_raw` (selected detection, odom, pre-EKF),
+  `ego_x/ego_y`, `state_xc/vxc/yc/vyc/vza`, `spin_centroid_x/y`, `spin_omega`,
+  `spin_invalid_streak`. (`state_yaw`, `vyaw`, `radius` were already published.)
+- **Translation follow:** `alpha_pos 0.995 → 1.0` (pure CV). 0.995 at ref_freq 60
+  bled ~26%/s of the velocity estimate — a constant drag that made the EKF
+  under-lead / lag a slightly-moving enemy ("non segue bene"). The anisotropic R
+  still collapses velocity to ~0 on stop, so this removes the lag without re-adding
+  stop-overshoot. If a static target shows phantom lead, lower toward 0.99.
+
+### 4d.9 Round 3 — center-aim for spinners + translation overshoot (bag `…190343`)
+Third bag (mostly a ~60 rpm spinner, 926 msgs, NOW with the raw-detection fields).
+User: translation now **overshoots** left-right on slow targets; spin aim still
+"random", no improvement. Bag analysis (raw fields let us reconstruct geometry):
+- **Spin is tracked, center is NOT ghosting:** `|center − raw detection|` median
+  **0.234 m ≈ radius 0.232** (the earlier "1.16 m" was an artifact of det=(0,0)
+  no-detection frames). `confirmed_spin` 93%, faces cycle.
+- **The spin failure is the AIM, not the state:** `incoming_lookahead` is the face
+  reason **59%** of frames; the aim chases each plate then JUMPS to the next
+  incoming one ~90° away → `cmd_yaw` frame-to-frame jump mean **58 mrad, p90 167,
+  max 395**, 30% of frames >50 mrad. At 60 rpm a handoff is every ~0.25 s, so
+  chasing plates means slewing the gimbal 90° every 0.25 s — it can never settle →
+  `yaw_locked` 37%, `cmd_fire` 11%. This is the "aim va a caso".
+- **Translation overshoot:** `alpha_pos=1.0` (round-2) over-led; also the orbiting
+  armor leaks into the CENTER velocity (`state |v|` mean 0.21, max 0.93 m/s phantom)
+  via `q_pos=10`, inflating the lead.
+
+**Round-3 fixes (applied, build OK):**
+1. **Center-aim for a confirmed spinner** (`spin_aim_center_enable=true`,
+   `computeAim`). When `confirmed_spin`, the aim azimuth/pitch point at the spin
+   center's **facing point** (center pushed one radius toward the barrel = where a
+   facing plate sits), NOT the chased rotating face. The center bearing is
+   near-stationary, so the gimbal can lock; firing still requires a plate within the
+   facing window at impact (`best.fire_valid`). **Offline-validated on the bag:**
+   frame-to-frame aim jump drops **58 → 11.6 mrad mean** (p90 167 → 23, >50 mrad
+   30% → 1%). This is the key spin fix — a steady aim that can actually lock and
+   fire when a plate sweeps through.
+2. **`q_pos 10 → 5`**: calms the phantom center velocity (less center-aim wobble,
+   less translation over-lead).
+3. **`alpha_pos 1.0 → 0.99`**: a touch of damping curbs the round-2 translation
+   overshoot; the round-2 gate fix handles "doesn't fire" separately now.
+
+On-robot re-validation pending. Expect: steady aim on a spinner that locks and
+fires when a plate faces; no left-right overshoot on slow translation.
+
+> The raw-detection fields added in round 2 are what made round 3 **data-driven**:
+> the center-aim benefit (5× steadier aim) was measured from the recorded bag
+> BEFORE touching the robot. Keep recording with these fields.
+
+---
+
+## 4e. FULL FIRE-CONTROL REWORK — shoots-wheels + overshoot (2026-06-23, APPLIED, build OK)
+
+### 4e.1 Symptoms (reported, this round) + the bag
+Validating round 3 on the standard robot (bag `bagsa/debug_stateY20260623_193335`,
+1541 msg / 35 s: spinner ~55–65 rpm 0–20 s, then translation 20–30 s, then stop):
+1. **Slight left-right translation** → aim **overshoots**, goes further L/R than it
+   should, sometimes **jumps back/forward**, doesn't follow accurately (we are still).
+2. **Hard spinner** → aim lands at near-**random** values around the robot, never
+   pitch/yaw inside the plate; **fire given when the aim is on the wheels** at close
+   range, NOT given when the aim is over the plate; `vyaw` "oscillates 80–110 rpm"
+   on a robot that wasn't rotating that hard.
+
+### 4e.2 Evidence — round 3 fixed the STATE, the FIRE-CONTROL is what's broken
+Round 3 (center-aim) **worked for what it does**: `confirmed_spin` 81%, faces cycle
+0→1→2→3, center NOT ghosting (`|center−det|` median 0.219 ≈ radius 0.218), and when
+`confirmed_spin` holds two frames the aim is steady (cmd_yaw jump 12 mrad). But:
+
+| Metric | Value | Reading |
+|---|---|---|
+| `cmd_fire` off-plate | **49%** of fires (`pixels_inside` 51% when firing) | shoots wheels |
+| `\|phase_error\|` at fire | mean 0.217, **max 0.597** | fires up to 34° off-facing |
+| phantom center `\|v\|` (spin) | **0.295 m/s mean, 1.23 max** (robot still) | overshoot source |
+| aim lead from phantom v | 32 mrad mean, **241 max** | the L/R overshoot + jumps |
+| `vyaw_rpm` (confirmed_spin) | 55 ± **22.8** (f2f 3.2) | noisy spin |
+| `yaw_locked` | **59%**; 238 frames `aim_fire`&!fire = `yaw_unlocked` | lock fails |
+| cmd_yaw big jumps (>80 mrad) | 61, **62% coincide with `confirmed_spin` toggle** | aim flips mode |
+
+### 4e.3 Root cause — ONE root, four faces (the FIRE-CONTROL/output layer)
+Rounds 1–3 fixed STATE ESTIMATION. What was left broken is the layer above:
+**we aim at one point and validate fire at a different point on a rotating
+reference, while the orbit contaminates the center velocity.**
+
+1. **Fire gate DECOUPLED from the aim point (the wheel-shot root).** Center-aim
+   points the gimbal at the spin-center facing point `P_c`, but fire was permitted
+   when the *rotating selected face* was within `fire_window_approach=0.60` (34°).
+   Those are different points: at r=0.22 a 34° plate is `r·sin34°≈0.12 m` (a full
+   plate width) from `P_c` → the bullet flies to `P_c` where no plate is. COD's
+   `should_fire_spin_target` (ricerca2.md:290) uses the window only as `phase_ok`
+   (selection) PLUS `aim_ok` (predicted aim error tiny) — **we implemented only the
+   window half.** Also: `pixels_inside` only checks "inside the camera frame", never
+   "inside the plate"; no impact-in-plate test existed.
+2. **Phantom center velocity → overshoot.** A single front-plate can't separate
+   "center translating" from "armor orbiting"; with the normal `q_pos` the EKF
+   center chases the orbiting armor → phantom velocity (and the center POSITION
+   wobbles too: even the windowed slope of `state_xc` gives 0.8 m/s at a dead stop —
+   so neither the observer centroid nor a slope is usable as a clean velocity).
+3. **`confirmed_spin` toggle → aim flips center-aim↔face-chase → no lock.** The
+   redundant raw-yaw/timing path (`jump_detected` 796, `vyaw_timing_accepted` 726)
+   was still resetting `phase_timing_confident_=false` on IPPE-noisy yaw reversals,
+   toggling the regime; each toggle = a >80 mrad gimbal jump = lost lock.
+4. **Noisy `vyaw`.** `q_yaw_spin=80` fully trusted the IPPE-flipping frontal yaw and
+   the timing path double-wrote `vyaw`, jittering it ±23 rpm. (The position observer
+   ω is actually *noisier* — std 30 — so vyaw must stay the smoothed EKF value, just
+   with fewer noise injections.)
+
+### 4e.4 The rework (APPLIED 2026-06-23, build OK) — four pieces
+**(1) IMPACT-INSIDE-PLATE fire gate** (`tracker.cpp::computeAim`, new config
+`fire_require_impact_inside`/`plate_half_width=0.065`/`plate_half_height=0.050`).
+The physical trigger: the predicted bullet impact (= the commanded aim
+`abs_yaw/abs_pitch`) must land inside the selected plate's board at impact time:
+`lateral = best.range·sin(aim.abs_yaw − best.bearing)`, `vertical = best.range·
+sin(aim.abs_pitch − best.abs_pitch)`, require `|lateral|≤half_w && |vertical|≤
+half_h`. For NON-center aim the command IS the plate center (lateral≈0 ⇒ inside), so
+the asymmetric window stays the only active gate there (obliquity guard). For the
+center-aim spinner it fires ONLY when a plate sweeps through `P_c` — the wheel-shot
+fix. Folds into `aim.fire`; new fields `AimResult::{impact_inside,impact_lateral,
+impact_vertical}` + `/debug_state` mirrors + `fire_block_reason="impact_outside_plate"`.
+This is roadmap #1 / COD's two-stage gate. **Offline indication on the bag:** the
+gate keeps ~73% of previously fire-eligible spinner frames (|phase|≲asin(0.065/r)≈
+0.30) and drops the 0.30–0.60 tail that produced the off-plate shots.
+
+**(2) Regime-adaptive CENTER stiffness** (`ekfPredict`, new `q_pos_spin=0.8`,
+`alpha_pos_spin=0.90`). While `spinning_regime_`, the horizontal center uses a small
+q + strong damping so it stops chasing the orbit → phantom velocity bleeds to ~0 and
+the center converges to the orbit mean. Mirrors the existing `q_yaw_spin` pattern;
+vertical keeps normal `q_pos`. A real translating spinner still follows (slowly) —
+and under-leading costs far fewer balls than the overshoot did.
+
+**(3) Subordinate the raw-yaw timing path to the position observer**
+(`feedSpinTimingJump`). While `spinning_regime_` the timing path may RAISE confidence
+but must NOT (a) reset `phase_timing_confident_=false` or (b) write `vyaw` — the
+observer's `spin_lost_grace` is the single owner of spin release. Kills the regime
+toggle (and one vyaw-noise source).
+
+**(4) Calmer spin yaw** (`q_yaw_spin 80→40`). The observer owns the rate; the EKF
+only needs enough q to keep the phase aligned. Less IPPE-yaw noise into vyaw.
+
+Also: `ref_freq 60→45` (real detector rate from the bags is ~44 Hz; 60 over-scaled
+the per-frame damping normalization). Re-confirm with `ros2 topic hz`.
+
+### 4e.5 Files changed
+- `tracker.hpp`: config `fire_require_impact_inside`/`plate_half_width`/
+  `plate_half_height`, `q_pos_spin`/`alpha_pos_spin`, `q_yaw_spin` default 80→40;
+  `AimResult::{impact_inside,impact_lateral,impact_vertical}`.
+- `tracker.cpp`: regime-adaptive `q_pos`/`alpha_pos` in `ekfPredict`; impact gate in
+  `computeAim` folded into `aim.fire`; raw-yaw path subordinated in `feedSpinTimingJump`.
+- `autoaim_node.cpp`: declare new params; publish impact fields; `fireBlockReason`
+  `impact_outside_plate`.
+- `DebugState.msg`: `impact_inside`/`impact_lateral`/`impact_vertical`.
+- `standard.launch.py`: all §4e params + `q_yaw_spin 40` + `ref_freq 45`.
+- `viewer_node.py`: HUD impact line (inside + lat/vert mm).
+
+### 4e.6 On-robot validation protocol (REQUIRED — not yet run on hardware)
+1. **Spinner (wheel-shot fix):** `cmd_fire` should now fire ONLY when the HUD
+   `Impact:Y` (lat/vert within plate); watch that fires no longer land on the wheels.
+   `fire_block_reason` should show `impact_outside_plate` while waiting for a plate
+   to reach the facing point (this is correct, not a bug).
+2. **Slow translation (overshoot fix):** aim should follow without the L/R overshoot
+   / back-forward jumps; `state_vxc/vyc` (phantom) should be much smaller during a
+   pure spin. If a real translating enemy is UNDER-led (lags), raise `q_pos_spin`
+   toward 2.0 or `alpha_pos_spin` toward 0.95.
+3. **Regime stability:** `confirmed_spin` should stop toggling; `yaw_locked` and
+   `cmd_fire` should rise; cmd_yaw jumps should drop.
+4. **vyaw:** steadier; if still noisy, lower `spin_obs_vyaw_blend` toward 0.2.
+5. **Static regression:** must still fire (impact gate trivially satisfied; aim = plate
+   center).
+6. **Bullet economy:** if it under-fires on a fast spinner (plate sweeps too fast to
+   catch inside the plate window), raise `plate_half_width` toward 0.08, or widen the
+   impact horizon by aiming slightly ahead of `P_c` (future work). If it over-fires
+   on leaving plates, that's the asymmetric `fire_window_leave` — lower toward 0.18.
+
+### 4e.7 Known risks / next (toward "team forte")
+- The impact gate is evaluated at a SINGLE impact time; a proper **trajectory fire
+  score** over a 50–150 ms horizon (roadmap #1 full) + the **latency ledger**
+  (roadmap #2) is the next step — it would also let us fire slightly BEFORE the plate
+  reaches `P_c` to account for the sweep speed.
+- The center/vyaw separation is still a 9-D EKF fighting an observability limit; the
+  clean long-term design is the two-mode split (directly-observed-armor tracker before
+  spin, robot-center/4-face after) or the robot-centric reprojection tracker
+  (roadmap #7).
+- **PnP yaw via normal vector** (§4.6.2) is still queued — the weak input feeding vyaw.
+
+---
+
 ## 5. Backlog — accuracy & fire-rate upgrades (bullet-economy aware)
 
 Context: **ARC has a ~750-ball cap.** Optimize *hit probability per ball*, not
@@ -678,6 +1042,45 @@ If validated, mirror `face_index_switch_penalty` plus the earlier §4 parameters
 into `hero`/`sentry` launches and commit.
 
 ### Reasoning ledger (most recent first)
+- **2026-06-23 (applied, §4e FULL FIRE-CONTROL REWORK)** — Bag `…193335` (spinner +
+  translation): round 3 fixed STATE (confirmed_spin 81%, center not ghosting) but the
+  FIRE-CONTROL layer was broken — 49% of fires off-plate (shoots wheels), phantom
+  center velocity 0.3–1.2 m/s (translation overshoot), confirmed_spin toggles → aim
+  flips → yaw_locked 59%. Root: aim point (center facing point) DECOUPLED from the
+  fire gate (rotating-face 0.60 window). Applied 4 fixes: (1) **impact-inside-plate
+  gate** — fire only if the predicted bullet impact lands on the selected plate's
+  board (COD two-stage gate; the wheel-shot fix); (2) **regime-adaptive center
+  stiffness** `q_pos_spin=0.8`/`alpha_pos_spin=0.90` — kills phantom velocity at the
+  source (mirrors q_yaw_spin); (3) **subordinate the raw-yaw timing path to the
+  position observer** — no more regime toggle / vyaw double-write; (4) `q_yaw_spin
+  80→40`. Both (2) and (3) are AIM fixes (overshoot + regime-flip jumps), not just
+  fire. Corrected the ref_freq misconception (it's a damping time-constant base, NOT
+  a rate to match — real dt is already used; reverted 45→60). `colcon build` OK.
+  **On-robot validation pending** (§4e.6). Offline: impact gate keeps ~73% of
+  fire-eligible spinner frames, drops the 0.30–0.60 phase tail (the off-plate shots).
+- **2026-06-23 (applied, §4d round 2)** — Ran §4d round-1 on robot (bag `…182411`):
+  catch-22 broken (confirmed_spin 75%, faces cycle), but `cmd_fire` still 9%, aim
+  "exits the robot", rpm oscillates 0↔70. Root: (1) face SELECTION still used the
+  strict `margin>=0` while the GATE used the asymmetric window → lookahead aimed at
+  the incoming face 90° away → no lock → no fire; (2) re-seed fired on every
+  confirmed_spin toggle + single-frame invalid dropped confidence + bad-center ω
+  spikes. Fixes: `fire_valid` = asymmetric gate (selection↔gate unified); re-seed
+  once per episode; spin-hold grace (6 frames); ω outlier/max rejection; blend
+  0.5→0.35. Build OK. **On-robot re-validation pending.**
+- **2026-06-23 (applied, §4d)** — Validated the §4c rework with a STATIC log
+  (`log4_still.txt`, now fires) and a real ~100 rpm SPINNER rosbag (`bagsa/`).
+  Bag analysis: `confirmed_spin`/`jump_detected` 0/374, `matched_face_idx` 0/374,
+  `cmd_fire` 10% — the §4c raw-yaw bootstrap **never triggered** (IPPE flip + strict
+  gates + face pinning + static-tuned yaw distrust all block it), and the
+  three-regime fire gate left every real frame in a strict "unknown phase"
+  black-hole. Applied a root rework (user chose "rework + geometric fire gate"):
+  **(A)** position/orbit-based spin observer (line-of-sight center estimate, median
+  ω, IPPE-immune; offline-validated ω=10.7→10.0, static/translation rejected) with
+  vyaw blend + fast spin-down + one-time EKF re-seed (ghost fix); **(B)**
+  regime-adaptive yaw trust (`q_yaw_spin`, floor→1.0 while spinning, face de-pin on
+  confirm); **(C)** asymmetric geometric fire gate (approach 0.60 / leave 0.25, COD
+  55/20 idea) replacing the three regimes. `colcon build` OK. **On-robot validation
+  pending** (protocol in §4d.6).
 - **2026-06-23 (applied)** — User asked to apply the best root rework after
   reviewing `WORKLOG.md`, `IMPLEMENTATION_PLAN.md`, `log3.txt`,
   `ricerca1.md`, and `ricerca2.md`. Implemented the §4c focused rework:

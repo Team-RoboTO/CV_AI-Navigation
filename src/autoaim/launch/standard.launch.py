@@ -72,6 +72,10 @@ def autoaim_params():
         #     the fire margin over its edge → fire/no-fire flicker (WORKLOG §4).
         #     The face-jump-timing gate, not q_yaw, does the fast spin-up
         #     convergence, so 7 keeps real spinners while killing the drift.
+        # q_pos 10 → 5 (WORKLOG §4d round 3): on a spinner the orbiting armor
+        # leaks into the CENTER velocity (phantom |v| up to 1 m/s in bag …190343),
+        # which both wobbles the center-aim and over-leads a slow translating
+        # target (the left-right overshoot). Lower q_pos calms the center velocity.
         {"q_pos": 10.0},
         {"q_yaw": 7.0},
         {"q_r": 1e-6},
@@ -91,9 +95,16 @@ def autoaim_params():
         {"r_yaw_slope": 0.005},
         {"max_oblique_deg": 75.0},
 
-        # 0.98 at ~100 Hz decays the velocity estimate to ~13%/s — a constant
-        # drag that under-leads translating targets. Let q_pos handle the noise.
-        {"alpha_pos": 0.995},
+        # alpha_pos = 1.0 → pure constant-velocity, NO velocity drag. 0.995 at
+        # ref_freq 60 bled ~26%/s, a constant drag that makes the EKF UNDER-lead /
+        # lag a translating enemy ("non segue bene" on a slight move). With the
+        # anisotropic R (tight lateral) the velocity still collapses to ~0 quickly
+        # when the target stops, so this removes the follow lag without re-adding
+        # stop-overshoot. WORKLOG §4d round 2 / §4b.
+        # ROUND 3: 1.0 (pure CV) OVER-led slow translating targets → the left-right
+        # overshoot the user saw. Back to 0.99: a touch of damping curbs the
+        # overshoot, while the gate fix (round 2) handles "doesn't fire" separately.
+        {"alpha_pos": 0.99},
         # alpha_yaw = 1.0 → NO spin damping. A 小陀螺 spins at a roughly constant
         # rate; damping vyaw between updates only makes the spin estimate decay
         # and the 4-face phase prediction lag behind. 0.995 quietly bled ~26%/s.
@@ -171,14 +182,21 @@ def autoaim_params():
         #   on a spinner. Calibrate on a mover in 5 ms steps; the node logs the
         #   measured pipeline part every 2 s.
         {"use_measured_latency": True},
-        {"actuation_latency": 0.030},
+        {"actuation_latency": 0.060},
         # LEGACY fallback fixed horizon, used ONLY if use_measured_latency=False.
         # Then it must cover the FULL capture→muzzle latency (40-80 ms typical).
         {"LEGACY_time_bias": 0.045},
 
-        # Must equal the REAL detection rate: ros2 topic hz /detector/armors_keypoints
-        # (the ZED grabs at 120 fps — if inference keeps up this should be ~120).
-        {"ref_freq": 60.0},
+        # ref_freq is NOT a rate that must match reality (WORKLOG §4e correction).
+        # The EKF predict and the command smoother already use the REAL measured dt
+        # (autoaim_node.cpp:969, 1462); 1/ref_freq is only the first-frame fallback.
+        # The ONLY real role of ref_freq is the damping time-constant base: velocity
+        # decays as alpha^(dt·ref_freq), so over wall-clock time the decay is
+        # alpha^(ref_freq·T) — INDEPENDENT of frame rate. So ref_freq must be a FIXED
+        # constant (it sets, with each alpha, the per-second time constant); it must
+        # NOT track the live rate, or the damping would drift with detector load.
+        # Kept at 60 because the alpha_* values were tuned against this base.
+        {"ref_freq": 48.0},
         # yaw_jump_thresh 1.20 rad (69°): a real face switch is ~90° (1.57 rad);
         # a 300 RPM spinner moves 31.4/60 = 0.52 rad between 60 Hz frames, so 1.20
         # sits cleanly between "normal frame" and "face switch".
@@ -206,6 +224,75 @@ def autoaim_params():
         {"switch_range_ratio": 0.85},
         {"switch_cooldown": 10},
         {"same_target_identity_dist": 1.0},
+
+        # ───────────────────────────────────────────────────────────────────
+        # SPIN-BOOTSTRAP REWORK + GEOMETRIC FIRE GATE (WORKLOG §4d)
+        # The §4c raw-yaw handoff bootstrap never triggered on a real ~100 rpm
+        # spinner (bag: confirmed_spin 0/374, jump_detected 0/374) because it
+        # depends on a clean per-frame ~90° yaw step + two consistent same-dir
+        # estimates, which the IPPE yaw flip and irregular frame rate destroy.
+        # The position-based spin observer estimates the spin from the ARMOR
+        # ORBIT (pixel-accurate, IPPE-immune): windowed-centroid ≈ spin center,
+        # median armor angular velocity about it = ω (handoff steps rejected).
+        {"spin_observer_enable": True},
+        {"spin_obs_window": 0.45},        # [s] sliding window of raw detections
+        {"spin_obs_min_samples": 4},      # min in-face angular-velocity samples
+        {"spin_obs_handoff_da": 1.0},     # [rad] |Δangle| above = handoff, rejected
+        {"spin_obs_min_radius": 0.05},    # [m] reject translation/noise on centroid
+        {"spin_obs_consistency": 0.6},    # robust MAD/|median| ceiling to confirm
+        {"spin_obs_sign_majority": 0.70}, # fraction of samples sharing median sign
+        {"spin_obs_vyaw_blend": 0.35},    # blend of observer ω into vyaw (lower = smoother rpm)
+        # One-time EKF center/phase re-seed on rising edge of confirmed spin (kills
+        # the "ghost" center that orbits with the armor before spin is tracked).
+        {"spin_obs_reseed_enable": True},
+        {"spin_obs_reseed_min_omega": 4.0},  # [rad/s] min |ω| to trust centroid as center
+        # Anti-flicker / anti-outlier (round 2): hold confirmed spin through brief
+        # observer dropouts, and reject bad-center ω spikes that made rpm swing
+        # 0↔70 and the aim wander.
+        {"spin_lost_grace": 6},           # frames of observer-invalid before releasing spin
+        {"spin_obs_max_omega": 40.0},     # [rad/s] reject estimates above this (bad center)
+        {"spin_obs_outlier_ratio": 2.5},  # once confirmed, ignore ω differing from vyaw by >this
+        # Regime-adaptive yaw trust: while the observer says spinning, disable the
+        # static U-shape (floor→1.0) and raise q_yaw so the EKF tracks the rotation
+        # (the static-tuned distrust is what froze the yaw on a real spinner).
+        {"yaw_facing_obs_floor_spin": 1.0},
+        # q_yaw_spin 80 → 40 (WORKLOG §4e): 80 fully trusted the IPPE-flipping
+        # frontal PnP yaw and injected ±23 rpm noise into vyaw. The position
+        # observer owns the spin rate now; the EKF only needs enough q to keep
+        # the phase aligned.
+        {"q_yaw_spin": 40.0},
+        # Regime-adaptive CENTER stiffness while spinning (WORKLOG §4e). A 小陀螺
+        # center is ~stationary; a single front-plate can't separate center motion
+        # from the orbit, so the normal q_pos let the EKF center CHASE the orbiting
+        # armor → phantom 0.3–1.2 m/s velocity led into the aim (the left-right
+        # overshoot + "salti avanti/indietro"). A small q_pos_spin + strong
+        # alpha_pos_spin stiffen the center so the orbit cannot leak in; a real
+        # translating spinner still follows (slowly). Set == q_pos/alpha_pos to
+        # disable.
+        {"q_pos_spin": 0.8},
+        {"alpha_pos_spin": 0.96},
+        # Asymmetric geometric fire gate — the ELIGIBILITY pre-filter (is the plate
+        # square enough to be worth a shot). Generous while the plate rotates INTO
+        # view (or static), strict while it leaves — the COD 55°/20° idea
+        # (ricerca2.md). NOT the fire trigger on its own (see impact gate below).
+        {"asymmetric_fire_enable": True},
+        {"fire_window_approach": 0.60},   # [rad] ≈34° entering / static
+        {"fire_window_leave": 0.25},      # [rad] ≈14° leaving
+        # IMPACT-INSIDE-PLATE gate (WORKLOG §4e — the wheel-shot fix). The PHYSICAL
+        # fire trigger: the predicted bullet impact (where the gimbal is aimed) must
+        # land on the selected plate's board. With center-aim the gimbal points at
+        # the spin center's facing point, so this fires only when a plate actually
+        # sweeps through it — instead of firing at any plate within 34° (which, at
+        # r≈0.22 m, put the bullet a full plate-width onto the wheels). Half-sizes
+        # are conservative so a pass is a real center hit. Set
+        # fire_require_impact_inside=False to restore the old window-only gate.
+        {"fire_require_impact_inside": True},
+        {"plate_half_width": 0.065},      # [m] half armor-board width
+        {"plate_half_height": 0.050},     # [m] half armor-board height
+        # Center-aim for a confirmed spinner: point at the spin center's facing
+        # point (steady) instead of chasing 90°-jumping plates, so the gimbal can
+        # lock. Fire still gated on a plate facing at impact. WORKLOG §4d round 3.
+        {"spin_aim_center_enable": True},
 
         {"cmd_smooth_alpha": 1.00},
         {"cmd_deadband_yaw": 0.005},
@@ -257,7 +344,7 @@ def generate_launch_description():
     serial_port = LaunchConfiguration("serial_port")
 
     serial_params = [
-        {"shooting_active": False},
+        {"shooting_active": True},
         {"rotating_chassis": False},
 
         {"serial_port": serial_port},
