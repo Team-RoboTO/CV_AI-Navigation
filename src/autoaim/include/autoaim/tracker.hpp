@@ -234,8 +234,29 @@ struct TrackerConfig
   // converge to the orbit's true mean. A genuinely translating spinner still
   // follows (slowly) — and under-leading is far cheaper on balls than the
   // overshoot. Set *_spin equal to the static values to disable the adaptation.
-  double q_pos_spin    = 0.8;   // [(m/s^2)^2] stiff center while spinning
-  double alpha_pos_spin = 0.90; // strong velocity damping while spinning
+  double q_pos_spin    = 2.0;   // [(m/s^2)^2] stiff center while spinning (2.0: stiff but still follows a slow translating spinner; the erratic 0.8↔10 swing is gone now the regime is sticky)
+  double alpha_pos_spin = 0.93; // velocity damping while spinning
+
+  // ── OBSERVABILITY-GATED LEAD + CENTER-AIM STICKINESS (WORKLOG §4f) ──
+  // At a 44 Hz detector a fast top (~235 rpm in bag 193721) moves the armor
+  // 30–90°/frame → the spin is ALIASED (Nyquist) and vyaw is unreliable, so
+  // leading the aim by vyaw·T points the shot at the WRONG phase. Above
+  // omega_reliable_max we drop the ROTATIONAL lead and rely on center-aim +
+  // opportunistic impact-gate fire (the physical best at this rate). Raise the
+  // detector rate to lift this ceiling. ~15 rad/s ≈ 143 rpm: below it the armor
+  // moves <≈20°/frame and the phase is trackable.
+  double omega_reliable_max = 15.0;  // [rad/s] above this: no rotational lead
+  // The spinning-top center is ~stationary; the orbit leaks a phantom velocity
+  // into vxc/vyc (0.3–1.2 m/s on a still robot). Capping the TRANSLATIONAL lead
+  // while spinning kills the L/R overshoot and stops the center-aim point from
+  // wobbling (which broke gimbal lock), while still letting a genuinely slow
+  // translating spinner be followed. Raise to disable.
+  double spin_trans_lead_cap = 0.30;  // [m/s] max center speed led into the aim while spinning
+  // Hold center-aim for a few frames after confirmed_spin briefly drops, so the
+  // aim azimuth does not flip center-aim↔face-chase on a 1-frame regime dropout
+  // (each flip is a ~90° gimbal jump that breaks lock — bag: 62% of >80 mrad
+  // command jumps coincide with a regime toggle). WORKLOG §4f (Radice 1).
+  int    center_aim_hold_frames = 8;
 
   // Velocity damping: v *= alpha each frame (at ref_freq Hz).
   // alpha_yaw should be 1.0 (NO spin damping): a 小陀螺 spins at a roughly
@@ -678,6 +699,10 @@ private:
   // Previous face selected by computeAim(). This is only face scheduling
   // hysteresis inside one tracked robot; it never resets or switches the EKF.
   mutable int last_aim_face_idx_ = 0;
+  // Center-aim stickiness counter (WORKLOG §4f): keeps the aim in center-aim mode
+  // for a few frames after confirmed_spin briefly drops, so the azimuth does not
+  // flip to face-chase (a ~90° jump that breaks gimbal lock).
+  mutable int center_aim_hold_ = 0;
 
   int last_matched_face_idx_ = -1;
   rclcpp::Time last_face_assoc_time_;

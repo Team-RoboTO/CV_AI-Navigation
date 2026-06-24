@@ -41,6 +41,7 @@ import json
 import math
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -141,6 +142,19 @@ class Yolo26PoseKeypointsNode(Node):
         self.declare_parameter("nms_iou", DEFAULT_NMS_IOU)
         self.declare_parameter("publish_debug_every", DEFAULT_PUBLISH_DEBUG_EVERY)
         self.declare_parameter("debug_scores", True)
+        # Per-frame JSON keypoint publish (/detector/armors_keypoints_json) is a
+        # DEBUG-only mirror of the typed ArmorKeypointArray. Nothing in the autoaim
+        # pipeline subscribes to it; json.dumps every frame is pure CPU waste at the
+        # grab rate. Default OFF (WORKLOG §4f stage 1). Turn on only for external
+        # JSON tooling.
+        self.declare_parameter("publish_keypoint_json", False)
+        # Software-pipeline the inference: run the CPU postprocess+publish of frame
+        # N-1 WHILE the GPU computes frame N (no GPU/CPU overlap otherwise). Hides
+        # the ~8 ms CPU stage under the ~15 ms inference → higher throughput. Costs
+        # ONE frame of extra latency, which the node's latency-aware prediction
+        # already accounts for (the capture timestamp is preserved). WORKLOG §4f
+        # stage 3. Set False to restore the strictly-serial loop.
+        self.declare_parameter("pipeline_inference", True)
         # -- camera capture / runtime (previously hard-coded constants) --
         self.declare_parameter("resolution", DEFAULT_RESOLUTION)
         self.declare_parameter("fps", DEFAULT_FPS)
@@ -158,6 +172,8 @@ class Yolo26PoseKeypointsNode(Node):
         self.nms_iou = float(self.get_parameter("nms_iou").value)
         self.publish_debug_every = int(self.get_parameter("publish_debug_every").value)
         self.debug_scores = bool(self.get_parameter("debug_scores").value)
+        self.publish_keypoint_json = bool(self.get_parameter("publish_keypoint_json").value)
+        self.pipeline_inference = bool(self.get_parameter("pipeline_inference").value)
 
         res_name = str(self.get_parameter("resolution").value).upper()
         if res_name not in ZED_RESOLUTIONS:
@@ -528,8 +544,148 @@ class Yolo26PoseKeypointsNode(Node):
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
+    def _process_and_publish(self, output, now_msg):
+        """Decode one inference output and publish the detection/keypoint topics.
+        Extracted from loop() so it can run for frame N-1 while the GPU computes
+        frame N (software pipeline, WORKLOG §4f stage 3). Pure CPU + ROS publish;
+        no CUDA context needed. IMU / camera_info / debug image stay in loop()."""
+        det_array_msg = Detection2DArray()
+        det_array_msg.header.stamp = now_msg
+        det_array_msg.header.frame_id = self.frame_id
+
+        kpt_array_msg = ArmorKeypointArray()
+        kpt_array_msg.header.stamp = now_msg
+        kpt_array_msg.header.frame_id = self.frame_id
+        kpt_array_msg.image_width = self.native_w
+        kpt_array_msg.image_height = self.native_h
+        kpt_array_msg.keypoint_order = KEYPOINT_NAMES
+
+        json_detections: List[Dict] = []
+
+        if self.output_mode == "post_nms":
+            decoded = self._decode_post_nms_rows(output)
+            if decoded[0] is None:
+                indices = []
+                boxes = kpts = v_confs = v_classes = None
+            else:
+                boxes, kpts, v_confs, v_classes = decoded
+                # Engine already applied NMS, so do not run cv2 NMS again.
+                indices = np.arange(len(v_confs), dtype=np.int32)
+        else:
+            class_scores = output[:, 4:4 + self.num_classes]
+            confs = np.max(class_scores, axis=1)
+            valid_idx = np.nonzero(confs > self.threshold)[0]
+            if len(valid_idx) == 0:
+                indices = []
+                boxes = kpts = v_confs = v_classes = None
+            else:
+                # Keep top candidates before NMS for speed.
+                if len(valid_idx) > MAX_CANDIDATES:
+                    top_local = np.argpartition(confs[valid_idx], -MAX_CANDIDATES)[-MAX_CANDIDATES:]
+                    valid_idx = valid_idx[top_local]
+                boxes, kpts, v_confs, v_classes = self._decode_raw_pose_candidates(output, valid_idx)
+                indices = cv2.dnn.NMSBoxes(
+                    boxes.tolist(), v_confs.tolist(), self.threshold, self.nms_iou
+                )
+
+        if boxes is not None and len(indices) > 0:
+            for raw_i in np.array(indices).flatten()[:MAX_DETECTIONS]:
+                    L_r, T_r, W_r, H_r = boxes[raw_i]
+                    L = max(0.0, min(float(self.native_w), float(L_r)))
+                    T = max(0.0, min(float(self.native_h), float(T_r)))
+                    R = max(0.0, min(float(self.native_w), float(L_r + W_r)))
+                    B = max(0.0, min(float(self.native_h), float(T_r + H_r)))
+                    W = R - L
+                    H = B - T
+                    if W <= 1.0 or H <= 1.0:
+                        continue
+
+                    cls = int(v_classes[raw_i])
+                    conf = float(v_confs[raw_i])
+                    kp = kpts[raw_i].copy()
+                    kp[:, 0] = np.clip(kp[:, 0], 0.0, float(self.native_w))
+                    kp[:, 1] = np.clip(kp[:, 1], 0.0, float(self.native_h))
+
+                    # Legacy bbox topic for current autoaim compatibility.
+                    det = Detection2D()
+                    det.header.stamp = now_msg
+                    det.header.frame_id = self.frame_id
+                    det.bbox.center.position.x = float(L + W * 0.5)
+                    det.bbox.center.position.y = float(T + H * 0.5)
+                    det.bbox.size_x = float(W)
+                    det.bbox.size_y = float(H)
+
+                    hyp = ObjectHypothesisWithPose()
+                    hyp.hypothesis.class_id = str(cls)
+                    hyp.hypothesis.score = conf
+                    det.results.append(hyp)
+                    det_array_msg.detections.append(det)
+
+                    # New typed keypoint output for autoaim.
+                    kmsg = ArmorKeypoint()
+                    kmsg.header.stamp = now_msg
+                    kmsg.header.frame_id = self.frame_id
+                    kmsg.class_id = int(cls)
+                    kmsg.class_name = CLASS_NAMES.get(cls, str(cls))
+                    kmsg.confidence = float(conf)
+                    kmsg.bbox_cx = float(L + W * 0.5)
+                    kmsg.bbox_cy = float(T + H * 0.5)
+                    kmsg.bbox_w = float(W)
+                    kmsg.bbox_h = float(H)
+                    kmsg.keypoints_xy = [
+                        float(kp[0, 0]), float(kp[0, 1]),  # TL
+                        float(kp[1, 0]), float(kp[1, 1]),  # TR
+                        float(kp[2, 0]), float(kp[2, 1]),  # BR
+                        float(kp[3, 0]), float(kp[3, 1]),  # BL
+                    ]
+                    kmsg.keypoint_scores = [float(kp[j, 2]) for j in range(NUM_KEYPOINTS)]
+                    kmsg.keypoint_valid = [
+                        bool(kp[j, 2] >= KEYPOINT_SCORE_THRESHOLD)
+                        for j in range(NUM_KEYPOINTS)
+                    ]
+                    kpt_array_msg.detections.append(kmsg)
+
+                    if self.publish_keypoint_json:
+                        json_detections.append({
+                            "class_id": cls,
+                            "class_name": CLASS_NAMES.get(cls, str(cls)),
+                            "confidence": conf,
+                            "bbox": {
+                                "left": float(L), "top": float(T),
+                                "right": float(R), "bottom": float(B),
+                                "cx": float(L + W * 0.5), "cy": float(T + H * 0.5),
+                                "w": float(W), "h": float(H),
+                            },
+                            "keypoints": [
+                                {
+                                    "name": KEYPOINT_NAMES[j],
+                                    "x": float(kp[j, 0]),
+                                    "y": float(kp[j, 1]),
+                                    "score": float(kp[j, 2]),
+                                    "valid": bool(kp[j, 2] >= KEYPOINT_SCORE_THRESHOLD),
+                                }
+                                for j in range(NUM_KEYPOINTS)
+                            ],
+                        })
+
+        self.pub.publish(det_array_msg)
+        self.kpt_pub.publish(kpt_array_msg)
+        if self.publish_keypoint_json:  # WORKLOG §4f stage 1: off by default (unused, CPU waste)
+            self.kpt_json_pub.publish(String(data=self._make_keypoint_json(now_msg, json_detections)))
+
     def loop(self):
+        # ── Per-stage latency ledger (WORKLOG §4f — framerate profiling) ──
+        # The loop is fully serial: grab (blocks for the next frame) → infer
+        # (stream.synchronize blocks) → CPU postprocess → publish, with NO
+        # GPU/CPU overlap. At 44 Hz (≈23 ms) a fast spinner is under-sampled, so
+        # the single biggest lever is finding which stage eats the 23 ms. These
+        # EMAs are logged every ~2 s so the bottleneck is visible live.
+        prof = {"grab": 0.0, "infer": 0.0, "post": 0.0, "pub": 0.0, "total": 0.0}
+        prof_a = 0.05  # EMA weight
+        t_loop_prev = None
+        pending = None  # (output_host_copy, now_msg) of the in-flight GPU frame (pipeline)
         while self.running:
+            t_s0 = time.perf_counter()
             if self.zed.grab(sl.RuntimeParameters()) != sl.ERROR_CODE.SUCCESS:
                 continue
 
@@ -545,6 +701,7 @@ class Yolo26PoseKeypointsNode(Node):
             else:
                 now_msg = self.get_clock().now().to_msg()
             self.zed.retrieve_image(self.mat_cpu, sl.VIEW.LEFT, sl.MEM.CPU)
+            t_s1 = time.perf_counter()  # grab+retrieve done
 
             # TensorRT inference.
             self.cuda_ctx.push()
@@ -564,144 +721,51 @@ class Yolo26PoseKeypointsNode(Node):
             self.trt_ctx.set_tensor_address(self.out_name, int(self.d_out))
             self.trt_ctx.execute_async_v3(self.stream.handle)
             cuda.memcpy_dtoh_async(self.h_out, self.d_out, self.stream)
-            self.stream.synchronize()
             self.cuda_ctx.pop()
 
-            output = self._raw_output_as_rows()
-
-            det_array_msg = Detection2DArray()
-            det_array_msg.header.stamp = now_msg
-            det_array_msg.header.frame_id = self.frame_id
-
-            kpt_array_msg = ArmorKeypointArray()
-            kpt_array_msg.header.stamp = now_msg
-            kpt_array_msg.header.frame_id = self.frame_id
-            kpt_array_msg.image_width = self.native_w
-            kpt_array_msg.image_height = self.native_h
-            kpt_array_msg.keypoint_order = KEYPOINT_NAMES
-
-            json_detections: List[Dict] = []
-
-            if self.output_mode == "post_nms":
-                finite_conf = output[:, 4][np.isfinite(output[:, 4])] if output.size else np.array([], dtype=np.float32)
-                max_conf = float(np.max(finite_conf)) if finite_conf.size else 0.0
-                # if self.debug_scores and self.frame_count % 60 == 0:
-                    # self.get_logger().info(f"post_nms max_conf={max_conf:.3f} threshold={self.threshold:.3f}")
-                decoded = self._decode_post_nms_rows(output)
-                if decoded[0] is None:
-                    indices = []
-                    boxes = kpts = v_confs = v_classes = None
-                else:
-                    boxes, kpts, v_confs, v_classes = decoded
-                    # Engine already applied NMS, so do not run cv2 NMS again.
-                    indices = np.arange(len(v_confs), dtype=np.int32)
+            # ── Software pipeline (WORKLOG §4f stage 3) ──
+            # While the GPU computes THIS frame, run the CPU postprocess+publish of
+            # the PREVIOUS frame (pending). The detection output is published one
+            # frame late, but its CAPTURE timestamp is preserved so the node's
+            # latency-aware prediction compensates. Set pipeline_inference:=false to
+            # restore the strictly-serial loop.
+            t_p0 = time.perf_counter()
+            if self.pipeline_inference:
+                if pending is not None:
+                    self._process_and_publish(pending[0], pending[1])
+                t_p1 = time.perf_counter()
+                self.cuda_ctx.push()
+                self.stream.synchronize()
+                self.cuda_ctx.pop()
+                t_s2 = time.perf_counter()
+                # snapshot THIS frame's output (host copy) for next iteration's CPU stage
+                pending = (self._raw_output_as_rows().copy(), now_msg)
             else:
-                class_scores = output[:, 4:4 + self.num_classes]
-                confs = np.max(class_scores, axis=1)
-                max_conf = float(np.nanmax(confs)) if confs.size else 0.0
-                # if self.debug_scores and self.frame_count % 60 == 0:
-                    # self.get_logger().info(f"raw max_conf={max_conf:.3f} threshold={self.threshold:.3f}")
-                valid_idx = np.nonzero(confs > self.threshold)[0]
-                if len(valid_idx) == 0:
-                    indices = []
-                    boxes = kpts = v_confs = v_classes = None
-                else:
-                    # Keep top candidates before NMS for speed.
-                    if len(valid_idx) > MAX_CANDIDATES:
-                        top_local = np.argpartition(confs[valid_idx], -MAX_CANDIDATES)[-MAX_CANDIDATES:]
-                        valid_idx = valid_idx[top_local]
-                    boxes, kpts, v_confs, v_classes = self._decode_raw_pose_candidates(output, valid_idx)
-                    indices = cv2.dnn.NMSBoxes(
-                        boxes.tolist(), v_confs.tolist(), self.threshold, self.nms_iou
-                    )
+                self.cuda_ctx.push()
+                self.stream.synchronize()
+                self.cuda_ctx.pop()
+                t_s2 = time.perf_counter()
+                self._process_and_publish(self._raw_output_as_rows(), now_msg)
+                t_p1 = time.perf_counter()
+            post_ms = (t_p1 - t_p0) * 1e3
+            gpu_wait_ms = ((t_s2 - t_p1) if self.pipeline_inference else (t_s2 - t_s1)) * 1e3
 
-            if boxes is not None and len(indices) > 0:
-                for raw_i in np.array(indices).flatten()[:MAX_DETECTIONS]:
-                        L_r, T_r, W_r, H_r = boxes[raw_i]
-                        L = max(0.0, min(float(self.native_w), float(L_r)))
-                        T = max(0.0, min(float(self.native_h), float(T_r)))
-                        R = max(0.0, min(float(self.native_w), float(L_r + W_r)))
-                        B = max(0.0, min(float(self.native_h), float(T_r + H_r)))
-                        W = R - L
-                        H = B - T
-                        if W <= 1.0 or H <= 1.0:
-                            continue
-
-                        cls = int(v_classes[raw_i])
-                        conf = float(v_confs[raw_i])
-                        kp = kpts[raw_i].copy()
-                        kp[:, 0] = np.clip(kp[:, 0], 0.0, float(self.native_w))
-                        kp[:, 1] = np.clip(kp[:, 1], 0.0, float(self.native_h))
-
-                        # Legacy bbox topic for current autoaim compatibility.
-                        det = Detection2D()
-                        det.header.stamp = now_msg
-                        det.header.frame_id = self.frame_id
-                        det.bbox.center.position.x = float(L + W * 0.5)
-                        det.bbox.center.position.y = float(T + H * 0.5)
-                        det.bbox.size_x = float(W)
-                        det.bbox.size_y = float(H)
-
-                        hyp = ObjectHypothesisWithPose()
-                        hyp.hypothesis.class_id = str(cls)
-                        hyp.hypothesis.score = conf
-                        det.results.append(hyp)
-                        det_array_msg.detections.append(det)
-
-                        # New typed keypoint output for autoaim.
-                        kmsg = ArmorKeypoint()
-                        kmsg.header.stamp = now_msg
-                        kmsg.header.frame_id = self.frame_id
-                        kmsg.class_id = int(cls)
-                        kmsg.class_name = CLASS_NAMES.get(cls, str(cls))
-                        kmsg.confidence = float(conf)
-                        kmsg.bbox_cx = float(L + W * 0.5)
-                        kmsg.bbox_cy = float(T + H * 0.5)
-                        kmsg.bbox_w = float(W)
-                        kmsg.bbox_h = float(H)
-                        kmsg.keypoints_xy = [
-                            float(kp[0, 0]), float(kp[0, 1]),  # TL
-                            float(kp[1, 0]), float(kp[1, 1]),  # TR
-                            float(kp[2, 0]), float(kp[2, 1]),  # BR
-                            float(kp[3, 0]), float(kp[3, 1]),  # BL
-                        ]
-                        kmsg.keypoint_scores = [float(kp[j, 2]) for j in range(NUM_KEYPOINTS)]
-                        kmsg.keypoint_valid = [
-                            bool(kp[j, 2] >= KEYPOINT_SCORE_THRESHOLD)
-                            for j in range(NUM_KEYPOINTS)
-                        ]
-                        kpt_array_msg.detections.append(kmsg)
-
-                        # Optional JSON debug copy.
-                        json_detections.append({
-                            "class_id": cls,
-                            "class_name": CLASS_NAMES.get(cls, str(cls)),
-                            "confidence": conf,
-                            "bbox": {
-                                "left": float(L),
-                                "top": float(T),
-                                "right": float(R),
-                                "bottom": float(B),
-                                "cx": float(L + W * 0.5),
-                                "cy": float(T + H * 0.5),
-                                "w": float(W),
-                                "h": float(H),
-                            },
-                            "keypoints": [
-                                {
-                                    "name": KEYPOINT_NAMES[j],
-                                    "x": float(kp[j, 0]),
-                                    "y": float(kp[j, 1]),
-                                    "score": float(kp[j, 2]),
-                                    "valid": bool(kp[j, 2] >= KEYPOINT_SCORE_THRESHOLD),
-                                }
-                                for j in range(NUM_KEYPOINTS)
-                            ],
-                        })
-
-            self.pub.publish(det_array_msg)
-            self.kpt_pub.publish(kpt_array_msg)
-            self.kpt_json_pub.publish(String(data=self._make_keypoint_json(now_msg, json_detections)))
+            # ── Latency ledger update + throttled log (WORKLOG §4f) ──
+            # In pipeline mode "gpu_wait" is the GPU time NOT hidden under the CPU
+            # stage (≈0 if CPU-bound); "post" is the CPU postprocess+publish time;
+            # "loop" + Hz is the real throughput.
+            prof["grab"]  += prof_a * ((t_s1 - t_s0) * 1e3 - prof["grab"])
+            prof["infer"] += prof_a * (gpu_wait_ms - prof["infer"])
+            prof["post"]  += prof_a * (post_ms - prof["post"])
+            if t_loop_prev is not None:
+                prof["total"] += prof_a * ((t_s0 - t_loop_prev) * 1e3 - prof["total"])
+            t_loop_prev = t_s0
+            if self.frame_count % 90 == 0:
+                rate = 1000.0 / prof["total"] if prof["total"] > 1e-6 else 0.0
+                self.get_logger().info(
+                    "LATENCY[ms] grab=%.1f gpu_wait=%.1f post=%.1f | loop=%.1f (%.0f Hz)%s"
+                    % (prof["grab"], prof["infer"], prof["post"],
+                       prof["total"], rate, " [pipe]" if self.pipeline_inference else ""))
 
             # IMU every frame (ZED-only feature). CameraInfo throttled: the
             # autoaim node latches intrinsics on the first message, so there is

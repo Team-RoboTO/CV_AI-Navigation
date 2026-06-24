@@ -584,6 +584,7 @@ void Tracker::resetSpinTiming()
   was_confirmed_spin_ = false;
   spin_reseed_done_ = false;
   spin_invalid_streak_ = 0;
+  center_aim_hold_ = 0;
 }
 
 void Tracker::feedSpinTimingJump(
@@ -1311,8 +1312,30 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
   // enemy); leading the aim by that phantom rotation drifts the shot. Translation
   // lead (vxc,vyc) ALWAYS applies — only the rotation is gated. WORKLOG §4b.
   Eigen::VectorXd x_aim = x_;
-  if (!confirmed_spin) {
+  // ── ROTATIONAL lead: only when spin is confirmed AND reliably observable ──
+  // (WORKLOG §4f, Radice 2/D). A fast top at 44 Hz is aliased, so vyaw is
+  // garbage and vyaw·T points the shot at the wrong phase — worse than no lead.
+  // Above omega_reliable_max we zero the rotational lead and rely on center-aim
+  // + opportunistic impact-gate fire. (Also keeps the old rule: no rotational
+  // lead on an unconfirmed/phantom spin.)
+  const bool omega_reliable =
+    confirmed_spin && std::abs(x_(7)) <= cfg_.omega_reliable_max;
+  if (!omega_reliable) {
     x_aim(7) = 0.0;
+  }
+  // ── TRANSLATIONAL lead cap while spinning (WORKLOG §4f, Radice 3/C) ──
+  // The spinning-top center is ~stationary; the orbit leaks a phantom velocity
+  // into vxc/vyc (0.3–1.2 m/s on a still robot) that, led into the aim, causes
+  // the L/R overshoot and wobbles the center-aim point so the gimbal can't lock.
+  // Cap the speed led into the aim while confirmed_spin: a real slow translation
+  // still follows, but the phantom can't overshoot.
+  if (confirmed_spin) {
+    const double vmag = std::hypot(x_aim(1), x_aim(3));
+    if (vmag > cfg_.spin_trans_lead_cap && vmag > 1e-6) {
+      const double s = cfg_.spin_trans_lead_cap / vmag;
+      x_aim(1) *= s;
+      x_aim(3) *= s;
+    }
   }
   const bool face_lookahead_active =
     cfg_.face_lookahead_enable &&
@@ -1650,12 +1673,25 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
   // actually lock; the fire decision below still requires a real plate within the
   // facing window at impact (best.fire_valid), so we only shoot when a plate is
   // there. This replaces the per-handoff 90° aim jumps that prevented lock.
+  // Center-aim stickiness (WORKLOG §4f, Radice 1): keep center-aim engaged for a
+  // few frames after confirmed_spin briefly drops, so the azimuth does not flip
+  // to face-chase (a ~90° jump that breaks gimbal lock). The hold is refreshed
+  // while confirmed_spin and decays otherwise.
+  if (confirmed_spin) {
+    center_aim_hold_ = cfg_.center_aim_hold_frames;
+  } else if (center_aim_hold_ > 0) {
+    --center_aim_hold_;
+  }
+  const bool center_aim_engaged =
+    cfg_.spin_aim_center_enable && (confirmed_spin || center_aim_hold_ > 0);
   bool center_aimed = false;
-  if (confirmed_spin && cfg_.spin_aim_center_enable) {
+  if (center_aim_engaged) {
     const double bxf = barrel_x_now + robot_vx * pred_t;
     const double byf = barrel_y_now + robot_vy * pred_t;
-    const double cxi = x_(0) + x_(1) * pred_t;
-    const double cyi = x_(2) + x_(3) * pred_t;
+    // Use the capped center velocity (x_aim) so the phantom-velocity overshoot
+    // does not wobble the center-aim point. WORKLOG §4f (Radice 3/C).
+    const double cxi = x_(0) + x_aim(1) * pred_t;
+    const double cyi = x_(2) + x_aim(3) * pred_t;
     const double czi = x_(4) + x_(5) * pred_t;
     const double bc = std::atan2(cyi - byf, cxi - bxf);
     const double r_face = std::clamp(x_(8), 0.10, 0.40);

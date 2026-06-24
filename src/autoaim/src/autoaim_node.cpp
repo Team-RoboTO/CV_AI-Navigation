@@ -141,9 +141,13 @@ public:
     // Regime-adaptive yaw trust: track a rotating yaw while spinning.
     cfg.yaw_facing_obs_floor_spin = declare_parameter("yaw_facing_obs_floor_spin", 1.0);
     cfg.q_yaw_spin            = declare_parameter("q_yaw_spin", 40.0);
-    // Regime-adaptive center stiffness while spinning (WORKLOG §4e).
-    cfg.q_pos_spin            = declare_parameter("q_pos_spin", 0.8);
-    cfg.alpha_pos_spin        = declare_parameter("alpha_pos_spin", 0.90);
+    // Regime-adaptive center stiffness while spinning (WORKLOG §4e/§4f).
+    cfg.q_pos_spin            = declare_parameter("q_pos_spin", 2.0);
+    cfg.alpha_pos_spin        = declare_parameter("alpha_pos_spin", 0.93);
+    // Observability-gated lead + center-aim stickiness (WORKLOG §4f).
+    cfg.omega_reliable_max    = declare_parameter("omega_reliable_max", 15.0);
+    cfg.spin_trans_lead_cap   = declare_parameter("spin_trans_lead_cap", 0.30);
+    cfg.center_aim_hold_frames = declare_parameter("center_aim_hold_frames", 8);
     // Asymmetric geometric fire gate (replaces the three-regime facing logic).
     cfg.asymmetric_fire_enable = declare_parameter("asymmetric_fire_enable", true);
     cfg.fire_window_approach  = declare_parameter("fire_window_approach", 0.60);

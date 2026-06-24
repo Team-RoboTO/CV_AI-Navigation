@@ -29,6 +29,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <chrono>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -143,6 +144,14 @@ class RealSenseDetector : public rclcpp::Node {
     publish_debug_every_ = declare_parameter<int>("publish_debug_every", 4);
     camera_info_every_ = declare_parameter<int>("camera_info_every", 1);
     frame_id_ = declare_parameter<std::string>("frame_id", "camera_color_optical_frame");
+    // The /detector/armors_keypoints_json topic is a DEBUG mirror; nothing in the
+    // autoaim pipeline subscribes to it (the tracker reads ArmorKeypointArray), so
+    // building the JSON string every frame is pure CPU waste at the grab rate.
+    // Default OFF (WORKLOG §4f stage 1). Enable only for external JSON tooling.
+    publish_keypoint_json_ = declare_parameter<bool>("publish_keypoint_json", false);
+    // Per-stage latency ledger: log gpu/decode/publish timing so the framerate
+    // bottleneck is visible on the REAL (standard-robot) detector. WORKLOG §4f.
+    profile_latency_ = declare_parameter<bool>("profile_latency", true);
 
     auto qos = rclcpp::SensorDataQoS();
     det_pub_ = create_publisher<vision_msgs::msg::Detection2DArray>("/detector/armors", qos);
@@ -417,6 +426,7 @@ class RealSenseDetector : public rclcpp::Node {
   }
 
   void processFrame(const rs2::video_frame& color, const rclcpp::Time& stamp) {
+    const auto _t0 = std::chrono::steady_clock::now();
     // src points at the native color data; for BGR8 it may be redirected to a
     // CPU-flipped copy. For YUYV the flip is folded into the kernel instead.
     const uint8_t* src = static_cast<const uint8_t*>(color.get_data());
@@ -453,6 +463,7 @@ class RealSenseDetector : public rclcpp::Node {
     CUDA_CHECK(cudaMemcpyAsync(h_out_, d_out_, out_count_ * sizeof(float),
                                cudaMemcpyDeviceToHost, stream_));
     CUDA_CHECK(cudaStreamSynchronize(stream_));
+    const auto _t_gpu = std::chrono::steady_clock::now();
 
     armors_.clear();
     if (output_mode_post_nms_) {
@@ -460,8 +471,32 @@ class RealSenseDetector : public rclcpp::Node {
     } else {
       decodeRaw();
     }
+    const auto _t_dec = std::chrono::steady_clock::now();
 
     publishDetections(stamp);
+    const auto _t_pub = std::chrono::steady_clock::now();
+
+    // ── Per-stage latency ledger (WORKLOG §4f). gpu = H2D+preprocess+infer+D2H
+    // +sync (serial, blocking); decode = CPU postprocess; pub = message build +
+    // publish. loop = wall period (the real rate). Logged every ~90 frames. ──
+    if (profile_latency_) {
+      auto ms = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+      };
+      const double a = 0.05;
+      g_gpu_ += a * (ms(_t0, _t_gpu) - g_gpu_);
+      g_dec_ += a * (ms(_t_gpu, _t_dec) - g_dec_);
+      g_pub_ += a * (ms(_t_dec, _t_pub) - g_pub_);
+      if (prof_have_prev_) g_loop_ += a * (ms(prof_prev_, _t0) - g_loop_);
+      prof_prev_ = _t0;
+      prof_have_prev_ = true;
+      if (frame_count_ % 90 == 0) {
+        const double hz = g_loop_ > 1e-6 ? 1000.0 / g_loop_ : 0.0;
+        RCLCPP_INFO(get_logger(),
+                    "LATENCY[ms] gpu=%.1f decode=%.1f pub=%.1f | loop=%.1f (%.0f Hz)",
+                    g_gpu_, g_dec_, g_pub_, g_loop_, hz);
+      }
+    }
 
     if (camera_info_every_ > 0 && (frame_count_ % camera_info_every_) == 0) {
       cam_info_msg_.header.stamp = stamp;
@@ -584,9 +619,11 @@ class RealSenseDetector : public rclcpp::Node {
     kpt_arr.keypoint_order = {"TL", "TR", "BR", "BL"};
 
     std::ostringstream json;
-    json << "{\"header\":{\"stamp\":{\"sec\":" << stamp.seconds() << "},\"frame_id\":\""
-         << frame_id_ << "\"},\"image_width\":" << native_w_ << ",\"image_height\":"
-         << native_h_ << ",\"keypoint_order\":[\"TL\",\"TR\",\"BR\",\"BL\"],\"detections\":[";
+    if (publish_keypoint_json_) {
+      json << "{\"header\":{\"stamp\":{\"sec\":" << stamp.seconds() << "},\"frame_id\":\""
+           << frame_id_ << "\"},\"image_width\":" << native_w_ << ",\"image_height\":"
+           << native_h_ << ",\"keypoint_order\":[\"TL\",\"TR\",\"BR\",\"BL\"],\"detections\":[";
+    }
 
     bool first = true;
     for (const Armor& a : armors_) {
@@ -632,19 +669,23 @@ class RealSenseDetector : public rclcpp::Node {
       }
       kpt_arr.detections.push_back(k);
 
-      if (!first) json << ",";
-      first = false;
-      json << "{\"class_id\":" << a.cls << ",\"class_name\":\"" << class_name(a.cls)
-           << "\",\"confidence\":" << a.conf << ",\"bbox\":{\"cx\":" << (L + W * 0.5f)
-           << ",\"cy\":" << (T + H * 0.5f) << ",\"w\":" << W << ",\"h\":" << H << "}}";
+      if (publish_keypoint_json_) {
+        if (!first) json << ",";
+        first = false;
+        json << "{\"class_id\":" << a.cls << ",\"class_name\":\"" << class_name(a.cls)
+             << "\",\"confidence\":" << a.conf << ",\"bbox\":{\"cx\":" << (L + W * 0.5f)
+             << ",\"cy\":" << (T + H * 0.5f) << ",\"w\":" << W << ",\"h\":" << H << "}}";
+      }
     }
-    json << "]}";
 
     det_pub_->publish(det_arr);
     kpt_pub_->publish(kpt_arr);
-    std_msgs::msg::String js;
-    js.data = json.str();
-    json_pub_->publish(js);
+    if (publish_keypoint_json_) {  // WORKLOG §4f stage 1: off by default (unused, CPU waste)
+      json << "]}";
+      std_msgs::msg::String js;
+      js.data = json.str();
+      json_pub_->publish(js);
+    }
   }
 
   void publishDebugImage(const uint8_t* data, const rclcpp::Time& stamp) {
@@ -720,6 +761,13 @@ class RealSenseDetector : public rclcpp::Node {
   std::atomic<bool> running_{false};
   std::thread worker_;
   long frame_count_{0};
+
+  // ── Config + latency ledger (WORKLOG §4f) ──
+  bool publish_keypoint_json_{false};
+  bool profile_latency_{true};
+  double g_gpu_{0.0}, g_dec_{0.0}, g_pub_{0.0}, g_loop_{0.0};
+  std::chrono::steady_clock::time_point prof_prev_{};
+  bool prof_have_prev_{false};
 };
 
 int main(int argc, char** argv) {

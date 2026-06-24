@@ -269,8 +269,24 @@ def autoaim_params():
         # alpha_pos_spin stiffen the center so the orbit cannot leak in; a real
         # translating spinner still follows (slowly). Set == q_pos/alpha_pos to
         # disable.
-        {"q_pos_spin": 0.8},
-        {"alpha_pos_spin": 0.96},
+        # §4f: 0.8 was too stiff (lagged a translating spinner) AND the 0.8↔10
+        # swing was erratic as the regime flickered. 2.0 + a sticky regime is
+        # stiff enough to reject the orbit but still follows a slow translation.
+        {"q_pos_spin": 2.0},
+        {"alpha_pos_spin": 0.93},
+        # ── §4f OBSERVABILITY-GATED LEAD + STICKY CENTER-AIM (the real-data fix) ──
+        # Bag 193721: the enemy spins ~235 rpm; at 44 Hz the armor moves 30–90°/
+        # frame → ALIASED, vyaw is unreliable. omega_reliable_max: above this rad/s
+        # we drop the rotational lead (leading on a garbage omega aimed at the wrong
+        # phase = "spara dove l'armatura non c'è / timing a caso") and rely on
+        # center-aim + opportunistic impact-gate fire. RAISE THE DETECTOR RATE to
+        # lift this ceiling. spin_trans_lead_cap: caps the phantom-velocity lead so
+        # a still/slow spinner doesn't overshoot L/R and the aim stays lockable.
+        # center_aim_hold_frames: keeps center-aim through brief regime dropouts so
+        # the aim doesn't flip 90° (the dominant lock-breaker).
+        {"omega_reliable_max": 15.0},     # [rad/s] ≈143 rpm; above = no rotational lead
+        {"spin_trans_lead_cap": 0.30},    # [m/s] max center speed led into the aim while spinning
+        {"center_aim_hold_frames": 8},
         # Asymmetric geometric fire gate — the ELIGIBILITY pre-filter (is the plate
         # square enough to be worth a shot). Generous while the plate rotates INTO
         # view (or static), strict while it leaves — the COD 55°/20° idea
@@ -344,7 +360,7 @@ def generate_launch_description():
     serial_port = LaunchConfiguration("serial_port")
 
     serial_params = [
-        {"shooting_active": True},
+        {"shooting_active": False},
         {"rotating_chassis": False},
 
         {"serial_port": serial_port},

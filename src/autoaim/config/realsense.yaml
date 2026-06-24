@@ -60,3 +60,9 @@
     publish_debug_every: 4   # /yolo/debug_image: publish every N frames (0 = never)
     camera_info_every: 1     # /camera_info: publish every N frames (0 = never)
     frame_id: "camera_color_optical_frame"
+    # /detector/armors_keypoints_json is a DEBUG-only mirror nothing in autoaim
+    # reads — building it every frame is wasted CPU. OFF by default (WORKLOG §4f).
+    publish_keypoint_json: false
+    # Log per-stage timing (gpu/decode/pub + loop Hz) every ~90 frames so the
+    # framerate bottleneck is visible on the real detector. WORKLOG §4f.
+    profile_latency: true

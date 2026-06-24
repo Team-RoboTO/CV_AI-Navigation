@@ -944,6 +944,153 @@ the per-frame damping normalization). Re-confirm with `ros2 topic hz`.
 
 ---
 
+## 4f. THE NYQUIST CEILING + observability-gated rework (2026-06-24, APPLIED, build OK)
+
+### 4f.1 Symptoms (reported after §4e on robot)
+Very slow to follow a translating enemy (missed ~10 balls shooting air at the
+start), then overshoot L/R; misses almost everything on a slow L/R mover; on a
+spinning chassis misses ~80–90% (hits 10–20%, "many by luck"): pitch not keeping
+up on alternating low/high armors, shoots L/R of the plates (wheels), fires at
+plates already leaving, wrong lead timing ("thinks a wide turn" / "already did a
+full turn before the bullet arrives"). User asked: refactor, wrong params, or what?
+
+### 4f.2 The decisive finding — it's the DETECTOR RATE vs the spin (physics)
+Bag `debug_state_20260624_193721` (2923 msg). §4e WORKED for the wheel-shot: fires
+off-plate **174→5**, phase at fire **0.245→0.121**, `pixels_inside` 99%. But:
+- **Lock is now the bottleneck**: 597 frames `aim_fire`&!`cmd_fire`, all yaw/pitch
+  unlocked. NOT-locked frames have `cmd_yaw` f2f move **34 mrad** vs the servo's
+  **7 mrad/frame** — we command jumps the gimbal physically can't follow.
+- **Raw detection is EXCELLENT** when sampled: still enemy → **4 mm** f2f jitter,
+  0.4 px reproj. Spinning enemy → **119 mm** f2f (p90 319, max 539) but STILL
+  0.6 px reproj, `yaw_replaced_by_bearing` 0%. So the 119 mm jumps are REAL motion.
+- Geometry: `Δθ = 0.119/0.21 = 0.57 rad = 32°/frame`, p90 87°/frame ⇒ true spin
+  **≈235 rpm**. At 44 Hz a 4-faced armor passes a face every ~2.8 frames →
+  **at/over Nyquist → aliased**. Three independent ω estimates disagreed wildly
+  (handoff cadence 400 / orbit-net 2–10 / EKF 50 rpm) — the signature of aliasing.
+- **Proof a tracker refactor can't fix it:** I implemented the chosen circle-fit
+  observer OFFLINE (`/tmp/circlefit.py`) — it ALSO failed (ω std ±108 rpm, fit
+  resid 35–43 mm, center vel 0.46 m/s even when still), because the armor doesn't
+  trace a clean circle when sampled at 44 Hz with 30–90°/frame steps.
+
+**Verdict: the dominant limiter is the 44 Hz detection rate vs a fast top — Nyquist,
+not code.** No EKF/observer/circle-fit beats it. Strong teams run 100–300 fps
+(ricerca2: ShanghaiTech 300fps/12ms) precisely for this. The detector here is a
+clean CUDA-preprocess + TensorRT pipeline but runs a **fully serial blocking loop**
+(grab → `stream.synchronize` infer → CPU postprocess+3 publishes incl. a per-frame
+JSON → no GPU/CPU overlap), so it caps at ~44 Hz. The user confirmed ~40–50 Hz.
+
+### 4f.3 The recalibrated plan (user: "do what's best to win") — A + B + C + D
+The full circle-fit EKF refactor was DROPPED (proven not to help at 44 Hz). Instead:
+- **A — raise the detector rate (THE lever, framerate-dependent).** Added a per-stage
+  **latency ledger** to `zed_detector.py::loop` (`time.perf_counter` around grab /
+  infer / postprocess / publish, EMA, logged every ~90 frames as `LATENCY[ms]
+  grab=.. infer=.. post=.. pub=.. | loop=.. (..Hz)`). This tells the user WHICH
+  stage eats the ~23 ms. Likely suspects: the serial blocking loop (no overlap) +
+  the per-frame JSON publish. Pipelining (double-buffer GPU infer ∥ CPU post) +
+  dropping/throttling the JSON are the next steps. *User to run + report.*
+- **B — make the command lockable (framerate-independent).** Center-aim
+  STICKINESS (`center_aim_hold_frames=8`): keep center-aim through brief
+  `confirmed_spin` dropouts so the azimuth doesn't flip center-aim↔face-chase (a
+  ~90° jump; 62% of >80 mrad jumps were at a regime toggle). Did NOT add a tight
+  command rate-limit on purpose — limiting to the servo rate would make
+  cmd≈servo and report "locked" while OFF-target (fire off-target). Fixing the
+  jump SOURCE is correct.
+- **C — kill the translation overshoot cleanly.** Reverted the erratic
+  regime-adaptive q_pos band-aid effect (q_pos_spin 0.8→**2.0**, the sticky regime
+  removes the 0.8↔10 flicker) and added `spin_trans_lead_cap=0.30 m/s`: while
+  `confirmed_spin`, cap the center speed led into the aim (in `computeAim`, applied
+  to `x_aim(1/3)` AND the center-aim point) so the phantom 0.3–1.2 m/s can't
+  overshoot, while a real slow translation still follows.
+- **D — don't lead on a garbage omega.** Rotational lead now gated on
+  OBSERVABILITY: `omega_reliable = confirmed_spin && |vyaw| ≤ omega_reliable_max
+  (15 rad/s ≈143 rpm)`. Above it (the aliased fast top) the rotational lead is
+  ZEROED → pure center-aim + opportunistic impact-gate fire (the physical best at
+  44 Hz). Below it (slow spin, well-sampled) the phase lead still applies.
+
+### 4f.4 What this does and does NOT fix (honest)
+- FIXES (framerate-independent): the lock-breaking command flips (B), the L/R
+  translation overshoot (C), the wrong-phase lead on a fast top (D, now we don't
+  pretend to predict an aliased spin).
+- Does NOT fix: actually HITTING a ~235 rpm top at 44 Hz — that needs **A** (higher
+  rate). At 44 Hz the honest best is center-aim + fire when a plate is at the facing
+  point; hit rate on a fast top is physically capped until the rate goes up.
+- `dz` (alternating high/low armor): NOT this bag's problem — measured Δz between
+  even/odd faces = **1 cm**, pitch_error not parity-dependent. The "aims low on the
+  high armor" was the pitch not keeping up during fast motion (the lock/Radice-1
+  issue), not a dz-model gap. Left dz disabled.
+
+### 4f.5 Files changed
+- `tracker.hpp`: config `omega_reliable_max`, `spin_trans_lead_cap`,
+  `center_aim_hold_frames`; `q_pos_spin` 0.8→2.0, `alpha_pos_spin` 0.90→0.93;
+  mutable `center_aim_hold_`.
+- `tracker.cpp` `computeAim`: observability-gated rotational lead; translational
+  lead cap; center-aim stickiness + capped center velocity in the center-aim point;
+  `resetSpinTiming` clears `center_aim_hold_`.
+- `autoaim_node.cpp`: declare the new params (+ updated q_pos_spin/alpha_pos_spin).
+- `standard.launch.py`: §4f params.
+- `zed_detector.py`: per-stage latency ledger in `loop()`.
+
+### 4f.6 On-robot validation (REQUIRED)
+1. **Run the detector, read `LATENCY[ms] ... (..Hz)`** — report the breakdown; that
+   sets the framerate plan (A). This is the single most important number now.
+2. Translation: overshoot should be gone; if it now UNDER-leads a real mover, raise
+   `spin_trans_lead_cap` toward 0.6 or `q_pos_spin` toward 5.
+3. Spin: aim should stay steady (lock should hold far more); `cmd_fire` up. Fast top
+   hit rate is capped until A.
+4. If a SLOW spinner under-fires (we dropped its lead), raise `omega_reliable_max`.
+
+### 4f.7 Next (toward winning)
+- **A is the headline.** Pipeline the detector loop (double-buffer), drop/throttle
+  the per-frame JSON, confirm FP16 engine. Target ≥90 Hz → then a real phase tracker
+  (even the circle-fit) becomes viable and the fast-top hit rate jumps.
+- Then: latency ledger end-to-end (node side too) + trajectory fire over the horizon.
+
+### 4f.8 Detector profiling — RealSense is the ACTIVE detector (2026-06-24)
+**Critical:** the STANDARD robot (the 44 Hz one) runs **`realsense_detector.cpp`**
+(C++, package `autoaim_realsense`, `DEFAULT_CAMERA="realsense"`), NOT `zed_detector.py`.
+The SENTRY uses the ZED (`zed_detector.py`). Both run the SAME engine and have the
+same serial-loop + per-frame-JSON issues. `trtexec` on the shared engine:
+- **input 1×3×960×960** (NOT 640), **GPU compute 15.1 ms** (66 fps ceiling for
+  inference alone). Serial loop adds ~8 ms CPU → ~44 Hz. H2D 0.88 ms, D2H 0.009 ms.
+- GPU **clock 0.918 GHz** (Orin maxes ~1.3) → likely NOT in MAXN/`jetson_clocks`.
+
+**The two biggest levers are camera-independent and code-risk-free (USER actions):**
+1. **Re-export the model at 640×640** (0.44× pixels → infer ~7 ms → ~110 fps ceiling).
+2. **`sudo nvpmodel -m 0 && sudo jetson_clocks`** (~−25 % infer).
+
+**Applied (stage 1 + ledger), build OK:**
+- `realsense_detector.cpp` (ACTIVE): `publish_keypoint_json` param (default **false** —
+  the JSON topic has no subscriber, pure CPU waste) + per-stage **latency ledger**
+  (`LATENCY[ms] gpu/decode/pub | loop Hz`, every 90 frames). `realsense.yaml` params.
+- `zed_detector.py` (SENTRY): same JSON param + ledger + **software pipeline**
+  (`pipeline_inference`, default true) — process frame N-1 on CPU while GPU computes
+  N; +1 frame latency, compensated by the latency-aware prediction.
+
+**Stage 3 (pipeline) on the C++ RealSense detector: DEFERRED until the ledger is read.**
+Rationale: after removing the JSON, if `decode`+`pub` is small the pipeline buys little,
+and an untested CUDA double-buffer refactor on the ACTIVE competition detector is high
+risk. Measure first (`LATENCY[ms]`), then decide. (Stage 2 / MEM.GPU was rejected:
+saves ~0.9 ms H2D vs a 15 ms infer, and risks a cross-CUDA-context crash.)
+
+### 4f.9 Pitch-slow + face-priority — SAME root, not dz (2026-06-24)
+User (bag 193721): gimbal too slow up/down (aims low, the high armor already passed);
+doesn't prioritise incoming armors / doesn't switch to a shootable face. Diagnosis:
+- **Pitch is the same command-jumpiness as yaw:** `cmd_pitch` f2f **17.7 mrad** (p90 45)
+  vs servo **11 mrad/frame** → `pitch_locked` only 66 %. The gimbal can't EXECUTE the
+  jumpy command, it's not a slow servo per se.
+- **Selection logic is fine:** `selected_face == best_face` **100 %**; `incoming_lookahead`
+  IS used (30–50 %). So it's NOT "ignores incoming"; the command it produces just can't
+  be locked, and at 44 Hz the incoming-face TIMING is aliased anyway.
+- **NOT a dz problem:** even/odd face Δz = **1 cm** in this bag; pitch_error not
+  parity-dependent. The "aims low on the high armor" is the pitch command lagging during
+  fast motion, i.e. the lock/Radice-1 issue, not a height-model gap.
+⇒ Addressed by §4f B/C/D (sticky center-aim → steady pitch too; untested on robot) +
+the framerate lift. No separate fix needed yet; re-evaluate with a fresh bag after
+those land. If face PRIORITY is still wrong then, revisit `computeAim` candidate
+ordering (FireValid vs Incoming) directly.
+
+---
+
 ## 5. Backlog — accuracy & fire-rate upgrades (bullet-economy aware)
 
 Context: **ARC has a ~750-ball cap.** Optimize *hit probability per ball*, not
@@ -1042,6 +1189,21 @@ If validated, mirror `face_index_switch_penalty` plus the earlier §4 parameters
 into `hero`/`sentry` launches and commit.
 
 ### Reasoning ledger (most recent first)
+- **2026-06-24 (applied, §4f NYQUIST CEILING + observability rework)** — §4e on robot
+  fixed the wheel-shot (off-plate 174→5) but exposed the real wall. Bag `…193721`:
+  raw detection is excellent (4 mm still / 0.6 px reproj) but a SPINNING enemy moves
+  the armor **119 mm = 32°/frame (p90 87°)** → true spin **≈235 rpm**, and at 44 Hz
+  that is **ALIASED (Nyquist)**. PROVED the user-chosen circle-fit refactor ALSO
+  fails offline (ω std ±108). So the limiter is the **detector rate, not the
+  tracker**. Recalibrated to A+B+C+D: **A** latency-ledger instrumentation in the
+  detector loop (find why 44 not ~120 Hz — serial blocking loop + per-frame JSON);
+  **B** sticky center-aim (no regime-flip 90° jumps → gimbal locks); **C** revert
+  erratic q_pos_spin (0.8→2.0) + `spin_trans_lead_cap=0.30` (kill phantom-velocity
+  overshoot); **D** observability-gated rotational lead (`omega_reliable_max=15`
+  rad/s — above it, no lead on the aliased garbage omega, pure center-aim +
+  opportunistic fire). Honest: B/C/D fix lock+overshoot+timing; actually HITTING a
+  235 rpm top needs A (higher fps). `colcon build` OK. **On-robot validation pending**
+  — first deliverable: report `LATENCY[ms]` from the detector.
 - **2026-06-23 (applied, §4e FULL FIRE-CONTROL REWORK)** — Bag `…193335` (spinner +
   translation): round 3 fixed STATE (confirmed_spin 81%, center not ghosting) but the
   FIRE-CONTROL layer was broken — 49% of fires off-plate (shoots wheels), phantom
