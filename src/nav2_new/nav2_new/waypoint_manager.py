@@ -146,13 +146,26 @@ class WaypointManager(Node):
         if name == self.current_strategy and self._task_in_progress:
             return
 
-        # Same strategy already selected and idle: only restart if no task is active.
+        # Same strategy already selected and idle.
+        # IMPORTANT: if a retry timer is already pending (the strategy just
+        # failed and we are backing off), do NOT restart immediately. Otherwise
+        # game_state_manager re-publishing /strategy continuously would bypass
+        # the backoff and cause a retry storm (~2 restarts/sec), hammering
+        # planner/controller/bt and starving the CPU.
         if name == self.current_strategy and not self._task_in_progress:
+            if self._retry_timer is not None:
+                return
             self._reset_requested = True
             return
 
         self.get_logger().info(f"Strategy request: {self.current_strategy} -> {name}")
         self.current_strategy = name
+
+        # A genuinely new strategy was requested: cancel any pending retry so it
+        # doesn't fire later for the old strategy.
+        if self._retry_timer is not None:
+            self._retry_timer.cancel()
+            self._retry_timer = None
 
         if self._task_in_progress:
             self.get_logger().info("Canceling current Nav2 task before strategy switch")
@@ -236,6 +249,10 @@ class WaypointManager(Node):
                 )
                 self._publish_string(self.failed_pub, finished_strategy)
                 self._clear_sequence()
+                # Avoid stacking multiple retry timers.
+                if self._retry_timer is not None:
+                    self._retry_timer.cancel()
+                    self._retry_timer = None
                 self._retry_timer = self.create_timer(self.retry_failed_after_sec, self._retry_once)
 
             elif result == TaskResult.CANCELED:

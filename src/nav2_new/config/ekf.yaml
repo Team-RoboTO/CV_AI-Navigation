@@ -1,0 +1,85 @@
+# =============================================================================
+# robot_localization EKF — fuses FAST-LIO pose (/odom_lio) with wheel twist
+# (/odom_wheel) to produce a smoother, glitch-resistant odom -> base_link.
+# =============================================================================
+# Design:
+#   - FAST-LIO (via tf_frame_relay publish_odom:=true) provides ABSOLUTE planar
+#     pose x, y, yaw in the odom frame, already head-referenced/corrected.
+#   - chassis_odom_publisher provides VELOCITY vx, vy in base_link, rotated from
+#     the chassis frame by the head yaw, deadbanded against rotation noise.
+#   - The EKF trusts FAST-LIO for absolute pose but uses wheel velocity to
+#     smooth and to REJECT short FAST-LIO jumps (e.g. the head-rotation glitch),
+#     because a sudden pose jump inconsistent with the measured velocity gets
+#     damped instead of followed instantly.
+#
+# This EKF owns odom -> base_link, so tf_frame_relay must run with
+# publish_tf:=false when this EKF is active (handled in the fusion launch).
+# AMCL still owns map -> odom.
+# =============================================================================
+
+ekf_filter_node:
+  ros__parameters:
+    use_sim_time: false
+
+    frequency: 50.0
+    sensor_timeout: 0.1
+    two_d_mode: true                 # planar robot: lock z, roll, pitch
+    transform_time_offset: 0.0
+    transform_timeout: 0.0
+    print_diagnostics: true
+    debug: false
+    publish_tf: true                 # this node publishes odom -> base_link
+    publish_acceleration: false
+    permit_corrected_publication: false
+
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_link
+    world_frame: odom                # we estimate odom -> base_link
+
+    # --- odom0 : FAST-LIO absolute pose (x, y, yaw) ---
+    odom0: /odom_lio
+    odom0_config: [true,  true,  false,   # x,    y,    z
+                   false, false, true,    # roll, pitch, yaw
+                   false, false, false,   # vx,   vy,   vz
+                   false, false, false,   # vroll vpitch vyaw
+                   false, false, false]   # ax,   ay,   az
+    odom0_queue_size: 10
+    odom0_differential: false
+    odom0_relative: false
+    # Reject pose updates that are wildly inconsistent (Mahalanobis). This is
+    # the line of defence against the head-rotation jump. Lower = stricter.
+    odom0_pose_rejection_threshold: 4.0
+    odom0_nodelay: true
+
+    # --- odom1 : wheel velocity (vx, vy) in base_link ---
+    odom1: /odom_wheel
+    odom1_config: [false, false, false,
+                   false, false, false,
+                   true,  true,  false,   # vx, vy
+                   false, false, false,
+                   false, false, false]
+    odom1_queue_size: 10
+    odom1_differential: false
+    odom1_relative: false
+    odom1_twist_rejection_threshold: 2.0
+    odom1_nodelay: true
+
+    # Process noise: how much the filter lets the state drift between updates.
+    # Keep yaw process noise moderate so wheel velocity can smooth pose without
+    # letting yaw wander. Tune up if the output lags, down if it is jumpy.
+    process_noise_covariance: [0.02, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.02, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.0,  0.02, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.0,  0.0,  0.05, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.0,  0.0,  0.0,  0.05, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.0,  0.0,  0.0,  0.0,  0.04, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.05, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.05, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.04, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.01, 0.0,  0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.01, 0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.02, 0.0,  0.0,  0.0,
+                               0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.01, 0.0,  0.0,
+                               0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.01, 0.0,
+                               0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.01]

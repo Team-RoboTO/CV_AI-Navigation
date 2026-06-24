@@ -1,23 +1,22 @@
 # =============================================================================
 # FAST_LIO config for Livox Mid-360 — head-referenced mode
+# TUNED for sustained head rotation + aggressive motion (anti yaw-drift).
 # =============================================================================
-# IMPORTANT:
-# - extrinsic_R/extrinsic_T describe the internal LiDAR <-> IMU calibration used
-#   by FAST_LIO. They are NOT the chassis/head mounting transform.
-# - The physical upside-down mounting is handled in launch/sensors.launch.py by
-#   the static TF base_link -> livox_frame and by the matching constant correction
-#   in tf_frame_relay.py.
-# - For a standard Mid-360 where the driver LiDAR frame and FAST_LIO body/IMU
-#   frame are already aligned as expected, keep extrinsic_R as identity.
+# Changes vs the original (all documented inline with "CHANGED"):
+#   - b_gyr_cov raised so the gyro bias can adapt during long rotations
+#     (the main cause of "after a while spinning it drifts").
+#   - finer surf/map voxel sizes for stronger scan matching while moving.
+#   - one extra solver iteration.
+# Revert any single line to the commented "was" value if you need to.
 # =============================================================================
 
 /**:
     ros__parameters:
         feature_extract_enable: false
         point_filter_num: 1
-        max_iteration: 3
-        filter_size_surf: 0.25
-        filter_size_map: 0.30
+        max_iteration: 4                 # CHANGED was 3
+        filter_size_surf: 0.15           # CHANGED was 0.25 (more planar features)
+        filter_size_map: 0.20            # CHANGED was 0.30
         cube_side_length: 100.0
         runtime_pos_log_enable: false
         map_file_path: "/root/nav2_ws/maps/fastlio_map_auto.pcd"
@@ -36,13 +35,13 @@
             scan_rate: 20
 
         mapping:
-            acc_cov: 0.15
-            gyr_cov: 0.15
+            acc_cov: 0.1                  # CHANGED was 0.15
+            gyr_cov: 0.1                  # CHANGED was 0.15
             b_acc_cov: 0.0001
-            b_gyr_cov: 0.0001
+            b_gyr_cov: 0.001             # CHANGED was 0.0001  <-- KEY anti yaw-drift
             fov_degree: 360.0
             det_range: 30.0
-            extrinsic_est_en: false
+            extrinsic_est_en: false      # set true for a few runs if lever-arm is uncertain
             extrinsic_T: [-0.011, -0.02329, 0.04412]
             extrinsic_R: [1.0, 0.0, 0.0,
                           0.0, 1.0, 0.0,

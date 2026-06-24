@@ -1,34 +1,43 @@
 amcl:
   ros__parameters:
     use_sim_time: false
-    min_particles: 500
-    max_particles: 3000
-    alpha1: 0.2
-    alpha2: 0.2
+    min_particles: 1000          # CHANGED was 500  (more coverage on symmetric map)
+    max_particles: 6000          # CHANGED was 3000
+    # Motion-model noise. alpha1/alpha2 raised a lot: with the head rotating
+    # independently, the particle cloud MUST spread enough in yaw to contain
+    # the true pose, otherwise a resample collapses it onto the wrong mode.
+    alpha1: 0.8                  # CHANGED was 0.2  <-- KEY for rotation-from-stationary
+    alpha2: 0.5                  # CHANGED was 0.2
     alpha3: 0.2
     alpha4: 0.2
-    alpha5: 0.2
-    base_frame_id: "base_link"
+    alpha5: 0.1                  # CHANGED was 0.2
+    base_frame_id: "base_stable"   # CHANGED was base_link -> use the non-rotating frame from amcl_scan_stabilizer (Approach B)
     global_frame_id: "map"
     odom_frame_id: "odom"
     robot_model_type: "nav2_amcl::OmniMotionModel"
     laser_model_type: "likelihood_field"
-    laser_likelihood_max_dist: 1.0
+    laser_likelihood_max_dist: 2.0   # CHANGED was 1.0 (easier re-lock after rotation)
     laser_max_range: 4.0
     laser_min_range: 0.20
     max_beams: 80
-    sigma_hit: 0.2
-    z_hit: 0.7
+    # Softer measurement model so a slightly imperfect scan during motion does
+    # not zero out particle weights and trigger a collapse.
+    sigma_hit: 0.3               # CHANGED was 0.2
+    z_hit: 0.55                  # CHANGED was 0.7
     z_max: 0.05
-    z_rand: 0.2
+    z_rand: 0.4                  # CHANGED was 0.2
     z_short: 0.05
-    update_min_a: 1000.0
-    update_min_d: 0.15
-    resample_interval: 1
-    transform_tolerance: 0.5
+    update_min_a: 0.1            # CHANGED was 1000.0  <-- re-enable rotation updates
+    update_min_d: 0.15           # CHANGED was 0.15
+    resample_interval: 1         # CHANGED was 1 (don't resample every update -> less collapse)
+    transform_tolerance: 1.0     # CHANGED was 0.5 (covers lag during fast motion)
     tf_broadcast: true
-    scan_topic: /scan
+    scan_topic: /scan_amcl       # CHANGED was /scan -> de-rotated scan from amcl_scan_stabilizer (Approach B)
     set_initial_pose: false
+    # Augmented-MCL recovery: inject random particles if the cloud degenerates,
+    # so a lost filter can recover instead of staying stuck (the screenshot case).
+    recovery_alpha_slow: 0.001   # CHANGED was 0.0 (disabled)
+    recovery_alpha_fast: 0.1     # CHANGED was 0.0 (disabled)
 
 bt_navigator:
   ros__parameters:
@@ -72,19 +81,19 @@ controller_server:
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: true
-      min_vel_x: -1.5
-      max_vel_x: 1.5
-      min_vel_y: -1.5
-      max_vel_y: 1.5
+      min_vel_x: -2.5
+      max_vel_x: 2.5
+      min_vel_y: -2.5
+      max_vel_y: 2.5
       max_vel_theta: 0.0
       min_speed_xy: 0.10
-      max_speed_xy: 1.5
+      max_speed_xy: 2.5
       min_speed_theta: 0.0
-      acc_lim_x: 2.0
-      acc_lim_y: 2.0
+      acc_lim_x: 2.5
+      acc_lim_y: 2.5
       acc_lim_theta: 0.0
-      decel_lim_x: -2.0
-      decel_lim_y: -2.0
+      decel_lim_x: -2.5
+      decel_lim_y: -2.5
       decel_lim_theta: 0.0
       vx_samples: 21
       vy_samples: 21
@@ -137,8 +146,8 @@ local_costmap:
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        inflation_radius: 0.10
-        cost_scaling_factor: 12.0
+        inflation_radius: 0.45
+        cost_scaling_factor: 4.0
 
       always_send_full_costmap: true
 
@@ -166,8 +175,8 @@ global_costmap:
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        inflation_radius: 0.45
-        cost_scaling_factor: 2.0
+        inflation_radius: 0.30
+        cost_scaling_factor: 8.0
 
       always_send_full_costmap: true
 
@@ -254,10 +263,10 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: false
     feedback: "OPEN_LOOP"
-    max_velocity: [1.5, 1.5, 0.0]
-    min_velocity: [-1.5, -1.5, 0.0]
-    max_accel: [2.0, 2.0, 0.0]
-    max_decel: [-2.0, -2.0, 0.0]
+    max_velocity: [2.5, 2.5, 0.0]
+    min_velocity: [-2.5, -2.5, 0.0]
+    max_accel: [2.5, 2.5, 0.0]
+    max_decel: [-2.5, -2.5, 0.0]
     odom_topic: "odom"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]

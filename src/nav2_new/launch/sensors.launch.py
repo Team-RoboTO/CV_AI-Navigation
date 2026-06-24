@@ -77,6 +77,11 @@ def launch_setup(context, *args, **kwargs):
             "invert_yaw": False,
             "invert_x": False,
             "invert_y": False,
+            # --- lever-arm (calibrare al passo 2d) --- p0 (-0.005, -0.017) p1()
+            "lever_arm_enable": True,
+            "lever_arm_x": -0.069,
+            "lever_arm_y": -0.0195,
+            "lever_arm_z": 0.0,
             "use_micro_stationary_gate": LaunchConfiguration("use_micro_stationary_gate"),
             "micro_status_topic": "/micro_status",
             "micro_vx_index": 2,
@@ -89,8 +94,31 @@ def launch_setup(context, *args, **kwargs):
         }],
         output="screen",
     )
+    amcl_scan_stabilizer = Node(
+        package="nav2_new", executable="amcl_scan_stabilizer",
+        name="amcl_scan_stabilizer", output="screen",
+        parameters=[{
+            "scan_in": "/scan",
+            "scan_out": "/scan_amcl",
+            "odom_frame": "odom",
+            "base_frame": "base_link",
+            "stable_frame": "base_stable",
+        }],
+    )
+    amcl_motion_gate = Node(
+        package="nav2_new", executable="amcl_motion_gate",
+        name="amcl_motion_gate", output="screen",
+        parameters=[{
+            "micro_status_topic": "/micro_status",
+            "amcl_node_name": "amcl",
+            "vx_index": 2, "vy_index": 3,
+            "vx_sign": 1.0, "vy_sign": -1.0,
+            "move_threshold_mps": 0.12,
+            "freeze_after_sec": 0.5,
+        }],
+    )
 
-    return [lidar_tf, tf_relay]
+    return [lidar_tf, tf_relay, amcl_scan_stabilizer, amcl_motion_gate]
 
 
 def generate_launch_description():
@@ -100,7 +128,7 @@ def generate_launch_description():
     rviz_arg = DeclareLaunchArgument("rviz", default_value="false")
 
     use_micro_stationary_gate_arg = DeclareLaunchArgument("use_micro_stationary_gate", default_value="true")
-    stationary_vxy_threshold_arg = DeclareLaunchArgument("stationary_vxy_threshold", default_value="0.06")
+    stationary_vxy_threshold_arg = DeclareLaunchArgument("stationary_vxy_threshold", default_value="0.12")
     micro_timeout_sec_arg = DeclareLaunchArgument("micro_timeout_sec", default_value="0.30")
     micro_vy_sign_arg = DeclareLaunchArgument("micro_vy_sign", default_value="-1.0")
     log_stationary_gate_arg = DeclareLaunchArgument("log_stationary_gate", default_value="true")
@@ -130,8 +158,8 @@ def generate_launch_description():
     # These replace:
     #   /livox/lidar -> livox_custom_to_pc2 -> /livox/lidar_pc2
     #   /livox/lidar_pc2 -> pointcloud_to_laserscan -> /scan
-    scan_publish_rate_arg = DeclareLaunchArgument("scan_publish_rate_hz", default_value="6.0")
-    scan_keep_every_n_arg = DeclareLaunchArgument("scan_keep_every_n", default_value="2")
+    scan_publish_rate_arg = DeclareLaunchArgument("scan_publish_rate_hz", default_value="8.0")
+    scan_keep_every_n_arg = DeclareLaunchArgument("scan_keep_every_n", default_value="1")
     scan_range_min_arg = DeclareLaunchArgument("scan_range_min", default_value="0.20")
     scan_range_max_arg = DeclareLaunchArgument("scan_range_max", default_value="4.0")
     scan_z_min_arg = DeclareLaunchArgument("scan_z_min", default_value="-0.55")

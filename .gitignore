@@ -3,3 +3,6 @@ install/
 log/
 
 
+core.*
+__pycache__/
+*.pyc

@@ -54,6 +54,8 @@ setup(
             'turret_idle_target_publisher = nav2_new.turret_idle_target_publisher:main',
             'game_status_reporter = nav2_new.game_status_reporter:main',
             'nav_match_reset = nav2_new.nav_match_reset:main',
+            'amcl_scan_stabilizer = nav2_new.amcl_scan_stabilizer:main',
+            'amcl_motion_gate     = nav2_new.amcl_motion_gate:main',
         ],
     },
 )

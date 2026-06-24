@@ -13,6 +13,8 @@ waypoints:
   scrivania_Leo:   { x: 3.622, y: 2.375, yaw: 0.000 }
   diagonale_1 :    { x: -0.787, y: 2.140, yaw: 0.000 }
   diagonale_2:    { x: 0.246, y: 0.596, yaw: 0.000 }
+  diagonale_1_centro:    { x: -0.114, y: 6.158, yaw: 0.000 }
+  diagonale_2_centro:    { x: 3.411, y: 6.107, yaw: 0.000 }
 
 health:
   retreat_threshold: 120.0
@@ -24,14 +26,14 @@ strategies:
 
   # Percorso di andata/ritorno dalla base verso la zona di gioco/centro.
   percorso:
-    red:  [fine_corridoio, scrivania_Leo]
-    blue: [fine_corridoio, scrivania_Leo]
+    red:  [fine_corridoio, centro_lab]
+    blue: [fine_corridoio, centro_lab]
 
   # Questa è la strategia che deve ripetersi in loop.
   # Se la tua si chiama hold_center_diagonal, usa quel nome anche nei parametri sopra.
   center_free_strategy:
-    red:  [diagonale_1, diagonale_2]
-    blue: [diagonale_1, diagonale_2]
+    red:  [diagonale_1_centro, diagonale_2_centro]
+    blue: [diagonale_1_centro, diagonale_2_centro]
 
   retreat_to_spawn:
     red:  [spawn_lab]

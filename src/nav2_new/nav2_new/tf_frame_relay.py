@@ -22,6 +22,7 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray
 from tf2_msgs.msg import TFMessage
+from nav_msgs.msg import Odometry
 
 
 def _normalize_quaternion(q: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
@@ -61,6 +62,19 @@ def _quaternion_from_yaw(yaw: float) -> Tuple[float, float, float, float]:
     return 0.0, 0.0, math.sin(half), math.cos(half)
 
 
+def _rotate_vector_by_quaternion(v, q):
+    """Rotate 3D vector v by quaternion q (xyzw). Returns (x, y, z)."""
+    vx, vy, vz = v
+    x, y, z, w = _normalize_quaternion(q)
+    tx = 2.0 * (y * vz - z * vy)
+    ty = 2.0 * (z * vx - x * vz)
+    tz = 2.0 * (x * vy - y * vx)
+    rx = vx + w * tx + (y * tz - z * ty)
+    ry = vy + w * ty + (z * tx - x * tz)
+    rz = vz + w * tz + (x * ty - y * tx)
+    return rx, ry, rz
+
+
 def _read_array(data, idx, default=0.0):
     if idx < 0 or idx >= len(data):
         return default, False
@@ -96,6 +110,19 @@ class TFFrameRelay(Node):
         self.declare_parameter('invert_x', False)
         self.declare_parameter('invert_y', False)
 
+        # --- Lever-arm compensation ---
+        # The LiDAR/IMU is NOT on the head yaw axis, so a pure head rotation
+        # makes the sensor orbit the axis and FAST-LIO reports real translation
+        # -> base_link drifts when you only rotate the head.
+        # L is the vector FROM the IMU/body origin TO the yaw axis, expressed in
+        # the body (IMU) frame. With the correct L, base_link is placed on the
+        # axis and head rotation produces zero translation. Defaults = 0 (off).
+        # Calibrate with the procedure in the README.
+        self.declare_parameter('lever_arm_enable', False)
+        self.declare_parameter('lever_arm_x', 0.0)
+        self.declare_parameter('lever_arm_y', 0.0)
+        self.declare_parameter('lever_arm_z', 0.0)
+
         # Micro gate. Current firmware layout:
         # data[0] = gimbal yaw (bounded; not used here)
         # data[1] = pitch (ignored)
@@ -110,6 +137,21 @@ class TFFrameRelay(Node):
         self.declare_parameter('stationary_vxy_threshold', 0.12)
         self.declare_parameter('micro_timeout_sec', 0.30)
         self.declare_parameter('log_stationary_gate', True)
+
+        # --- EKF integration flags (default = legacy behaviour) ---
+        # publish_tf:   keep True for the current setup. Set False when an
+        #               external EKF (robot_localization) owns odom->base_link,
+        #               so we don't fight it on /tf.
+        # publish_odom: when True, also publish the SAME corrected, head-
+        #               referenced pose as nav_msgs/Odometry on odom_output_topic,
+        #               so the EKF can consume FAST-LIO pose with all the existing
+        #               corrections already applied.
+        self.declare_parameter('publish_tf', True)
+        self.declare_parameter('publish_odom', False)
+        self.declare_parameter('odom_output_topic', '/odom_lio')
+        # Pose covariance fed to the EKF for x, y (m^2) and yaw (rad^2).
+        self.declare_parameter('odom_xy_variance', 0.02)
+        self.declare_parameter('odom_yaw_variance', 0.02)
 
         input_topic = self.get_parameter('input_topic').value
         self.source_parent_frame = self.get_parameter('source_parent_frame').value
@@ -128,6 +170,13 @@ class TFFrameRelay(Node):
         self.invert_x = bool(self.get_parameter('invert_x').value)
         self.invert_y = bool(self.get_parameter('invert_y').value)
 
+        self.lever_arm_enable = bool(self.get_parameter('lever_arm_enable').value)
+        self.lever_arm = (
+            float(self.get_parameter('lever_arm_x').value),
+            float(self.get_parameter('lever_arm_y').value),
+            float(self.get_parameter('lever_arm_z').value),
+        )
+
         self.use_micro_stationary_gate = bool(self.get_parameter('use_micro_stationary_gate').value)
         self.micro_status_topic = self.get_parameter('micro_status_topic').value
         self.micro_vx_index = int(self.get_parameter('micro_vx_index').value)
@@ -137,6 +186,12 @@ class TFFrameRelay(Node):
         self.stationary_vxy_threshold = float(self.get_parameter('stationary_vxy_threshold').value)
         self.micro_timeout_sec = float(self.get_parameter('micro_timeout_sec').value)
         self.log_stationary_gate = bool(self.get_parameter('log_stationary_gate').value)
+
+        self.publish_tf = bool(self.get_parameter('publish_tf').value)
+        self.publish_odom = bool(self.get_parameter('publish_odom').value)
+        self.odom_output_topic = self.get_parameter('odom_output_topic').value
+        self.odom_xy_variance = float(self.get_parameter('odom_xy_variance').value)
+        self.odom_yaw_variance = float(self.get_parameter('odom_yaw_variance').value)
 
         self.last_micro_time = None
         self.micro_vx = 0.0
@@ -153,6 +208,10 @@ class TFFrameRelay(Node):
 
         self.sub = self.create_subscription(TFMessage, input_topic, self._on_tf, 100)
         self.pub = self.create_publisher(TFMessage, '/tf', 100)
+        if self.publish_odom:
+            self.odom_pub = self.create_publisher(Odometry, self.odom_output_topic, 50)
+        else:
+            self.odom_pub = None
         if self.use_micro_stationary_gate:
             self.micro_sub = self.create_subscription(
                 Float32MultiArray, self.micro_status_topic, self._on_micro_status, 50)
@@ -249,6 +308,16 @@ class TFFrameRelay(Node):
 
             raw_x = t.transform.translation.x
             raw_y = t.transform.translation.y
+
+            # Lever-arm: move the reported point from the IMU to the yaw axis,
+            # so pure head rotation does not translate base_link. Use the full
+            # 3D body orientation (before planarize) to rotate L into the parent
+            # frame, then add it to the body position.
+            if self.lever_arm_enable:
+                lx, ly, _lz = _rotate_vector_by_quaternion(self.lever_arm, q_body)
+                raw_x = raw_x + lx
+                raw_y = raw_y + ly
+
             if self.invert_x:
                 raw_x = -raw_x
             if self.invert_y:
@@ -266,7 +335,31 @@ class TFFrameRelay(Node):
 
             out.transforms.append(t2)
 
-        if out.transforms:
+            # Publish the SAME corrected pose as Odometry for the EKF.
+            if self.odom_pub is not None:
+                odom = Odometry()
+                odom.header.stamp = t2.header.stamp
+                odom.header.frame_id = self.target_parent_frame
+                odom.child_frame_id = self.target_child_frame
+                odom.pose.pose.position.x = out_x
+                odom.pose.pose.position.y = out_y
+                odom.pose.pose.position.z = 0.0
+                odom.pose.pose.orientation.x = q_base[0]
+                odom.pose.pose.orientation.y = q_base[1]
+                odom.pose.pose.orientation.z = q_base[2]
+                odom.pose.pose.orientation.w = q_base[3]
+                cov = [0.0] * 36
+                big = 1e6
+                cov[0] = self.odom_xy_variance    # x
+                cov[7] = self.odom_xy_variance    # y
+                cov[14] = big                     # z (unused, 2d)
+                cov[21] = big                     # roll
+                cov[28] = big                     # pitch
+                cov[35] = self.odom_yaw_variance  # yaw
+                odom.pose.covariance = list(cov)
+                self.odom_pub.publish(odom)
+
+        if out.transforms and self.publish_tf:
             self.pub.publish(out)
 
 
