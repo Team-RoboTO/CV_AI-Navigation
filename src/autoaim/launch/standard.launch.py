@@ -272,8 +272,32 @@ def autoaim_params():
         # §4f: 0.8 was too stiff (lagged a translating spinner) AND the 0.8↔10
         # swing was erratic as the regime flickered. 2.0 + a sticky regime is
         # stiff enough to reject the orbit but still follows a slow translation.
-        {"q_pos_spin": 2.0},
+        # §4g (bag …201048): 2.0 STILL lags a WALKED spinner — the EKF center
+        # trails the true center by ~66 ms / 16 cm ("segue lentamente"). That is a
+        # POSITION-tracking lag (this stiffness), not a lead problem: the spin
+        # velocity is already bled ~97%/s (alpha_pos_spin) and hard-capped at
+        # spin_trans_lead_cap=0.30, so raising q_pos_spin follows TIGHTER without
+        # adding overshoot. 4.0 ≈ doubles the center responsiveness (lag → ~9 cm),
+        # still ≪ non-spin q_pos=10 so the orbit is still rejected (still-spinner
+        # center wobble ≈0.07→0.10 m/s ⇒ ~2 mrad ≪ lock tol). If a walked spinner
+        # still lags and lock holds, push toward 6.0.
+        {"q_pos_spin": 4.0},
         {"alpha_pos_spin": 0.93},
+        # ── ADAPTIVE FOLLOW (WORKLOG §4g) — switchable, NON-spin (translating)
+        # target. Goal: follow SUDDEN changes much faster AND overshoot LESS — a
+        # fixed alpha_pos can't do both. The horizontal-center velocity damping
+        # reacts in ONE frame to the POSITION INNOVATION vs the lead: LIGHT
+        # (alpha_move) while the target advances as the velocity predicts (hold the
+        # lead → fast follow), HARD (alpha_stop) the instant the measurement falls
+        # behind the lead — a stop or reversal (collapse the lead → less overshoot).
+        # Offline CV-Kalman sim (move→stop): lag 54→43 mm AND overshoot 75→60 mm.
+        # Switch off: adaptive_follow_enable=False restores the static alpha_pos.
+        # Tuning: still overshoots → lower alpha_stop toward 0.55; too twitchy to
+        # start a move → raise alpha_move toward 1.0 stays, or alpha_stop toward 0.85.
+        {"adaptive_follow_enable": True},
+        {"adaptive_follow_alpha_move": 1.00},
+        {"adaptive_follow_alpha_stop": 0.70},
+        {"adaptive_follow_realized_ema": 0.50},
         # ── §4f OBSERVABILITY-GATED LEAD + STICKY CENTER-AIM (the real-data fix) ──
         # Bag 193721: the enemy spins ~235 rpm; at 44 Hz the armor moves 30–90°/
         # frame → ALIASED, vyaw is unreliable. omega_reliable_max: above this rad/s

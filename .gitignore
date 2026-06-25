@@ -9,7 +9,6 @@ AI-models/*.engine
 AI-models/*.onnx
 
 #old folders
-
 old/
 
 #container folders
@@ -30,6 +29,9 @@ src/zed-ros2-wrapper
 # Python
 __pycache__/
 *.pyc
+
+# IDEs
+.vscode/
 
 # AI assistant local files
 .agents/

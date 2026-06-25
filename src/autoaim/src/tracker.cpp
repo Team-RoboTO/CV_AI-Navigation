@@ -59,9 +59,13 @@ Tracker::Tracker(const TrackerConfig & cfg) : cfg_(cfg)
 void Tracker::ekfPredict(double dt)
 {
   double b, a;
+  // b_xy is the HORIZONTAL-center (xc,yc) velocity damping. It equals b unless the
+  // adaptive follow (WORKLOG §4g) overrides it; the vertical channel always uses b.
+  double b_xy;
   if (state_ == TEMP_LOST) {
     // Aggressive damping: no measurement to correct, so decay velocity fast
     b = a = std::pow(cfg_.alpha_coast, dt * cfg_.ref_freq);
+    b_xy = b;
   } else {
     // Regime-adaptive center damping: while spinning, bleed the phantom center
     // velocity (orbit leak) fast so it is not led into the aim. WORKLOG §4e.
@@ -69,21 +73,44 @@ void Tracker::ekfPredict(double dt)
       spinning_regime_ ? cfg_.alpha_pos_spin : cfg_.alpha_pos;
     b = std::pow(alpha_pos_eff, dt * cfg_.ref_freq);
     a = std::pow(cfg_.alpha_yaw, dt * cfg_.ref_freq);
+
+    // ── ADAPTIVE FOLLOW (WORKLOG §4g) — switchable, NON-SPIN regime only ──
+    // Track sudden changes fast AND overshoot less by making the horizontal-center
+    // damping react in ONE frame to whether the last measurement still confirms the
+    // lead. follow_signal_ (computed in the previous update() from the position
+    // innovation vs the expected advance) is ≈1 while moving, →0 on a stop, <0 on a
+    // reversal. follow_w∈[0,1] = clamp(follow_signal_):
+    //   1 ⇒ light damping (alpha_move): hold the lead, follow sudden changes fast.
+    //   0 ⇒ hard damping (alpha_stop): collapse the lead in 1–2 frames ⇒ minimal
+    //       overshoot; a reversal (signal<0) is caught and killed at once.
+    // Skipped for a confirmed spinner: the orbit leak co-drives the innovation and
+    // the velocity, which would read as "moving" on a still top — a spinner keeps
+    // q_pos_spin/alpha_pos_spin.
+    double alpha_xy = alpha_pos_eff;
+    double follow_w = 1.0;
+    if (cfg_.adaptive_follow_enable && !spinning_regime_) {
+      follow_w = std::clamp(follow_signal_, 0.0, 1.0);
+      alpha_xy = cfg_.adaptive_follow_alpha_stop +
+        follow_w * (cfg_.adaptive_follow_alpha_move - cfg_.adaptive_follow_alpha_stop);
+    }
+    b_xy = std::pow(std::clamp(alpha_xy, 0.0, 1.0), dt * cfg_.ref_freq);
+    debug_info_.adaptive_follow_w = follow_w;
+    debug_info_.follow_signal_raw = follow_signal_;  // un-clamped (<0 = reversal)
   }
 
   // State transition f(x)
   Eigen::VectorXd xn = x_;
-  xn(0) += x_(1)*b*dt;  xn(1) = x_(1)*b;  // xc, vxc
-  xn(2) += x_(3)*b*dt;  xn(3) = x_(3)*b;  // yc, vyc
-  xn(4) += x_(5)*b*dt;  xn(5) = x_(5)*b;  // za, vza
-  xn(6) += x_(7)*a*dt;  xn(7) = x_(7)*a;  // yaw, vyaw
+  xn(0) += x_(1)*b_xy*dt;  xn(1) = x_(1)*b_xy;  // xc, vxc (adaptive)
+  xn(2) += x_(3)*b_xy*dt;  xn(3) = x_(3)*b_xy;  // yc, vyc (adaptive)
+  xn(4) += x_(5)*b*dt;     xn(5) = x_(5)*b;     // za, vza (vertical: base damping)
+  xn(6) += x_(7)*a*dt;     xn(7) = x_(7)*a;     // yaw, vyaw
 
   // Jacobian F
   Eigen::MatrixXd F = Eigen::MatrixXd::Identity(9, 9);
-  F(0,1) = b*dt; F(1,1) = b;
-  F(2,3) = b*dt; F(3,3) = b;
-  F(4,5) = b*dt; F(5,5) = b;
-  F(6,7) = a*dt; F(7,7) = a;
+  F(0,1) = b_xy*dt; F(1,1) = b_xy;
+  F(2,3) = b_xy*dt; F(3,3) = b_xy;
+  F(4,5) = b*dt;    F(5,5) = b;
+  F(6,7) = a*dt;    F(7,7) = a;
 
   // Process noise Q: discrete white-noise acceleration model. STATIC q_pos for
   // all center axes (xc, yc, za) and STATIC q_yaw for the spin. The old online
@@ -475,6 +502,13 @@ void Tracker::initFromDetection(const ArmorDetection & det)
   last_observed_armor_pos_ = Eigen::Vector3d(det.x, det.y, det.z);
   last_observed_armor_yaw_ = yaw;
   last_observed_face_idx_ = 0;
+  // Adaptive-follow state: seed the center, zero the realized velocity (WORKLOG §4g).
+  follow_signal_ = 1.0;
+  prev_center_valid_ = true;
+  prev_center_x_ = x_(0);
+  prev_center_y_ = x_(2);
+  realized_vx_ema_ = 0.0;
+  realized_vy_ema_ = 0.0;
 }
 
 // =========================================================================
@@ -930,6 +964,7 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
   // the spin observer's verdict on the PREVIOUS frame (the observer for this
   // frame runs after the EKF update below). WORKLOG §4d.
   spinning_regime_ = spin_omega_valid_;
+  debug_info_.spinning_regime = spinning_regime_;
   debug_info_.state_yaw = x_(6);
   debug_info_.phase_confident = phaseConfident();
   debug_info_.static_confirmed = staticConfirmed();
@@ -1003,6 +1038,26 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
     const double radius_before_update = x_(8);
     const FacePrediction face_before_update =
       predictFace(x_, assoc.face_idx, 0.0);
+
+    // ── ADAPTIVE FOLLOW signal (WORKLOG §4g) ──
+    // Did the measurement advance as the (post-predict) velocity predicted? The
+    // armor-position innovation projected on the velocity, normalised by the
+    // expected per-frame advance |v|^2·dt: ≈1 moving, →0 stop, <0 reverse. Stored
+    // for the NEXT frame's ekfPredict (1-frame-delayed but immediate stop detector).
+    // Below ~0.02 m/s the lead is negligible (<~2 mm), so report "moving" (=1).
+    {
+      const double vx = x_(1), vy = x_(3);
+      const double vmag = std::hypot(vx, vy);
+      if (vmag > 0.02) {
+        const double innx = best_det.x - face_before_update.position.x();
+        const double inny = best_det.y - face_before_update.position.y();
+        follow_signal_ =
+          1.0 + (innx * vx + inny * vy) / (vmag * vmag * std::max(dt, 1e-3));
+      } else {
+        follow_signal_ = 1.0;
+      }
+    }
+
     const double bearing = std::atan2(best_det.y - ego_y_, best_det.x - ego_x_);
     const double obliquity_yaw = assoc.yaw_valid ? assoc.yaw_meas : face_before_update.yaw;
     const double fa =
@@ -1214,6 +1269,23 @@ void Tracker::update(const std::vector<ArmorDetection> & detections, double dt,
       resetSpinTiming();
     }
   }
+
+  // ── REALIZED CENTER VELOCITY (WORKLOG §4g) — drives the adaptive follow ──
+  // EMA of the per-frame change of the EKF center. On a non-spinning target this
+  // is the true translation: large+steady while moving, ~0 the moment it stops,
+  // sign-flipped on a reversal. ekfPredict next frame reads it to pick light vs
+  // hard damping. Computed for the normal tracked path (init seeds it).
+  if (state_ != LOST && prev_center_valid_ && dt > 1e-4) {
+    const double rvx = (x_(0) - prev_center_x_) / dt;
+    const double rvy = (x_(2) - prev_center_y_) / dt;
+    const double e = std::clamp(cfg_.adaptive_follow_realized_ema, 0.0, 1.0);
+    realized_vx_ema_ = e * rvx + (1.0 - e) * realized_vx_ema_;
+    realized_vy_ema_ = e * rvy + (1.0 - e) * realized_vy_ema_;
+  }
+  prev_center_x_ = x_(0);
+  prev_center_y_ = x_(2);
+  prev_center_valid_ = true;
+  debug_info_.realized_center_speed = std::hypot(realized_vx_ema_, realized_vy_ema_);
 }
 
 // =========================================================================
@@ -1818,6 +1890,14 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
     (std::abs(aim.impact_lateral)  <= cfg_.plate_half_width &&
      std::abs(aim.impact_vertical) <= cfg_.plate_half_height);
   aim.impact_inside = impact_inside;
+
+  // Lead / aim-mode telemetry (WORKLOG §4g debug): the lead actually folded into
+  // the aim (x_aim is post-cap / post-omega-gate), plus which aim mode ran.
+  aim.applied_lead_vx   = x_aim(1);
+  aim.applied_lead_vy   = x_aim(3);
+  aim.applied_lead_vyaw = x_aim(7);
+  aim.omega_reliable    = omega_reliable;
+  aim.center_aimed      = center_aimed;
 
   aim.fire = best.valid &&
     fireStatePermits() &&

@@ -144,6 +144,12 @@ public:
     // Regime-adaptive center stiffness while spinning (WORKLOG §4e/§4f).
     cfg.q_pos_spin            = declare_parameter("q_pos_spin", 2.0);
     cfg.alpha_pos_spin        = declare_parameter("alpha_pos_spin", 0.93);
+    // Adaptive follow (WORKLOG §4g): switchable maneuver-tracking damping for the
+    // NON-spin (translating) target — fast on sudden changes, less overshoot.
+    cfg.adaptive_follow_enable      = declare_parameter("adaptive_follow_enable", true);
+    cfg.adaptive_follow_alpha_move  = declare_parameter("adaptive_follow_alpha_move", 1.00);
+    cfg.adaptive_follow_alpha_stop  = declare_parameter("adaptive_follow_alpha_stop", 0.70);
+    cfg.adaptive_follow_realized_ema = declare_parameter("adaptive_follow_realized_ema", 0.50);
     // Observability-gated lead + center-aim stickiness (WORKLOG §4f).
     cfg.omega_reliable_max    = declare_parameter("omega_reliable_max", 15.0);
     cfg.spin_trans_lead_cap   = declare_parameter("spin_trans_lead_cap", 0.30);
@@ -974,6 +980,9 @@ private:
     }
 
     last_time_ = now;
+    // Stash for the debug-state publisher (runs later inside publishCommand).
+    last_frame_dt_ = dt;
+    last_num_target_detections_ = static_cast<int>(armors.size());
 
     if (publish_other_debug_messages_) {
       RCLCPP_INFO_THROTTLE(
@@ -1369,6 +1378,27 @@ private:
     msg.spin_centroid_y = tracker_debug.spin_centroid_y;
     msg.spin_omega = tracker_debug.spin_omega;
     msg.spin_invalid_streak = tracker_debug.spin_invalid_streak;
+    // Adaptive-follow telemetry (WORKLOG §4g).
+    msg.adaptive_follow_w = tracker_debug.adaptive_follow_w;
+    msg.follow_signal_raw = tracker_debug.follow_signal_raw;
+    msg.realized_center_speed = tracker_debug.realized_center_speed;
+    msg.spinning_regime = tracker_debug.spinning_regime;
+
+    // ── Aim / lead actually applied + aim mode (WORKLOG §4g debug surface) ──
+    msg.aim_target_x = aim.target_x;
+    msg.aim_target_y = aim.target_y;
+    msg.aim_target_z = aim.target_z;
+    msg.applied_lead_vx = aim.applied_lead_vx;
+    msg.applied_lead_vy = aim.applied_lead_vy;
+    msg.applied_lead_vyaw = aim.applied_lead_vyaw;
+    msg.omega_reliable = aim.omega_reliable;
+    msg.center_aimed = aim.center_aimed;
+
+    // ── Timing / detector health ──
+    msg.frame_dt = last_frame_dt_;
+    msg.pipeline_latency = tracker_->pipelineLatency();
+    msg.num_target_detections = last_num_target_detections_;
+    msg.target_generation = tracker_->targetGeneration();
 
     msg.matched = tracker_debug.matched;
     msg.mahalanobis = tracker_debug.mahalanobis;
@@ -1883,6 +1913,11 @@ private:
   tf2::Vector3 frame_translation_{0, 0, 0};
 
   rclcpp::Time last_time_{0, 0, RCL_ROS_TIME};
+
+  // Per-frame telemetry stashed in handleArmorMeasurements for publishDebugState
+  // (which runs later inside publishCommand). WORKLOG §4g debug surface.
+  double last_frame_dt_ = 0.0;
+  int    last_num_target_detections_ = 0;
 
   double smooth_alpha_ = 0.30;
   double cmd_deadband_yaw_ = 0.015;

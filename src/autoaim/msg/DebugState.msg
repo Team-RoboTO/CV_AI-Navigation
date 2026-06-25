@@ -100,6 +100,44 @@ float64 spin_centroid_y
 float64 spin_omega
 int32 spin_invalid_streak
 
+# Adaptive-follow telemetry (WORKLOG §4g). adaptive_follow_w: 1 = light damping
+# (target moving, lead held → fast follow) … 0 = hard damping (stop/reversal, lead
+# killed → less overshoot); 1.0 when off or in the spin regime.
+# follow_signal_raw: the un-clamped signal (<0 ⇒ reversal, >1 ⇒ accelerating).
+# realized_center_speed: |EMA of the per-frame EKF-center velocity| [m/s].
+# spinning_regime: regime flag the EKF used this frame (q_yaw/q_pos/yaw-trust + it
+#   gates the adaptive follow off; distinct from confirmed_spin which gates the aim).
+float64 adaptive_follow_w
+float64 follow_signal_raw
+float64 realized_center_speed
+bool spinning_regime
+
+# ── Aim / lead ACTUALLY APPLIED + aim mode (WORKLOG §4g debug surface) ──
+# aim_target_*: the odom point the gimbal is aiming at (after center-aim / ballistics).
+# applied_lead_v{x,y}: translational lead velocity folded into the aim [m/s], AFTER
+#   the spin_trans_lead_cap — compare to state_vxc/vyc to see how much the cap bit.
+# applied_lead_vyaw: rotational lead used [rad/s] (0 when omega-gated; compare to vyaw).
+# omega_reliable: was the rotational (vyaw) lead applied (false ⇒ aliased/unconfirmed).
+# center_aimed: center-aim engaged (gimbal points at the spin-centre facing point).
+float64 aim_target_x
+float64 aim_target_y
+float64 aim_target_z
+float64 applied_lead_vx
+float64 applied_lead_vy
+float64 applied_lead_vyaw
+bool omega_reliable
+bool center_aimed
+
+# ── Timing / detector health ──
+# frame_dt: detection interval [s] (rate/aliasing diagnostic — 1/dt = live Hz).
+# pipeline_latency: measured capture→aim latency [s] (the horizon = this + actuation).
+# num_target_detections: target-class plates seen this frame (0 ⇒ detector miss).
+# target_generation: bumps on every track (re)acquire/switch — spots track resets.
+float64 frame_dt
+float64 pipeline_latency
+int32 num_target_detections
+int32 target_generation
+
 bool matched
 float64 mahalanobis
 int32 matched_face_idx

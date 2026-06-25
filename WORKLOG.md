@@ -1091,6 +1091,170 @@ ordering (FireValid vs Incoming) directly.
 
 ---
 
+## 4g. WALKED-SPINNER FOLLOW LAG + bag …201048 problem audit (2026-06-25, APPLIED, build OK)
+
+### 4g.1 Request
+"Follow the enemy MUCH more closely (not slowly) when it moves (we are still, the
+enemy moves) but do NOT overshoot." Plus: list the problems in the last bag
+(`bagsa/debug_state_20260624_201048`, 15045 msgs / 336 s) that need addressing.
+
+### 4g.2 What the bag actually is (offline replay of the raw fields)
+This is **almost entirely a fast SPINNING TOP**, sometimes walked across and brought
+from 2.9 m → 0.34 m, with a static tail. It is NOT a clean pure-translation test.
+Per 10 s window the armor PATH is 50–90 m while net center displacement is ~0.1–1 m
+(`detnet/detpath ≈ 0.01`) and the plate normal rotates 100–180 rad — a spinner.
+Frame classification by local plate-rotation is clean: rot<1 rad/0.6 s (static/
+translation) → `confirmed_spin` 5 %; rot>3 → 77 %. So the regime observer is NOT
+broadly false-triggering; the §4d/§4e/§4f machinery is doing its job.
+
+### 4g.3 The "segue lentamente" — measured: a POSITION lag, not a lead deficit
+Compared the EKF center (`state_xc/yc`) to a heavily-smoothed line-of-sight center
+(`det + r·[cosθ,sinθ]_bearing`, the orbit-averaged truth) while the spinner is
+WALKED (100–140 s):
+
+| segment | EKF center lag vs true center | pos err |
+|---|---|---|
+| 100–140 s walked spinner | **3 frames ≈ 66 ms** | **0.16 m** |
+| 140–160 s approach (close) | 1 frame ≈ 22 ms | 0.08 m |
+| 220–260 s fast spinner, still | (phase-only, no real motion) | 0.06 m |
+
+So when the spinner translates, the aim trails the true center by ~66 ms / 16 cm.
+Crucially this is a **position-tracking lag**, not a lead problem:
+- The cleanest velocity estimate available is the EKF `vxc/vyc` itself: on a NON-
+  translating spinner it reads **0.04 m/s** (the q_pos_spin stiffening works). The
+  observer **centroid** velocity is garbage (0.12 m/s still / 1.45 m/s walked) — the
+  §4e note "neither the centroid nor a windowed slope is a clean velocity" is
+  CONFIRMED, so a centroid-velocity lead is off the table.
+- The spin lead is already bled ~97 %/s (`alpha_pos_spin=0.93` at ref_freq 48) and
+  hard-capped at `spin_trans_lead_cap=0.30` (binds 32 % of moving-spin frames, mostly
+  clipping the orbit PHANTOM, not real translation). So overshoot is already guarded.
+
+⇒ The lag is set by **`q_pos_spin`** (center stiffness). It was lowered to reject the
+orbit "ghost"; the cost is trailing real translation.
+
+### 4g.4 The fix — APPLIED 2026-06-25 (build OK), single knob
+`q_pos_spin` **2.0 → 4.0** (`tracker.hpp` default + `standard.launch.py`). Doubles the
+center responsiveness so the walked-spinner lag drops toward ~9 cm, while:
+- it stays ≪ the non-spin `q_pos=10`, so the center still rejects the orbit (it does
+  not start chasing the orbiting armor → no ghost);
+- overshoot is unchanged: the velocity led into the aim is still bled ~97 %/s and
+  capped at 0.30 m/s;
+- lock is unaffected: the bag's center-aim command is already steady (cmd_yaw f2f
+  jitter 5–6 mrad med, p90 17–19); a still-spinner center wobble of ~0.07→0.10 m/s is
+  ~2 mrad ≪ the lock tolerance (27 mrad @2.5 m, ~108 mrad @0.6 m).
+Tunable: push toward 6.0 if a walked spinner still lags AND the gimbal keeps lock;
+drop back to 2.0 to revert. Left `alpha_pos_spin`/`spin_trans_lead_cap` untouched so
+the on-robot validation isolates one variable.
+NOTE — regimes: this knob only affects a CONFIRMED spinner. A NON-spinning enemy that
+merely translates uses `q_pos=10` / `alpha_pos=0.99` (already the user-validated
+no-overshoot setting; `alpha_pos=1.0` was reverted in round 3 for overshoot — do NOT
+re-raise it to chase follow speed). If a pure-translation test still feels slow, the
+right lever is a regime-split tighter tangential R or an asymmetric (responsive-up /
+damp-on-stop) velocity damper — deliberately NOT done here to avoid re-adding the
+round-3 overshoot blind.
+
+### 4g.5 Problems found in bag …201048 (audit — report, mostly NOT code bugs)
+1. **The last ~60 s (280–340 s, 2483 frames = 18 % of the bag) is a PARKED GIMBAL,
+   not autoaim.** Autoaim commanded correctly (`cmd_yaw` 0.571 ≈ target bearing 0.505)
+   but `micro_yaw` was frozen at 0.255 (std 0.018) — the physical gimbal sat ~18° off
+   the command the whole time → `yaw_locked` 0 %, `cmd_fire` 0 %, block reason
+   `yaw_pitch_unlocked`. The lock gate correctly refused to fire. **Action: exclude
+   this tail from any tuning stats; confirm the gimbal was actually driven
+   (shooting/enable) during the run — if it genuinely could not reach the command,
+   that is a hardware/gimbal-control issue, separate from autoaim.** This single
+   segment drags the whole-bag `yaw_locked` from ~70 % down to 60 % and `cmd_fire` down.
+2. **LOCK is the fire bottleneck (framerate-bound).** `aim_fire` 46 % but `cmd_fire`
+   only 17 %; both-locked 43 %. At 2.5 m `tol_yaw = 0.0675/2.5 ≈ 27 mrad` but the
+   residual command/track jitter on the aliased fast top is ~30 mrad → lock fails
+   ~half the time. This is the §4f Nyquist wall: at 44 Hz the command cannot be made
+   steady enough for the tight FAR-range lock window. Lever = **detector rate**
+   (§4f.A — read the `LATENCY[ms]` ledger); secondary = re-balance `fire_lock_k_yaw`
+   vs the real far-range jitter.
+3. **The top is ALIASED at 44 Hz.** Raw plate normal moves ~14 rad/s; `vyaw_rpm` sits
+   26–55 (smoothed/capped) while raw handoffs imply a much faster top. The rotational
+   lead is (correctly) zeroed above `omega_reliable_max`, so on the fast top the
+   system is center-aim + opportunistic impact-gate fire only — hit rate is physically
+   capped until the framerate rises. Not a regression; the §4f conclusion stands.
+4. **Center-follow lag on a WALKED spinner ~66 ms / 16 cm** (§4g.3) — the "segue
+   lentamente"; addressed by the q_pos_spin change above.
+5. **Fire-gate blocks (spin, non-firing frames):** `facing_window_approach` 4556,
+   `yaw_pitch_unlocked` 3041, `impact_outside_plate` 1819, `facing_window_leave` 664.
+   The facing/impact blocks are mostly CORRECT (no wheel-shots — the §4e gate works);
+   combined with the lock failures they keep `cmd_fire` ~17 %. "Honest but quiet" on a
+   fast top → again a framerate story, not a gate bug.
+6. **(Minor) detector hiccups:** ~289 frames dt>50 ms (one 339 ms gap), 9 dropouts.
+   Grace/coast absorbs them (`TEMP_LOST` only 5 %), but watch the detector loop
+   stability via the §4f.A ledger.
+
+### 4g.6 On-robot validation (REQUIRED — not yet run on hardware)
+1. **Walked spinner (the target case):** aim should trail the moving center LESS
+   (was ~66 ms / 16 cm). Watch `state_xc/yc` vs the raw detection; the gimbal should
+   sit on the center more tightly while it is walked. If still laggy AND lock holds,
+   raise `q_pos_spin` toward 6.0.
+2. **Overshoot check:** a walked spinner that STOPS must settle without L/R overshoot
+   (the cap + alpha_pos_spin bleed are unchanged, so this should hold). If it now
+   overshoots, lower `spin_trans_lead_cap` toward 0.25.
+3. **Lock regression:** `yaw_locked`/`cmd_fire` must not DROP vs the previous build
+   (the center-aim wobble should stay ~2 mrad). If lock drops on a still spinner,
+   `q_pos_spin` is too high — back off toward 3.0.
+4. **Static regression:** still robot must still fire (this knob is spin-only).
+
+### 4g.7 ADAPTIVE FOLLOW — fast on sudden changes + less overshoot (APPLIED 2026-06-25, build OK)
+**User clarification (round 2):** "Don't touch the fire margin — improve the AIM: it
+must follow SUDDEN changes much faster AND overshoot LESS, and make it switchable off."
+(Also confirmed §4g.5#1: the 280–340 s tail was the gimbal deliberately OFF — not a
+bug.) "Switchable" → a new `*_enable` flag; the conservative FIRE gating ("honest but
+quiet") is separately already switchable via `fire_require_impact_inside=false` /
+`asymmetric_fire_enable=false`.
+
+**Why a new mechanism (not a knob):** "follow sudden changes faster" wants light
+velocity damping (hold the lead); "overshoot less" wants heavy damping (kill the lead
+on a stop). No single `alpha_pos` does both — that is the whole §4b↔§4d.9 oscillation
+(1.0 over-led/overshot, 0.99 lags). The fix makes the horizontal-center velocity
+damping **react in one frame to whether the latest measurement still confirms the
+lead**, using the POSITION INNOVATION, not a lagged velocity EMA.
+
+**The signal** (`tracker.cpp::update`, consumed next frame in `ekfPredict`):
+`follow_signal = 1 + (innov · v) / (|v|^2 · dt)` where `innov` is the armor-position
+innovation vs the post-predict prediction. ≈1 while the target advances as the velocity
+predicts (moving), →0 the instant it falls behind the lead (stop), <0 on a reversal.
+`w = clamp(follow_signal, 0, 1)`; `alpha_xy = alpha_stop + w·(alpha_move − alpha_stop)`
+damps only the horizontal center (xc,yc); vertical/yaw unchanged.
+
+**Why the innovation, not the realized-velocity EMA:** I first implemented the EMA of
+the per-frame center displacement — the offline CV-Kalman sim showed it is slightly
+WORSE (the EMA detects the stop ~2 frames late, after the overshoot peak has formed).
+The innovation reacts immediately. Sim (move→stop, faithful 1-D CV-Kalman, q_pos=10,
+40–60 seeds): static `alpha_pos=0.99` → follow lag **54 mm**, peak overshoot **75 mm**;
+innovation-adaptive (`alpha_move=1.0`, `alpha_stop=0.70`) → lag **43 mm**, overshoot
+**60 mm** — BOTH better. Reversal: lag 52→42 mm, overshoot no worse.
+
+**Gated to the NON-SPIN regime** (`!spinning_regime_`): on a 小陀螺 the orbit leak
+co-drives the innovation and the velocity, so the signal would read "moving" on a still
+top — a confirmed spinner keeps the proven `q_pos_spin`/`alpha_pos_spin`/lead-cap path.
+This targets exactly the "we are still, the enemy translates" case the user described.
+
+**Switchable:** `adaptive_follow_enable=false` restores the static `alpha_pos`. Two new
+`/debug_state` fields for offline tuning: `adaptive_follow_w` (1 light … 0 hard) and
+`realized_center_speed`.
+
+**Files:** `tracker.hpp` (config `adaptive_follow_enable`/`alpha_move=1.0`/`alpha_stop
+=0.70`/`realized_ema`; `TrackerDebugInfo`+state `follow_signal_`); `tracker.cpp`
+(`ekfPredict` adaptive `b_xy`; `update()` computes `follow_signal_` + realized-speed
+telemetry; `initFromDetection` seeds them); `autoaim_node.cpp` (declare params + publish
+2 debug fields); `DebugState.msg` (+2 fields); `standard.launch.py` (params). `colcon
+build` OK.
+
+**On-robot validation (REQUIRED):**
+1. **Sudden translation (the case):** a NON-spinning enemy that darts L/R or starts/stops
+   — aim should snap onto it faster and STOP without sailing past. Watch `adaptive_follow_w`
+   (→0 at each stop/reversal) and `state_vxc/vyc` collapsing right after a stop.
+2. **Overshoot:** if it still sails past on a stop, lower `alpha_stop` toward 0.55. If it
+   feels twitchy/under-damped mid-move, raise `alpha_stop` toward 0.85.
+3. **A/B:** flip `adaptive_follow_enable` to compare against the old static behaviour.
+4. **Spinner unaffected:** this is non-spin only; a confirmed spinner must behave exactly
+   as the §4g.4 build (the q_pos_spin change owns that case).
+
 ## 5. Backlog — accuracy & fire-rate upgrades (bullet-economy aware)
 
 Context: **ARC has a ~750-ball cap.** Optimize *hit probability per ball*, not
@@ -1154,6 +1318,29 @@ Also queued (smaller, from the §4 work): **PnP yaw via normal vector** instead 
 | `radius` / `dz` | EKF radius `x(8)` / armor-pair height step |
 | `fire_block_reason` | first failing gate (e.g. `phase_unknown_window_margin`, `spin_window_margin`, `static_facing_margin`, `yaw_unlocked`) |
 
+**Offline-replay fields (WORKLOG §4d):** `det_x_raw/det_y_raw/det_z_raw/det_yaw_raw`
+(selected detection in odom, pre-EKF), `ego_x/ego_y`, `state_xc/state_vxc/state_yc/
+state_vyc/state_vza` (EKF center pos+vel), `spin_centroid_x/y`, `spin_omega`,
+`spin_invalid_streak`.
+
+**Expanded debug surface (WORKLOG §4g — added 2026-06-25 for follow/overshoot/aim work):**
+
+| Field | Meaning |
+|---|---|
+| `adaptive_follow_w` | adaptive-follow weight: 1 = light damping (moving, lead held) … 0 = hard (stop/reversal); 1.0 when off / spinning |
+| `follow_signal_raw` | the un-clamped follow signal: **<0 ⇒ reversal**, ≈0 stop, ≈1 moving, >1 accelerating |
+| `realized_center_speed` | \|EMA of per-frame EKF-center velocity\| [m/s] (telemetry) |
+| `spinning_regime` | regime flag the EKF used this frame (q_yaw/q_pos/yaw-trust; gates adaptive-follow OFF). Distinct from `confirmed_spin` (which gates the AIM) |
+| `aim_target_x/y/z` | odom point the gimbal is actually aiming at (post center-aim/ballistics) |
+| `applied_lead_vx` / `applied_lead_vy` | translational lead **actually folded into the aim** [m/s], AFTER `spin_trans_lead_cap` — compare to `state_vxc/vyc` to see how hard the cap bit |
+| `applied_lead_vyaw` | rotational lead used [rad/s]; **0 when omega-gated** — compare to `vyaw` |
+| `omega_reliable` | was the rotational lead applied (false ⇒ aliased/unconfirmed spin → center-aim only) |
+| `center_aimed` | center-aim engaged (gimbal at the spin-centre facing point, not chasing a face) |
+| `frame_dt` | detection interval [s]; **1/`frame_dt` = live detector Hz** (rate/aliasing diagnostic) |
+| `pipeline_latency` | measured capture→aim latency [s]; horizon = this + `actuation_latency` |
+| `num_target_detections` | target-class plates this frame (**0 ⇒ detector miss**, vs association failure) |
+| `target_generation` | bumps on every track (re)acquire/switch — **spots track resets** that explain discontinuities |
+
 ---
 
 ## 7. Next action — ON-ROBOT VALIDATION (2026-06-23 rework applied, build OK)
@@ -1189,6 +1376,49 @@ If validated, mirror `face_index_switch_penalty` plus the earlier §4 parameters
 into `hero`/`sentry` launches and commit.
 
 ### Reasoning ledger (most recent first)
+- **2026-06-25 (applied, §4g debug-surface expansion)** — User asked for more
+  `/debug_state` variables to debug the follow/overshoot/aim work data-driven. Added 14
+  fields (msg now 127), documented in §6: the LEAD actually applied
+  (`applied_lead_vx/vy/vyaw` — post-cap/post-omega-gate, vs `state_vxc/vyc`/`vyaw` to
+  see how hard the cap/gate bit), the aim point (`aim_target_x/y/z`), the aim-mode
+  decisions (`omega_reliable`, `center_aimed`, `spinning_regime`), the adaptive-follow
+  internals (`follow_signal_raw` <0=reversal), and timing/health (`frame_dt` ⇒ live Hz,
+  `pipeline_latency`, `num_target_detections`, `target_generation` ⇒ track resets).
+  Plumbed via `AimResult` (lead/mode), `TrackerDebugInfo` (regime/signal), and node
+  members (dt/det-count). `colcon build` OK; all 14 verified present in the regenerated
+  msg. Keep recording — these make the next bag analysis self-contained.
+- **2026-06-25 (applied, §4g.7 ADAPTIVE FOLLOW)** — User clarified: don't touch fire,
+  improve the AIM — follow SUDDEN changes much faster AND overshoot LESS, switchable.
+  No single `alpha_pos` does both (1.0 overshoots, 0.99 lags — the §4b↔§4d.9 loop), so
+  added an innovation-gated horizontal-center velocity damping: `follow_signal = 1 +
+  (innov·v)/(|v|²·dt)` (≈1 moving → light `alpha_move=1.0`; →0 stop / <0 reverse → hard
+  `alpha_stop=0.70`), reacting in ONE frame. First tried a realized-velocity EMA — the
+  offline CV-Kalman sim showed it detects the stop too LATE (slightly worse); the
+  innovation reacts immediately: sim move→stop lag **54→43 mm** AND overshoot **75→60
+  mm**. Gated to NON-spin (a spinner's orbit confounds the signal; it keeps
+  `q_pos_spin`). Switch: `adaptive_follow_enable`. New debug fields `adaptive_follow_w`
+  /`realized_center_speed`. The "honest but quiet" FIRE gating is separately switchable
+  via existing `fire_require_impact_inside`/`asymmetric_fire_enable`. `colcon build` OK.
+  **On-robot validation pending** (§4g.7). Confirmed the 280–340 s bag tail was the
+  gimbal deliberately off (not a bug).
+- **2026-06-25 (applied, §4g walked-spinner follow lag)** — Replayed the last bag
+  (`debug_state_20260624_201048`, 15045 msgs / 336 s). It is a fast SPINNING TOP
+  (armor path 50–90 m/10 s, net center ~0) walked across + brought close, NOT a
+  translation test. Measured the "segue lentamente": while WALKED, the EKF center
+  lags the true (orbit-averaged) center by **~66 ms / 16 cm** — a POSITION lag set by
+  `q_pos_spin=2.0` (kept stiff to reject the orbit ghost), NOT a lead deficit (the
+  spin velocity is already bled ~97 %/s + capped 0.30; the observer centroid velocity
+  is confirmed garbage). Fix: **`q_pos_spin` 2.0 → 4.0** — doubles center
+  responsiveness (lag → ~9 cm) while staying ≪ non-spin q_pos=10 (still rejects the
+  orbit) and adding NO overshoot (velocity bleed + cap unchanged) and NO lock risk
+  (center wobble ~2 mrad ≪ tol). `colcon build` OK. **On-robot validation pending**
+  (§4g.6). Bag problems reported (§4g.5): the last 60 s is a PARKED GIMBAL (correct
+  command, frozen `micro_yaw` 18° off → not a code bug, but pollutes the stats); LOCK
+  is the fire bottleneck (`aim_fire` 46 % vs `cmd_fire` 17 %, tight 27 mrad far-range
+  lock vs ~30 mrad aliased-spin jitter) — framerate-bound (§4f.A); the top is aliased
+  at 44 Hz so the rotational lead is correctly off; impact/facing gates correctly
+  refuse off-plate shots. Net: the deeper fire-rate lever remains detector FPS, not
+  tracker tuning.
 - **2026-06-24 (applied, §4f NYQUIST CEILING + observability rework)** — §4e on robot
   fixed the wheel-shot (off-plate 174→5) but exposed the real wall. Bag `…193721`:
   raw detection is excellent (4 mm still / 0.6 px reproj) but a SPINNING enemy moves

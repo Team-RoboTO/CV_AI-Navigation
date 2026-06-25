@@ -107,6 +107,19 @@ struct AimResult
   bool   impact_inside   = false;
   double impact_lateral  = 0.0;  // [m] horizontal miss of impact vs plate centre
   double impact_vertical = 0.0;  // [m] vertical   miss of impact vs plate centre
+
+  // ── Aim / lead telemetry (WORKLOG §4g debug surface) ──
+  // The LEAD actually folded into the aim this frame, AFTER the spin lead cap and
+  // the observability gate — so a bag shows exactly how much we led and in which
+  // mode. applied_lead_v{x,y}: translational lead velocity used [m/s] (= x_aim
+  // velocity, capped while spinning). applied_lead_vyaw: rotational lead used
+  // [rad/s] (0 when omega-gated). omega_reliable: was the rotational lead applied.
+  // center_aimed: did center-aim engage (point at the spin-centre facing point).
+  double applied_lead_vx   = 0.0;
+  double applied_lead_vy   = 0.0;
+  double applied_lead_vyaw = 0.0;
+  bool   omega_reliable    = false;
+  bool   center_aimed      = false;
 };
 
 struct FacePrediction
@@ -159,6 +172,17 @@ struct TrackerDebugInfo
   double spin_centroid_y = 0.0;
   double spin_omega = 0.0;
   int spin_invalid_streak = 0;
+
+  // Adaptive-follow telemetry (WORKLOG §4g). follow_w: 1 = light damping (target
+  // moving, lead held) … 0 = hard damping (stop/reversal, lead killed). 1.0 when
+  // the feature is off or in the spin regime. follow_signal_raw: the un-clamped
+  // signal (<0 ⇒ reversal, >1 ⇒ accelerating). realized_center_speed: |EMA of the
+  // per-frame EKF-center velocity| [m/s]. spinning_regime: the regime flag the EKF
+  // used this frame (drives q_yaw/q_pos/yaw-trust and gates the adaptive follow).
+  double adaptive_follow_w = 1.0;
+  double follow_signal_raw = 1.0;
+  double realized_center_speed = 0.0;
+  bool   spinning_regime = false;
 };
 
 // ── All config in one struct ──
@@ -234,7 +258,16 @@ struct TrackerConfig
   // converge to the orbit's true mean. A genuinely translating spinner still
   // follows (slowly) — and under-leading is far cheaper on balls than the
   // overshoot. Set *_spin equal to the static values to disable the adaptation.
-  double q_pos_spin    = 2.0;   // [(m/s^2)^2] stiff center while spinning (2.0: stiff but still follows a slow translating spinner; the erratic 0.8↔10 swing is gone now the regime is sticky)
+  // q_pos_spin 2.0 → 4.0 (WORKLOG §4g): bag …201048 showed the EKF CENTER lags the
+  // true (orbit-averaged) center by ~66 ms / 16 cm while a spinner is WALKED across
+  // — the "segue lentamente" the user reports. It is a POSITION-tracking lag set by
+  // this stiffness, NOT a lead problem (the spin velocity is already bled ~97%/s by
+  // alpha_pos_spin and hard-capped by spin_trans_lead_cap=0.30, so raising it does
+  // not add overshoot). 4.0 ≈ doubles the center responsiveness (lag → ~9 cm) while
+  // staying well under the non-spin q_pos=10, so the center still rejects the orbit
+  // (still-spinner center wobble ≈0.07→~0.10 m/s ⇒ ~2 mrad aim wobble ≪ lock tol).
+  // Push toward 6.0 if a walked spinner still lags AND the gimbal keeps lock.
+  double q_pos_spin    = 4.0;   // [(m/s^2)^2] center stiffness while spinning
   double alpha_pos_spin = 0.93; // velocity damping while spinning
 
   // ── OBSERVABILITY-GATED LEAD + CENTER-AIM STICKINESS (WORKLOG §4f) ──
@@ -257,6 +290,34 @@ struct TrackerConfig
   // (each flip is a ~90° gimbal jump that breaks lock — bag: 62% of >80 mrad
   // command jumps coincide with a regime toggle). WORKLOG §4f (Radice 1).
   int    center_aim_hold_frames = 8;
+
+  // ── ADAPTIVE FOLLOW (WORKLOG §4g) — switchable maneuver-tracking damping ──
+  // The user wants the aim to follow SUDDEN changes much faster AND overshoot
+  // LESS. A single fixed velocity damping (alpha_pos) cannot do both: light
+  // damping holds the lead (fast follow) but overshoots on a stop; heavy damping
+  // kills overshoot but lags a mover. The fix makes the HORIZONTAL-center velocity
+  // damping react, in ONE frame, to whether the latest measurement is still
+  // confirming the lead. The signal is the POSITION INNOVATION projected on the
+  // velocity, normalised by the expected per-frame advance |v|·dt:
+  //     follow_signal = 1 + (innov · v̂) / (|v|·dt)
+  //   ≈ 1  while the target advances as the velocity predicts (sustained motion /
+  //        a maneuver) → damp LIGHTLY (alpha_move≈1.0): hold the lead, follow fast;
+  //   → 0  the instant the measurement falls BEHIND the lead (the target stopped) →
+  //        damp HARD (alpha_stop≈0.70): the velocity/lead collapses in 1–2 frames;
+  //   < 0  on a REVERSAL → clamped to 0 (hard damp), so the stale-direction lead is
+  //        killed at once and the EKF rebuilds the new direction.
+  // The innovation reacts immediately (a lagged realized-velocity EMA detects the
+  // stop too late — the overshoot peak has already formed). Offline 1-D CV-Kalman
+  // sim (move→stop): follow lag 54→43 mm AND peak overshoot 75→60 mm vs static
+  // alpha_pos=0.99. Gated to the NON-SPIN regime: a 小陀螺's orbit leak co-drives
+  // the innovation and the velocity, which reads as "moving" on a still top — a
+  // confirmed spinner keeps the proven q_pos_spin/alpha_pos_spin path. Targets the
+  // "we are still, the enemy translates" case. Switchable: set
+  // adaptive_follow_enable=false to restore the static alpha_pos behaviour.
+  bool   adaptive_follow_enable       = true;
+  double adaptive_follow_alpha_move   = 1.00;  // light damping while the lead is confirmed (responsive follow)
+  double adaptive_follow_alpha_stop   = 0.70;  // hard damping the moment the target stops/reverses (anti-overshoot)
+  double adaptive_follow_realized_ema = 0.50;  // EMA factor for the realized-center-speed TELEMETRY only
 
   // Velocity damping: v *= alpha each frame (at ref_freq Hz).
   // alpha_yaw should be 1.0 (NO spin damping): a 小陀螺 spins at a roughly
@@ -762,6 +823,19 @@ private:
   bool   spin_reseed_done_ = false;
   // Consecutive invalid-observer frames, for the spin-hold grace.
   int    spin_invalid_streak_ = 0;
+
+  // ── Adaptive-follow state (WORKLOG §4g) ──
+  // follow_signal_ is the innovation-vs-lead signal (≈1 moving, →0 stopping,
+  // <0 reversing) computed at the END of the previous update() and consumed by the
+  // next ekfPredict() — a 1-frame-delayed but immediate stop/reversal detector.
+  // The prev_center_/realized_*_ema_ fields drive only the realized-center-speed
+  // telemetry (DebugState), not the damping.
+  double follow_signal_ = 1.0;
+  bool   prev_center_valid_ = false;
+  double prev_center_x_ = 0.0;
+  double prev_center_y_ = 0.0;
+  double realized_vx_ema_ = 0.0;
+  double realized_vy_ema_ = 0.0;
 };
 
 }  // namespace autoaim
