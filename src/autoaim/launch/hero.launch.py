@@ -23,7 +23,7 @@ def autoaim_params():
         # True: read our team color from /micro_status[target_color_status_index]
         #       and pick the enemy class automatically via micro_color_target_classes.
         # False: always shoot the fixed class list in target_classes below.
-        {"target_classes_from_micro_status": False},  # ON/OFF auto color from micro
+        {"target_classes_from_micro_status": True},  # ON/OFF auto color from micro
 
         # micro_color_target_classes[i] = YOLO class to shoot when micro sends i.
         #   i=0 (we are red)  -> shoot blue -> "0"
@@ -74,7 +74,7 @@ def autoaim_params():
 
         {"bullet_speed": 25.0},
         {"gravity": 9.8},
-        {"gimbal_height": 0.420},
+        {"gimbal_height": 0.570},
 
         # MEASURE FROM THE ACTIVE LENS, NOT THE HOUSING CENTER — and note this
         # is a ZED X MINI: stereo baseline 50 mm, so the lens is only ~2.5 cm
@@ -88,14 +88,14 @@ def autoaim_params():
         #   barrel_offset_z = (muzzle height) - (lens height) [m]
         #                     Sentry-calibrated shared value: camera above barrel.
         {"barrel_offset_x": 0.0},
-        {"barrel_offset_y": 0.02},     # <- MEASURE (lens-cover trick, see INSTRUCTIONS.md)
+        {"barrel_offset_y": 0.0},     # <- MEASURE (lens-cover trick, see INSTRUCTIONS.md)
         {"barrel_offset_z": -0.05},
 
         # 1.0 rad @ ref 1 m -> ~0.33 rad window at 3 m: OK for tuning, loose for
         # a match. Against a fast spinner, timed shots need ~0.10-0.18 rad with
         # window_ref_dist ~3.0. Tighten once the static calibration is done.
-        {"angular_window": 1.0},
-        {"window_ref_dist": 1.0},
+        {"angular_window": 0.10},
+        {"window_ref_dist": 3.0},
         {"min_fire_dist": 0.2},
         {"max_fire_dist": 6.0},
 
@@ -109,7 +109,7 @@ def autoaim_params():
         # muzzle exit (calibrate: shoot a mover, adjust in 5 ms steps; the node
         # logs the measured pipeline part every 2 s).
         {"use_measured_latency": True},
-        {"actuation_latency": 0.020},
+        {"actuation_latency": 0.040},
         # Fallback fixed bias, used ONLY if use_measured_latency is False.
         {"time_bias": 0.045},
 
@@ -133,8 +133,8 @@ def autoaim_params():
         {"cmd_deadband_pitch": 0.005},
         {"cmd_rate_limit_yaw": 0.0},
         {"cmd_rate_limit_pitch": 0.0},
-        {"fire_lock_yaw": 0.05},
-        {"fire_lock_pitch": 0.04},
+        {"fire_lock_yaw": 0.035},
+        {"fire_lock_pitch": 0.030},
 
         # ⚠ THESE TWO MUST BE EQUAL. Both describe the same physical fact —
         # whether the micro's pitch FEEDBACK has the opposite sign of its pitch
@@ -179,8 +179,8 @@ def generate_launch_description():
     serial_port = LaunchConfiguration("serial_port")
 
     serial_params = [
-        {"shooting_active": False},
-        {"rotating_chassis": False},
+        {"shooting_active": True},
+        {"rotating_chassis": True},
 
         {"serial_port": serial_port},
         {"serial_baudrate": 500000},
