@@ -72,7 +72,7 @@ def autoaim_params():
         {"radius_ema_alpha": 0.05},
         {"initial_dz": 0.05},
 
-        {"bullet_speed": 25.0},
+        {"bullet_speed": 11.5},
         {"gravity": 9.8},
         {"gimbal_height": 0.570},
 
