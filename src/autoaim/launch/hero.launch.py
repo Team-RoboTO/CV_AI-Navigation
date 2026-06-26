@@ -54,6 +54,10 @@ def autoaim_params():
         # measurement noise -> jittery commands -> fire-lock dropouts.
         # Start lower; raise again only if tracking feels sluggish AFTER the fix.
         {"q_pos": 100.0},
+        # q_z DECOUPLED from q_pos: the height channel must NOT inherit the big
+        # q_pos used to chase movers, or PnP z-jitter becomes phantom vertical
+        # velocity and the pitch oscillates. Keep small.
+        {"q_z": 2.0},
         {"q_yaw": 20.0},
         {"q_r": 1e-6},
         {"r_pos_base": 0.05},
@@ -98,6 +102,10 @@ def autoaim_params():
         {"window_ref_dist": 3.0},
         {"min_fire_dist": 0.2},
         {"max_fire_dist": 6.0},
+        # Obliquity fire gate, range-independent. 0.0 = OFF (current behavior).
+        # Set ~0.6 to stop firing on foreshortened plates during slow spin
+        # (the main cause of low hit-rate there). vis = cos(angle-off-frontal).
+        {"fire_min_vis": 0.0},
 
         # 0.005 is essentially ZERO latency compensation. It must cover the FULL
         # capture->muzzle latency (capture+inference+transport+serial+gimbal),
@@ -129,6 +137,10 @@ def autoaim_params():
         {"same_target_identity_dist": 1.0},
 
         {"cmd_smooth_alpha": 1.00},
+        # YAW stays at 1.0 (snappy, no lag for movers). PITCH can be smoothed
+        # independently: lower toward ~0.6 ONLY if pitch is still nervous after
+        # q_z + rate-limit + deadband. 1.0 = no smoothing (no added lag).
+        {"cmd_smooth_alpha_pitch": 1.0},
         {"cmd_deadband_yaw": 0.005},
         {"cmd_deadband_pitch": 0.005},
         {"cmd_rate_limit_yaw": 0.0},

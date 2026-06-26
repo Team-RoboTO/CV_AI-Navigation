@@ -238,10 +238,9 @@ def generate_launch_description():
         {"serial_tx_hz": 100.0},
         {"serial_reconnect_interval": 2.0},
         {"serial_rx_timeout": 3.0},
-        # Standard has no turret_yaw_mux/navigation pipeline in this launch.
-        # Feed autoaim directly into the bridge's turret-command slot and force
-        # nav TX fields to zero from launch params, without special bridge code.
-        {"turret_cmd_topic": "/cmd_vel_AI"},
+        # Sentry routes autoaim through turret_yaw_mux so navigation can provide
+        # idle aiming when CV is lost.
+        {"turret_cmd_topic": "/turret/cmd"},
         {"nav_cmd_topic": "/cmd_vel_NAV"},
         {"micro_status_topic": "/micro_status"},
         {"enable_nav_pipeline": True},
