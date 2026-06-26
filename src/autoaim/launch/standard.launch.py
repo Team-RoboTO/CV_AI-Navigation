@@ -54,6 +54,10 @@ def autoaim_params():
         # measurement noise -> jittery commands -> fire-lock dropouts.
         # Start lower; raise again only if tracking feels sluggish AFTER the fix.
         {"q_pos": 100.0},
+        # q_z DECOUPLED from q_pos: the height channel must NOT inherit the big
+        # q_pos used to chase movers, or PnP z-jitter becomes phantom vertical
+        # velocity and the pitch oscillates. Keep small.
+        {"q_z": 2.0},
         {"q_yaw": 20.0},
         {"q_r": 1e-6},
         {"r_pos_base": 0.05},
@@ -64,7 +68,7 @@ def autoaim_params():
 
         # 0.98 at ~100 Hz decays the velocity estimate to ~13%/s — a constant
         # drag that under-leads translating targets. Let q_pos handle the noise.
-        {"alpha_pos": 0.995},
+        {"alpha_pos": 0.999},
         {"alpha_yaw": 1.00},
         {"alpha_coast": 0.98},
 
@@ -98,6 +102,10 @@ def autoaim_params():
         {"window_ref_dist": 1.0},
         {"min_fire_dist": 0.2},
         {"max_fire_dist": 6.0},
+        # Obliquity fire gate, range-independent. 0.0 = OFF (current behavior).
+        # Set ~0.6 to stop firing on foreshortened plates during slow spin
+        # (the main cause of low hit-rate there). vis = cos(angle-off-frontal).
+        {"fire_min_vis": 0.0},
 
         # 0.005 is essentially ZERO latency compensation. It must cover the FULL
         # capture->muzzle latency (capture+inference+transport+serial+gimbal),
@@ -129,10 +137,17 @@ def autoaim_params():
         {"same_target_identity_dist": 1.0},
 
         {"cmd_smooth_alpha": 1.00},
+        # YAW stays at 1.0 (snappy, no lag for movers). PITCH can be smoothed
+        # independently: lower toward ~0.6 ONLY if pitch is still nervous after
+        # q_z + rate-limit + deadband. 1.0 = no smoothing (no added lag).
+        {"cmd_smooth_alpha_pitch": 1.0},
         {"cmd_deadband_yaw": 0.005},
-        {"cmd_deadband_pitch": 0.005},
+        {"cmd_deadband_pitch": 0.01},
         {"cmd_rate_limit_yaw": 0.0},
-        {"cmd_rate_limit_pitch": 0.0},
+        # Pitch rate limit: ~2.0 rad/s (~114 deg/s). Real plate-height changes
+        # are far slower than this, so it removes jitter without adding lag.
+        # YAW stays 0.0 (unlimited) so fast movers are tracked snappily.
+        {"cmd_rate_limit_pitch": 2.0},
         {"fire_lock_yaw": 0.05},
         {"fire_lock_pitch": 0.04},
 

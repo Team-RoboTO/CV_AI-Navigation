@@ -67,7 +67,13 @@ struct TrackerConfig
   double lost_timeout      = 0.4;   // seconds before TEMP_LOST → LOST
 
   // EKF process noise (higher = trust measurements more, respond faster)
-  double q_pos             = 5.0;
+  double q_pos             = 5.0;   // x/y center channels — keep HIGH for lead on movers
+  // Height (za, vza) channel process noise, DECOUPLED from q_pos.
+  // A plate does not physically rise/fall, so vertical velocity should stay ~0.
+  // If z shares the large q_pos used to chase translating targets, every PnP
+  // z-jitter is read as real vertical velocity and extrapolated forward
+  // (za + vza*pred_t) → the pitch command oscillates. Keep this small.
+  double q_z               = 2.0;
   double q_yaw             = 10.0;
   double q_r               = 1e-6;
 
@@ -125,6 +131,14 @@ struct TrackerConfig
   double window_ref_dist   = 3.0;
   double min_fire_dist     = 0.3;
   double max_fire_dist     = 6.0;
+  // Minimum plate "face-on-ness" required to fire, range-independent.
+  // vis = cos(obliquity): 1.0 = perfectly frontal, 0.0 = edge-on.
+  //   0.0  → disabled (legacy behavior: angular_window alone decides).
+  //   0.6  → only fire when the plate is within ~53° of frontal.
+  //   0.75 → within ~41° (recommended once static calibration is done).
+  // This is the clean way to stop shooting at foreshortened plates during
+  // slow spin, where angular_window (which scales with 1/range) gets very wide.
+  double fire_min_vis      = 0.0;
 
   // Timing
   // ── PREDICTION HORIZON (measured-latency split) ──
@@ -318,8 +332,18 @@ private:
 
   double radius_ = 0.24;
   double other_radius_ = 0.28;
-  double dz_ = 0.0;
-  bool dz_initialized_ = false;
+  // ── Adaptive inter-pair height step ──
+  // dz_ is the SIGNED height of the *other* plate pair relative to the pair
+  // currently visible, used only to predict unseen faces in 4-face mode.
+  // It is (re)derived every 90° face jump as: dz_ = sign(raw_step) * dz_step_mag_,
+  // where dz_step_mag_ is an EMA of the |height step| magnitude and the sign comes
+  // straight from the measurement (which alternates naturally as pairs swap).
+  // Co-planar robots collapse dz_step_mag_ to 0 (latched by dz_flat_), so the
+  // pitch stops wobbling; staggered robots learn the real step within ~1 jump.
+  double dz_           = 0.0;   // signed offset applied to the alternate pair [m]
+  double dz_step_mag_  = 0.0;   // learned |height step| between pairs, >= 0 [m]
+  int    dz_jump_count_ = 0;    // 90° jumps seen for the current target
+  bool   dz_flat_      = false; // latched: this robot has same-height plates
   double last_yaw_ = 0.0;
   std::string target_id_;
 
