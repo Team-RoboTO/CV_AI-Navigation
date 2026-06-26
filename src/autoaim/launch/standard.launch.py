@@ -76,9 +76,14 @@ def autoaim_params():
         # leaks into the CENTER velocity (phantom |v| up to 1 m/s in bag …190343),
         # which both wobbles the center-aim and over-leads a slow translating
         # target (the left-right overshoot). Lower q_pos calms the center velocity.
-        {"q_pos": 10.0},
+        {"q_pos": 15.0},
         {"q_yaw": 7.0},
         {"q_r": 1e-6},
+        # q_z DECOUPLED from q_pos (WORKLOG §4h). q_pos=10 was also driving the z
+        # channel → PnP z-noise became phantom vertical velocity → nervous pitch.
+        # A plate's height doesn't change, so keep z calm with a small q_z while
+        # q_pos stays high for the horizontal lead.
+        {"q_z": 2.0},
         # Position measurement noise is ANISOTROPIC (WORKLOG §4b):
         #   r_pos_*      = RADIAL (depth / along line of sight) — PnP's weak axis,
         #                  large and range-growing.
@@ -114,7 +119,29 @@ def autoaim_params():
         {"initial_radius": 0.24},
         {"radius_ema_alpha": 0.05},
         {"initial_dz": 0.0},
+        # ADAPTIVE height step (WORKLOG §4h/§4i): learn a STAGGERED enemy's armor
+        # height step so the pitch hits the raised plate too. DISABLED after the
+        # bag …191123 audit (WORKLOG §4i.7): that enemy is FLAT (height residual is
+        # unimodal, std 3.9 cm, NO second mode), and the only real vertical signal is
+        # a RANGE-COUPLED projection bias (apparent height +38 cm per metre of range,
+        # corr 0.87 ≈ a ~20° camera-pitch/extrinsic error). dz was therefore fitting
+        # a calibration artefact and swinging the FULL ±0.12 clamp (sign-flipping)
+        # → it ADDED up to 12 cm of vertical aim error. Re-enable ONLY after the
+        # camera→odom pitch calibration is fixed AND you actually face a staggered
+        # enemy. The fast/decoupled estimator + mean-aim + fire gate stay in the code,
+        # gated by this flag.
         {"adapt_dz_enable": False},
+        {"dz_max": 0.12},            # [m] physical clamp on the learned step
+        {"dz_flat_threshold": 0.015}, # [m] below this -> flat robot (dz=0)
+        # FAST height calibration (WORKLOG §4i): the step converges in a few
+        # odd-face samples (sample-counted EMA) instead of ~20, so the pitch stops
+        # shooting too high on low / too low on high plates for seconds. Center-aim
+        # points the pitch at the MEAN of the two armor heights (steady, no high/low
+        # jitter per handoff) and holds fire until the step is confidently learned.
+        {"dz_ema_alpha": 0.20},          # steady EMA rate after the fast-start samples
+        {"dz_confident_count": 3},       # odd-face samples before dz is trusted / fire allowed
+        {"center_aim_mean_height": True},   # center-aim pitch = centre + dz/2 (mean of both plates)
+        {"fire_require_dz_confident": True},  # no center-aim shot until height calibrated
 
         {"bullet_speed": 25.0},
         {"gravity": 9.8},
@@ -182,7 +209,7 @@ def autoaim_params():
         #   on a spinner. Calibrate on a mover in 5 ms steps; the node logs the
         #   measured pipeline part every 2 s.
         {"use_measured_latency": True},
-        {"actuation_latency": 0.060},
+        {"actuation_latency": 0.040},
         # LEGACY fallback fixed horizon, used ONLY if use_measured_latency=False.
         # Then it must cover the FULL capture→muzzle latency (40-80 ms typical).
         {"LEGACY_time_bias": 0.045},
@@ -224,6 +251,11 @@ def autoaim_params():
         {"switch_range_ratio": 0.85},
         {"switch_cooldown": 10},
         {"same_target_identity_dist": 1.0},
+        # FAST RE-ACQUIRE while coasting (WORKLOG §4i): if the tracked robot moves /
+        # vanishes and a spatially-distinct enemy is visible while we are TEMP_LOST,
+        # switch to it immediately instead of aiming at the stale coasted position
+        # for the rest of lost_timeout (~1 s). Set False to keep the old coast.
+        {"temp_lost_fast_reacquire": True},
 
         # ───────────────────────────────────────────────────────────────────
         # SPIN-BOOTSTRAP REWORK + GEOMETRIC FIRE GATE (WORKLOG §4d)
@@ -281,7 +313,11 @@ def autoaim_params():
         # still ≪ non-spin q_pos=10 so the orbit is still rejected (still-spinner
         # center wobble ≈0.07→0.10 m/s ⇒ ~2 mrad ≪ lock tol). If a walked spinner
         # still lags and lock holds, push toward 6.0.
-        {"q_pos_spin": 4.0},
+        # §4i (still "too slow to follow a moving enemy"): 4.0 → 6.0. With the
+        # phantom orbit velocity now well suppressed, this tightens the walked-spinner
+        # center-follow further (lag → ~6 cm); pair with the higher lead cap below.
+        # Drop back toward 4.0 if a still spinner starts to wobble / lose lock.
+        {"q_pos_spin": 7.0},
         {"alpha_pos_spin": 0.93},
         # ── ADAPTIVE FOLLOW (WORKLOG §4g) — switchable, NON-spin (translating)
         # target. Goal: follow SUDDEN changes much faster AND overshoot LESS — a
@@ -309,7 +345,11 @@ def autoaim_params():
         # center_aim_hold_frames: keeps center-aim through brief regime dropouts so
         # the aim doesn't flip 90° (the dominant lock-breaker).
         {"omega_reliable_max": 15.0},     # [rad/s] ≈143 rpm; above = no rotational lead
-        {"spin_trans_lead_cap": 0.30},    # [m/s] max center speed led into the aim while spinning
+        # §4i: 0.30 → 0.45. With q_pos_spin=6 suppressing the orbit phantom, the EKF
+        # center velocity is mostly REAL translation now, so the old tight cap was
+        # clipping genuine walk-follow. 0.45 lets a walking spinner be led properly;
+        # lower toward 0.30 if a stopping spinner overshoots L/R.
+        {"spin_trans_lead_cap": 0.45},    # [m/s] max center speed led into the aim while spinning
         {"center_aim_hold_frames": 8},
         # Asymmetric geometric fire gate — the ELIGIBILITY pre-filter (is the plate
         # square enough to be worth a shot). Generous while the plate rotates INTO
@@ -336,9 +376,13 @@ def autoaim_params():
 
         {"cmd_smooth_alpha": 1.00},
         {"cmd_deadband_yaw": 0.005},
-        {"cmd_deadband_pitch": 0.005},
+        # PITCH anti-jitter (WORKLOG §4h). The real pitch changes slowly, so a
+        # rate-limit (≈114°/s) and a slightly wider deadband kill the residual
+        # vertical jitter without adding lag. YAW stays raw (0.0 rate-limit) — a
+        # tight yaw limit would make cmd≈servo and report "locked" while off-target.
+        {"cmd_deadband_pitch": 0.01},
         {"cmd_rate_limit_yaw": 0.0},
-        {"cmd_rate_limit_pitch": 0.0},
+        {"cmd_rate_limit_pitch": 2.0},
         {"fire_lock_yaw": 0.05},
         {"fire_lock_pitch": 0.04},
         {"fire_lock_k_yaw": 0.0675},
@@ -384,8 +428,8 @@ def generate_launch_description():
     serial_port = LaunchConfiguration("serial_port")
 
     serial_params = [
-        {"shooting_active": False},
-        {"rotating_chassis": False},
+        {"shooting_active": True},
+        {"rotating_chassis": True},
 
         {"serial_port": serial_port},
         {"serial_baudrate": 500000},

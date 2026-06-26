@@ -127,10 +127,12 @@ void Tracker::ekfPredict(double dt)
   // tracks it instead of smoothing it away (the log3/bag failure). WORKLOG §4d.
   const double q_yaw_eff = spinning_regime_ ? cfg_.q_yaw_spin : cfg_.q_yaw;
   // While spinning, a small q_pos_spin keeps the horizontal CENTER stiff so the
-  // EKF stops chasing the orbiting armor (phantom velocity). The vertical channel
-  // (block 4) keeps the normal q_pos — z is not orbit-contaminated. WORKLOG §4e.
+  // EKF stops chasing the orbiting armor (phantom velocity). WORKLOG §4e.
   const double q_pos_eff = spinning_regime_ ? cfg_.q_pos_spin : cfg_.q_pos;
-  block(0, q_pos_eff); block(2, q_pos_eff); block(4, cfg_.q_pos);
+  // Vertical channel uses the DECOUPLED q_z (small): a plate's height does not
+  // change, so this stops PnP z-noise becoming phantom vertical velocity → the
+  // nervous pitch. Horizontal lead is unaffected (still q_pos_eff). WORKLOG §4h.
+  block(0, q_pos_eff); block(2, q_pos_eff); block(4, cfg_.q_z);
   block(6, q_yaw_eff);
   Q(8,8) = std::pow(t,4)/4 * cfg_.q_r;
 
@@ -138,9 +140,11 @@ void Tracker::ekfPredict(double dt)
   P_ = F * P_ * F.transpose() + Q;
   P_ = (P_ + P_.transpose()) * 0.5;
 
-  // Clamp covariance (prevents explosion during TEMP_LOST)
+  // Clamp covariance (prevents explosion during TEMP_LOST). Index 5 (vza) lowered
+  // 2.0 → 0.3 to match the decoupled q_z: a plate barely moves vertically, so cap
+  // the vertical velocity variance hard — no more 1.4 m/s phantom vza. WORKLOG §4h.
   Eigen::VectorXd mc(9);
-  mc << 1.0, 10.0, 1.0, 10.0, 1.0, 2.0, 1.0, 30.0, 0.01;
+  mc << 1.0, 10.0, 1.0, 10.0, 1.0, 0.3, 1.0, 30.0, 0.01;
   for (int i = 0; i < 9; i++) {
     if (P_(i,i) > mc(i)) {
       double s = std::sqrt(mc(i) / std::max(P_(i,i), 1e-10));
@@ -487,6 +491,12 @@ void Tracker::initFromDetection(const ArmorDetection & det)
   radius_ = r;  other_radius_ = r;
   dz_ = cfg_.initial_dz;
   dz_initialized_ = std::abs(dz_) > 1e-6;
+  // Re-learn the height step per target. Until both parities are seen enough,
+  // center-aim hedges to the mean height and (optionally) holds fire. WORKLOG §4i.
+  dz_sample_count_ = 0;
+  dz_confident_ = !cfg_.adapt_dz_enable;  // if adaptation is off, nothing to wait for
+  z_even_count_ = 0;  z_even_ema_ = 0.0;
+  z_odd_count_  = 0;  z_odd_ema_  = 0.0;
   x_ = Eigen::VectorXd::Zero(9);
   x_ << det.x+r*cos(yaw), 0, det.y+r*sin(yaw), 0, det.z, 0, yaw, 0, r;
   P_ = P0_;
@@ -592,6 +602,15 @@ bool Tracker::shouldSwitch(const ArmorDetection & candidate) const
     double new_range = candidate.range();
     return new_range < cur_range * cfg_.switch_range_ratio;
   }
+
+  // TEMP_LOST: we are COASTING — not actually seeing the tracked target, the aim
+  // sits on a predicted (possibly stale) position. A spatially-DISTINCT fresh
+  // detection (we already failed the identity test above) means our robot moved or
+  // vanished and a different one is visible: re-acquire it NOW instead of staying
+  // stale for the rest of lost_timeout (the "takes seconds to notice it moved"
+  // bug). The range ratio is dropped here because the coasted range is unreliable.
+  // WORKLOG §4i.
+  if (state_ == TEMP_LOST && cfg_.temp_lost_fast_reacquire) return true;
 
   // TRACKING / TEMP_LOST: cooldown must elapse, and new target must be much closer.
   if (state_ == TRACKING && switch_cooldown_counter_ > 0) return false;
@@ -940,14 +959,38 @@ void Tracker::updateRadiusFromAssociation(
       (1.0 - cfg_.radius_ema_alpha) * other_radius_ + cfg_.radius_ema_alpha * rm;
   }
 
-  if (cfg_.adapt_dz_enable && face.idx % 2 == 1) {
-    const double measured_dz = det.z - x_(4);
-    if (std::abs(measured_dz) < 0.20) {
-      if (!dz_initialized_) {
-        dz_ = measured_dz;
-        dz_initialized_ = true;
-      } else {
-        dz_ = 0.95 * dz_ + 0.05 * measured_dz;
+  // ── ADAPTIVE HEIGHT STEP (WORKLOG §4h + §4i.2) ──
+  // Learn the armor-pair height step dz UNBIASED, by differencing two DIRECT
+  // per-parity height EMAs (H_odd − H_even) instead of det.z − x_(4). The EKF
+  // centre x_(4) averages BOTH parities on a spinner (→ centre + dz/2), so the old
+  // det.z − x_(4) under-shot dz and converged slowly through the dz↔x_(4) feedback
+  // loop. Direct differencing is unbiased and settles as soon as both EMAs do.
+  // Each EMA uses a sample-counted rate (a = max(dz_ema_alpha, 1/n)) so the first
+  // sightings move it fast, then it settles. `oblique`/bad-rm frames are already
+  // filtered out above, so only trustworthy heights reach here.
+  if (cfg_.adapt_dz_enable) {
+    const bool even = (face.idx % 2 == 0);
+    double & h = even ? z_even_ema_ : z_odd_ema_;
+    int    & n = even ? z_even_count_ : z_odd_count_;
+    ++n;
+    const double ah = std::max(cfg_.dz_ema_alpha, 1.0 / static_cast<double>(n));
+    h = (n == 1) ? det.z : (1.0 - ah) * h + ah * det.z;
+
+    // dz is meaningful only once BOTH parities have been observed (otherwise a
+    // single-parity target's height is carried by x_(4) and best.z is already
+    // right — no step needed). When both are seen, dz = H_odd − H_even directly.
+    if (z_even_count_ > 0 && z_odd_count_ > 0) {
+      double measured_dz =
+        std::clamp(z_odd_ema_ - z_even_ema_, -cfg_.dz_max, cfg_.dz_max);
+      // Flat-collapse: a real RoboMaster step is ~0 (flat) or ~5 cm+ (staggered),
+      // never ~1 cm, so snap tiny estimates to exactly 0 to keep flat robots flat.
+      dz_ = (std::abs(measured_dz) < cfg_.dz_flat_threshold) ? 0.0 : measured_dz;
+      dz_initialized_ = true;
+      // Confidence: both parities seen enough times (so the step is real, not a
+      // one-shot). Gates center-aim fire and the mean-height aim. WORKLOG §4i.
+      dz_sample_count_ = std::min(z_even_count_, z_odd_count_);
+      if (dz_sample_count_ >= cfg_.dz_confident_count) {
+        dz_confident_ = true;
       }
     }
   }
@@ -1769,7 +1812,24 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
     const double r_face = std::clamp(x_(8), 0.10, 0.40);
     const double fpx = cxi - r_face * std::cos(bc);
     const double fpy = cyi - r_face * std::sin(bc);
-    const double fpz = czi;  // dz=0 model: armor ring at center height
+    // HEIGHT to aim the pitch at. On a STAGGERED spinner the plate sweeping through
+    // the facing point alternates between centre (even faces) and centre+dz (odd):
+    // chasing the selected face's height (best.z) made the pitch jitter up/down each
+    // handoff and shoot the wrong height mid-transition. Instead point the pitch at
+    // the MEAN of the two plate heights (centre + dz/2) — one steady command that
+    // keeps BOTH plates within plate_half_height (worst-case vertical miss halved to
+    // dz/2). Flat robot: dz≈0 ⇒ mean = centre ⇒ unchanged. WORKLOG §4i.
+    // (center_aim_mean_height=false restores the §4h per-face best.z behaviour.)
+    double fpz = best.valid ? best.z : czi;
+    if (cfg_.center_aim_mean_height && cfg_.adapt_dz_enable) {
+      // Prefer the DIRECT mean of the two measured per-parity heights (unbiased and
+      // transient-robust, WORKLOG §4i.2); fall back to czi + dz/2 before both
+      // parities are seen. A robot's height is ~constant in odom, so no vertical
+      // lead is needed; the EMAs already track it live.
+      fpz = (z_even_count_ > 0 && z_odd_count_ > 0)
+              ? 0.5 * (z_even_ema_ + z_odd_ema_)
+              : czi + 0.5 * dz_;
+    }
     const double gd = std::hypot(fpx - bxf, fpy - byf);
     const auto bal = solveBallistic(gd, fpz - barrel_z);
     if (bal.valid) {
@@ -1899,12 +1959,24 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
   aim.omega_reliable    = omega_reliable;
   aim.center_aimed      = center_aimed;
 
+  // ── HEIGHT-CALIBRATION fire gate (WORKLOG §4i) ──
+  // Don't fire from center-aim until the staggered-height step dz is confidently
+  // learned: a spinner reveals all 4 faces so confidence arrives within a few
+  // tenths of a second (fast EMA), and we avoid burning balls while the pitch is
+  // still mis-calibrated on the alternating high/low plates. Non-center aim and
+  // flat robots (dz_confident_ true once a few odd faces read ~0) are unaffected.
+  const bool height_ok =
+    !(cfg_.adapt_dz_enable && cfg_.fire_require_dz_confident &&
+      center_aimed && !dz_confident_);
+  aim.height_uncalibrated = !height_ok;
+
   aim.fire = best.valid &&
     fireStatePermits() &&
     best.range >= cfg_.min_fire_dist &&
     best.range <= cfg_.max_fire_dist &&
     facing_ok &&
-    impact_inside;
+    impact_inside &&
+    height_ok;
 
   return aim;
 }

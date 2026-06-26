@@ -51,6 +51,7 @@ public:
     cfg.q_pos            = declare_parameter("q_pos", 5.0);
     cfg.q_yaw            = declare_parameter("q_yaw", 10.0);
     cfg.q_r              = declare_parameter("q_r", 1e-6);
+    cfg.q_z              = declare_parameter("q_z", 2.0);  // decoupled vertical noise (WORKLOG §4h)
     cfg.r_pos_base       = declare_parameter("r_pos_base", 0.05);
     cfg.r_pos_slope      = declare_parameter("r_pos_slope", 0.04);
     // Tangential (lateral/bearing) position noise — see TrackerConfig / WORKLOG §4b.
@@ -68,6 +69,12 @@ public:
     cfg.radius_ema_alpha = declare_parameter("radius_ema_alpha", 0.05);
     cfg.initial_dz       = declare_parameter("initial_dz", 0.0);
     cfg.adapt_dz_enable  = declare_parameter("adapt_dz_enable", false);
+    cfg.dz_max           = declare_parameter("dz_max", 0.12);           // physical clamp (WORKLOG §4h)
+    cfg.dz_flat_threshold = declare_parameter("dz_flat_threshold", 0.015);  // flat-collapse (WORKLOG §4h)
+    cfg.dz_ema_alpha     = declare_parameter("dz_ema_alpha", 0.20);          // fast convergence (WORKLOG §4i)
+    cfg.dz_confident_count = declare_parameter("dz_confident_count", 3);     // samples before trusted (WORKLOG §4i)
+    cfg.center_aim_mean_height = declare_parameter("center_aim_mean_height", true);     // pitch on mean (WORKLOG §4i)
+    cfg.fire_require_dz_confident = declare_parameter("fire_require_dz_confident", true);  // hold fire until calibrated (WORKLOG §4i)
     cfg.bullet_speed     = declare_parameter("bullet_speed", 25.0);
     cfg.gravity          = declare_parameter("gravity", 9.8);
     cfg.gimbal_height    = declare_parameter("gimbal_height", 0.325);
@@ -110,6 +117,7 @@ public:
     cfg.switch_range_ratio = declare_parameter("switch_range_ratio", 0.85);
     cfg.switch_cooldown  = declare_parameter("switch_cooldown", 10);
     cfg.same_target_identity_dist = declare_parameter("same_target_identity_dist", 1.0);
+    cfg.temp_lost_fast_reacquire = declare_parameter("temp_lost_fast_reacquire", true);  // fast re-acquire while coasting (WORKLOG §4i)
     // ── Static-fire-flicker fixes (WORKLOG §4) ──
     // static_facing_max: facing cap [rad] used INSTEAD of the strict margin when
     //   the target is not spinning — fire a locked, near-static plate even if it
@@ -488,6 +496,11 @@ private:
       // from "plate too oblique".
       if (cfg_.fire_require_impact_inside && aim.facing_ok && !aim.impact_inside) {
         return "impact_outside_plate";
+      }
+      // Center-aim is waiting for the staggered-height step dz to be learned before
+      // committing a shot (WORKLOG §4i). Transient — clears in a few tenths of a s.
+      if (aim.height_uncalibrated) {
+        return "height_uncalibrated";
       }
       if (cfg_.asymmetric_fire_enable) {
         return aim.approaching ? "facing_window_approach" : "facing_window_leave";

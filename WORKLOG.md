@@ -1255,6 +1255,257 @@ build` OK.
 4. **Spinner unaffected:** this is non-spin only; a confirmed spinner must behave exactly
    as the §4g.4 build (the q_pos_spin change owns that case).
 
+---
+
+## 4h. PITCH JITTER + ADAPTIVE dz cluster (from `propost1.md` review, 2026-06-25, APPLIED, build OK)
+
+### 4h.1 Context — reviewing a colleague's proposal (`propost1.md`)
+The user shared `propost1.md`: a transcript of ANOTHER agent proposing shooting fixes.
+**It analysed a STALE/older codebase** (pre-§2 refactor): it cites `handleArmorJump`
+(removed), `vyaw_fire_threshold` + single-face/4-face mode (replaced by
+`confirmedSpin`/center-aim), `q_pos=100` (now 10), `angular_window=1.0`/`window_ref_dist=1.0`
+(now 0.35/3.0), `alpha_pos=0.995` (now 0.99), `actuation_latency=0.020` (now 0.060),
+`initial_dz=0.05` (now 0.0), `vyaw_timing_max_dt=0.5` (now 0.700). Its `git apply` patch
+would NOT apply. So most of its CODE claims are false-for-current-code or already done.
+
+But the user pushed back correctly: *extract the INTENT, not the stale code refs.* Doing
+that, three intents map to REAL, currently-unmet improvements (the rest are superseded:
+"fire only on a frontal plate" = the §4e impact gate, stricter than its `vis≥0.6`;
+"tighten the window" = done; "less under-lead on movers" = §4g; "estimate slow spin" =
+the §4d position observer). The user asked to apply the genuinely-useful cluster.
+
+### 4h.2 The three real gaps + the fix (APPLIED)
+**(1) q_z DECOUPLED from q_pos (the pitch-jitter root).** `ekfPredict` shared `q_pos`
+across x,y AND z (`block(4, cfg_.q_pos)`), so the high horizontal `q_pos` pumped the
+VERTICAL channel → PnP z-noise became phantom `vza`, extrapolated forward → nervous
+pitch. A plate's height does not change. Fix: new `q_z=2.0`, `block(4, cfg_.q_z)`; and
+the vza covariance clamp `mc(5)` 2.0 → **0.3**. Horizontal lead untouched (still q_pos).
+
+**(2) ADAPTIVE dz, robust + enabled (the "aims low on the high armor" gap).** With
+`initial_dz=0` + `adapt_dz_enable=false` the code assumed ALL armors flat → on a
+STAGGERED enemy it aimed at centre height and missed the raised plate by ~dz. The
+existing measurement (`measured_dz = det.z − x_(4)` for odd faces) is already
+sign-correct in the current model (both odd faces share one height — the colleague's
+fragile parity-flip is unnecessary here). Made it robust + enabled: clamp `|dz|≤dz_max
+=0.12`, fast-first-then-slow EMA, and **flat-collapse** (`|dz|<dz_flat_threshold=0.015`
+⇒ snap to 0) so a flat robot stays flat despite noise. `initFromDetection` resets it
+⇒ re-learns per target. Launch: `adapt_dz_enable=True`.
+
+**(3) Center-aim pitch from the SELECTED face height.** Center-aim used a fixed centre
+height (`fpz=czi`), so even with a learned dz the spinner shot landed ~dz off vertically
+(and the impact gate would block forever on a staggered robot). Now `fpz = best.z` (the
+selected face's predicted height, carrying dz for odd faces): azimuth stays the steady
+centre-aim point, only the PITCH tracks the plate that will be fired at. Flat robot:
+dz≈0 ⇒ best.z≈czi ⇒ unchanged.
+
+**(4) Pitch anti-jitter params (launch only).** `cmd_rate_limit_pitch` 0 → **2.0**
+(≈114°/s; real pitch is far slower, so no lag, only jitter killed) and
+`cmd_deadband_pitch` 0.005 → **0.01**. YAW stays raw (rate-limit 0.0) — a tight yaw
+limit would make cmd≈servo and falsely report "locked" while off-target.
+
+### 4h.3 Files changed
+- `tracker.hpp`: config `q_z=2.0`, `dz_max=0.12`, `dz_flat_threshold=0.015`; doc.
+- `tracker.cpp`: `ekfPredict` z→q_z + mc(5)=0.3; robust dz in
+  `updateRadiusFromAssociation`; center-aim `fpz=best.z`.
+- `autoaim_node.cpp`: declare `q_z`/`dz_max`/`dz_flat_threshold`.
+- `standard.launch.py`: `q_z=2.0`, `adapt_dz_enable=True` (+dz_max/dz_flat_threshold),
+  `cmd_rate_limit_pitch=2.0`, `cmd_deadband_pitch=0.01`.
+
+### 4h.4 On-robot validation (REQUIRED — not yet run)
+1. **Pitch calm:** on a tracked target the commanded pitch should stop oscillating
+   (q_z + rate-limit). If still nervous, lower `cmd_smooth_alpha` toward 0.7 (affects
+   yaw too) or add a per-axis pitch smoother.
+2. **Staggered robot:** aim should hit the high AND low armors (not ~5 cm low on the
+   raised one). Watch `dz` in `/debug_state`: should converge to the real step (~0.05)
+   on a staggered enemy, stay 0 on a flat one.
+3. **Flat robot regression:** `dz` must stay 0 (flat-collapse); pitch as before.
+4. **Bullet economy / accuracy ceilings (USER, hardware):** measure `bullet_speed`
+   (still 25.0 placeholder) and `barrel_offset_y/z` — real per-shot accuracy caps the
+   colleague correctly flagged.
+
+### 4h.5 What was REJECTED from `propost1.md` and why
+- `fire_min_vis` obliquity gate → redundant with the §4e impact gate (more physical) +
+  §4d asymmetric window (34°, stricter than vis≥0.6≈53°).
+- The colleague's parity-bit dz rewrite of `handleArmorJump` → that function is gone;
+  the current direct measurement is already sign-correct, so only robustness+enable was
+  needed.
+- Window/latency/alpha_pos retunes → already at or past the suggested values.
+
+---
+
+## 4i. SLOW TARGET-SWITCH + PITCH-HEIGHT CALIBRATION (2026-06-25, APPLIED, build OK)
+
+### 4i.1 Request (testing on the STANDARD)
+Two on-robot symptoms:
+1. **"Takes too long to notice the enemy moved"** — the aim stays for *seconds* on
+   where the previous robot was, then switches too late.
+2. **"Pitch fires before the armor height is calibrated"** — on an enemy with
+   alternating high/low armor it shoots too high on the low plate and too low on the
+   high one; it must reach the right height faster, ideally rest on a MEAN between the
+   two heights, and that mean must adapt quickly as the robot moves at distance.
+
+### 4i.2 Problem 1 — root cause: COAST staleness + range-gated switch
+When the tracked robot's detection stops at its old spot (it moved / went behind cover /
+a different robot is now the threat), the EKF coasts in `TEMP_LOST` for
+`lost_timeout = 1.0 s` (~44 frames @44 Hz) **holding the old predicted position**.
+Meanwhile `shouldSwitch` only re-targets a spatially-distinct fresh detection if it is
+*much closer* (`new_range < 0.85·cur_range`). A moved/new robot at similar or farther
+range is therefore **never** switched to until the coast fully expires → LOST → re-acquire.
+That is the "stays seconds on the old position" the user saw. (A continuously-visible
+robot that merely translates is tracked fine — the §4g lag is ~66 ms, not seconds; the
+seconds-scale symptom needs a detection gap + an un-switched alternative, exactly this.)
+
+**Fix (APPLIED):** in `shouldSwitch`, when state is `TEMP_LOST` (we are coasting — NOT
+seeing the target, the aim is a prediction) and the candidate already failed the identity
+test (`spatial_dist ≥ same_target_identity_dist = 1.0 m`, i.e. genuinely a different/moved
+robot), **switch immediately** — drop the "much closer" requirement (the coasted range is
+unreliable anyway). A brief occlusion where the SAME robot reappears nearby still passes
+the identity test → no switch (coast still works). A confirmed spinner spans only ~radius
+(<1 m), so its own reappearing plate never trips this. Switchable: `temp_lost_fast_reacquire`
+(default True). Result: re-acquire on the next distinct detection instead of after ~1 s.
+
+### 4i.3 Problem 2 — root cause: slow dz EMA + per-face center-aim pitch
+- **dz converged too slowly.** `updateRadiusFromAssociation` used `dz = 0.95·dz +
+  0.05·measured` (τ ≈ 20 odd-face samples), and odd faces are seen only intermittently →
+  the staggered step took *seconds* to settle → the pitch aimed at a wrong height the
+  whole time. **Fix:** sample-counted EMA `a = max(dz_ema_alpha=0.20, 1/n)` — the first
+  samples move dz fast, then it settles. Plus a confidence counter `dz_confident_`
+  (`dz_sample_count_ ≥ dz_confident_count = 3`; a flat robot reaching dz≈0 also becomes
+  "confident flat"). Reset per target in `initFromDetection`.
+- **Center-aim pitch chased the SELECTED face height** (`fpz = best.z`, §4h). On a
+  staggered SPINNER the swept plate alternates centre / centre+dz every handoff → the
+  pitch jittered up/down and shot the wrong height mid-transition (exactly the user's
+  "too high on low / too low on high, alternating"). **Fix:** center-aim now points the
+  pitch at the **MEAN of the two heights** `fpz = czi + dz/2` — one steady command that
+  keeps BOTH plates within `plate_half_height` (worst-case vertical miss halved to dz/2).
+  The azimuth stays the steady centre-aim point; only the pitch changes. Flat robot:
+  dz≈0 ⇒ mean = centre ⇒ unchanged. Switchable: `center_aim_mean_height` (default True).
+  The mean tracks `x_(4)` so it still moves with the target at distance (q_z owns its
+  responsiveness, unchanged to avoid re-adding §4h pitch jitter).
+- **Fired before the height was calibrated.** **Fix:** a height-calibration fire gate —
+  `aim.fire` additionally requires `dz_confident_` *when center-aiming* (gated to
+  center-aim because a spinner reveals all 4 faces, so confidence arrives in a few tenths
+  of a second; non-center / even-face static targets aim at `x_(4)` regardless of dz and
+  are unaffected — they always fire). New `fire_block_reason = "height_uncalibrated"`
+  (transient). Switchable: `fire_require_dz_confident` (default True). Bullet-economy
+  aligned (ARC ~750-ball cap): don't spend balls until the pitch is settled.
+
+### 4i.4 Files changed
+- `tracker.hpp`: config `temp_lost_fast_reacquire`, `dz_ema_alpha=0.20`,
+  `dz_confident_count=3`, `center_aim_mean_height`, `fire_require_dz_confident`; state
+  `dz_sample_count_`/`dz_confident_`; `dzConfident()`; `AimResult.height_uncalibrated`.
+- `tracker.cpp`: `initFromDetection` resets dz confidence; `updateRadiusFromAssociation`
+  fast counted EMA + confidence; `shouldSwitch` TEMP_LOST fast re-acquire; `computeAim`
+  center-aim mean height + height fire gate.
+- `autoaim_node.cpp`: declare the 5 new params; `fireBlockReason` → `height_uncalibrated`.
+- `standard.launch.py`: the 5 new params (all defaults on). `colcon build` OK.
+
+### 4i.5 On-robot validation (REQUIRED — not yet run)
+1. **Moved/second robot:** when the tracked enemy moves away or a different enemy becomes
+   the threat, the aim should jump to the new one within a few frames (not ~1 s). Watch
+   `selected_class_id` / target generation flip and the aim leaving the old spot quickly.
+   If it flaps between two robots, raise `same_target_identity_dist` or set
+   `temp_lost_fast_reacquire=False`.
+2. **Staggered spinner:** `dz` in `/debug_state` should reach the real step (~0.05) within
+   a few tenths of a second (was seconds); the commanded pitch should sit STEADY at the
+   mean (no high/low jitter per handoff) and land both plates. `fire_block_reason` may show
+   `height_uncalibrated` briefly at the start of each new target, then clear.
+3. **Flat robot regression:** `dz` stays 0 (flat-collapse), `dz_confident_` reaches true,
+   center-aim pitch unchanged, fires normally.
+4. **Static even-face target regression:** must still fire (height gate is center-aim only).
+
+### 4i.6 Round 2 — still slow to follow + dz still inaccurate (2026-06-25, APPLIED, build OK)
+The §4i build helped but the user reported it is **still too slow to follow a moving
+enemy**, **dz still not accurate enough**, and **generally slow to react**.
+
+**Audit of the latency chain (so we change the real lever):** the command pipeline is
+already RAW — `cmd_smooth_alpha=1.0` (no low-pass lag), `cmd_rate_limit_yaw=0.0` (raw
+yaw), `cmd_rate_limit_pitch=2.0` (≈114°/s, above the servo). So the follow lag is in the
+EKF + lead, not the command path. For the dominant case (a SPINNER that walks, §4g.2) the
+center responsiveness is `q_pos_spin` and the translational lead is clamped at
+`spin_trans_lead_cap`. A walk >0.30 m/s was being UNDER-led (cap) on top of the center
+position lag.
+
+**dz inaccuracy — the real mechanism.** The §4i estimate `measured_dz = det.z − x_(4)` is
+coupled: on a spinner the EKF centre `x_(4)` sees both face parities ~50/50 and converges
+to the MEAN height `Z0 + D/2` (D = true step). The fixed point is actually correct
+(dz→D, because dz feeds the odd-face prediction, closing the loop), but the **transient is
+slow and biased low** — dz and x_(4) co-converge through that feedback loop. That is the
+"not accurate enough / slow".
+
+**Fixes (APPLIED):**
+1. **Decoupled, unbiased dz (WORKLOG §4i.2).** Track the even-face and odd-face heights
+   as two DIRECT sample-counted EMAs (`z_even_ema_`/`z_odd_ema_`), and learn
+   `dz = H_odd − H_even`. No feedback loop, no x_(4) bias, settles as soon as both EMAs
+   do. Confidence = `min(even_count, odd_count) ≥ dz_confident_count` (needs BOTH parities,
+   exactly when a step is meaningful). Single-parity targets keep dz=0 and let x_(4) carry
+   the height (best.z already right). Center-aim mean now uses the DIRECT mean
+   `0.5·(z_even+z_odd)` when both parities are seen (transient-robust), falling back to
+   `czi + dz/2`. Reset per target in `initFromDetection`.
+2. **Faster spinner follow.** `q_pos_spin` 4.0 → **6.0** (tighter walked-spinner center
+   tracking; the orbit phantom is well suppressed at 6, so this does not re-chase the
+   orbit) and `spin_trans_lead_cap` 0.30 → **0.45** (the EKF center velocity is mostly REAL
+   translation now, so the old tight cap was clipping genuine walk-follow). Both are
+   A/B knobs: drop q_pos_spin→4 if a still spinner wobbles/loses lock; drop the cap→0.30 if
+   a stopping spinner overshoots L/R.
+
+**Files:** `tracker.hpp` (state `z_even_ema_`/`z_odd_ema_` + counts); `tracker.cpp`
+(`initFromDetection` reset, `updateRadiusFromAssociation` decoupled dz, center-aim direct
+mean); `standard.launch.py` (`q_pos_spin=6`, `spin_trans_lead_cap=0.45`). `colcon build` OK.
+
+**On-robot validation (round 2, REQUIRED):**
+1. **Walked spinner:** the gimbal should sit on the moving center noticeably tighter than
+   §4i. Watch `state_xc/yc` vs the raw detection and `applied_lead_vx/vy` vs `state_vxc/vyc`
+   (the cap should bite less). If a STOPPING spinner now overshoots L/R, lower
+   `spin_trans_lead_cap` toward 0.30 first, then `q_pos_spin` toward 4.
+2. **dz accuracy:** `dz` should now reach the TRUE step (~0.05), not ~half, and faster.
+   Compare `dz` to a hand-measured step. If it reads high/noisy, raise `dz_confident_count`
+   or lower `dz_ema_alpha`.
+3. **Lock regression:** a STILL spinner must keep lock (q_pos_spin=6 center wobble must stay
+   ≪ lock tol). If `yaw_locked`/`cmd_fire` drop vs §4i, back q_pos_spin toward 4.
+4. **Bullet speed (USER/hardware):** `bullet_speed=25.0` is still a PLACEHOLDER — a wrong
+   value biases the whole prediction horizon (flight_time) and thus the lead. MEASURE it.
+
+### 4i.7 Bag …191123 audit — dz is a PHANTOM (range-coupled projection bias) (2026-06-25)
+User recorded `bagsa/debug_state_20260625_191123` (4063 msg, 75.6 s, **54 Hz**) to test the
+round-2 doubts: phase 1 translate-only, phase 2 rotate+move, phase 3 rotate-only (our gimbal
+off at the tail). Single target (`target_generation` constant = 5, **0 switches**); spinner
+**≈143 rpm (15 rad/s, NOT aliased at 54 Hz)** — a tractable spinner. Offline replay
+(`/tmp/.../read_bag.py`,`dz.py`,`dz2.py`,`pitch.py`,`final.py` → `/tmp/bag.npz`):
+
+**THE decisive finding — there is NO armor height step; "dz" was a calibration artefact.**
+- Raw armor height (`det_z_raw`) is **unimodal** (single broad peak), NOT bimodal.
+- Height correlates with RANGE at **+38 cm per metre (corr 0.87)**; after removing that trend
+  the residual is unimodal, std **3.9 cm** ⇒ the robot is **FLAT**. The slope ⇒ an
+  **uncompensated ~20° pitch error in the camera→odom projection** (extrinsic camera-mount
+  pitch and/or the gimbal-pitch sign/offset/`angle_sync` timing used to lift pixels to odom).
+- Parity label vs height-cluster agreement was **58 %** (≈ random) — face parity is NOT a
+  reliable height cue here, confirming the round-2 doubt; BUT it is moot because there is no
+  real step to estimate. So neither the parity-EMA NOR a 2-means would help — both fit noise.
+- Consequence: the running `dz` field swung the **FULL ±0.12 clamp**, sign-flipping, median 0
+  → it ADDED up to 12 cm of vertical aim error. As the robot changed distance the apparent
+  height swung ±15 cm (dist 0.94→1.43 m ⇒ z 0.58→0.75) — exactly the user's "the aim height
+  is wrong and changes as the robot moves at distance". **This is a vertical CALIBRATION
+  problem, not a tracker problem.**
+
+**Action (APPLIED):** `adapt_dz_enable` True → **False** in `standard.launch.py` (removes the
+proven harm; dz=0, flat). All the §4h/§4i dz code stays, gated by the flag. **The real fix is
+the USER's: recalibrate the camera→odom vertical projection** (check the camera-mount pitch
+extrinsic, the `pitch_sign_`/`micro_pitch_lock_opposite_sign_` convention, and `angle_sync`)
+so reconstructed height stops scaling with range. Re-enable dz only after that AND when facing
+a genuinely staggered enemy.
+
+**Follow (problem 1) — NOT reproducible as severe in this bag.** Translations are modest
+(state |v| ≈ 0.12 m/s in rotate+move; the 0-5 s "translate" phase was mostly lateral, range
+0.96→0.93 m). `adaptive_follow_w` = 1.0 (lead held), the EKF velocity DOES respond (0.19 med /
+1.0 p90 in the move at 5–10 s), and `spin_trans_lead_cap=0.45` binds only 13 %. So the round-2
+`q_pos_spin=6`/`cap=0.45` are reasonable but this bag does not stress them — to tune follow,
+record a FAST lateral dash. Don't over-tune follow from this bag.
+
+**Fire:** `cmd_fire` 29 %; blocks dominated by `facing_window_approach` (1461) + `impact_outside_plate`
+(625) — both CORRECT on a spinner (no wheel-shots). `height_uncalibrated` only 64 frames (our
+gate is not over-blocking). With dz off, that gate is inert (dz_confident_ = true).
+
 ## 5. Backlog — accuracy & fire-rate upgrades (bullet-economy aware)
 
 Context: **ARC has a ~750-ball cap.** Optimize *hit probability per ball*, not
@@ -1376,6 +1627,19 @@ If validated, mirror `face_index_switch_penalty` plus the earlier §4 parameters
 into `hero`/`sentry` launches and commit.
 
 ### Reasoning ledger (most recent first)
+- **2026-06-25 (applied, §4h pitch/dz cluster from `propost1.md` review)** — Reviewed a
+  colleague's `propost1.md`: it reasoned on a STALE codebase (handleArmorJump,
+  vyaw_fire_threshold, q_pos=100, angular_window=1.0, …) so most code claims are
+  false-for-current / already-done, and its `git apply` wouldn't apply. User pushed back:
+  extract the INTENT. Three intents were real + unmet → APPLIED: (1) **q_z decoupled**
+  from q_pos (z channel no longer pumped → kills phantom vza → nervous pitch) + vza clamp
+  2.0→0.3; (2) **adaptive dz robust + enabled** (learn the height step per-robot; clamp +
+  EMA + flat-collapse; current measurement is already sign-correct so the colleague's
+  parity-flip was unneeded) so a STAGGERED enemy is hit at the right pitch; (3) **center-aim
+  pitch = best.z** (selected face height, not fixed centre) so the spinner shot isn't ~dz
+  low; (4) pitch anti-jitter params (`cmd_rate_limit_pitch=2.0`, `cmd_deadband_pitch=0.01`;
+  yaw stays raw). Rejected: `fire_min_vis` (superseded by §4e impact gate). `colcon build`
+  OK. On-robot validation pending (§4h.4). bullet_speed/barrel_offset still USER hardware.
 - **2026-06-25 (applied, §4g debug-surface expansion)** — User asked for more
   `/debug_state` variables to debug the follow/overshoot/aim work data-driven. Added 14
   fields (msg now 127), documented in §6: the LEAD actually applied

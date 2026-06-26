@@ -120,6 +120,9 @@ struct AimResult
   double applied_lead_vyaw = 0.0;
   bool   omega_reliable    = false;
   bool   center_aimed      = false;
+  // True when fire was withheld only because the staggered-height step dz is not
+  // yet confidently learned (center-aim, fire_require_dz_confident). WORKLOG §4i.
+  bool   height_uncalibrated = false;
 };
 
 struct FacePrediction
@@ -208,6 +211,14 @@ struct TrackerConfig
   double q_pos             = 5.0;
   double q_yaw             = 10.0;
   double q_r               = 1e-6;
+  // VERTICAL process noise — DECOUPLED from q_pos (WORKLOG §4h). The horizontal
+  // q_pos is large so the EKF can lead a translating chassis, but a plate's
+  // HEIGHT does not change, so sharing q_pos on the z channel let PnP z-noise
+  // become a PHANTOM vertical velocity (vza) that was extrapolated forward → the
+  // nervous pitch the user saw. A small dedicated q_z keeps the vertical channel
+  // calm (vza ~ 0) without slowing the horizontal lead. Raise toward q_pos only
+  // if a target genuinely changes height fast (it never does in RoboMaster).
+  double q_z               = 2.0;
 
   // EKF measurement noise (higher = trust measurements less, smoother)
   // RADIAL (along line of sight / depth) position noise: PnP depth is the weak
@@ -336,7 +347,40 @@ struct TrackerConfig
   // face jump, but seeding avoids shooting low on the raised pair before
   // a jump is seen. Set to 0.0 if all four faces are at the same height.
   double initial_dz        = 0.0;
-  bool   adapt_dz_enable   = false;
+  // ── ADAPTIVE HEIGHT STEP (WORKLOG §4h) ──
+  // Some enemies have STAGGERED armor heights (one low, one high), others FLAT
+  // (all equal). With dz frozen at 0 we assume flat → on a staggered robot we aim
+  // at the centre height and miss the raised plate by ~dz vertically ("aims low on
+  // the high armor"). dz is LEARNED per-robot: for an odd face (1,3) confidently
+  // associated, measured_dz = det.z − centre_z gives the offset directly (correct
+  // sign — both odd faces share the same height, no fragile sign-flip needed).
+  // Robust guards: clamp |dz| ≤ dz_max, slow EMA, and FLAT-COLLAPSE (|dz| below
+  // dz_flat_threshold ⇒ treat as 0) so a flat robot stays flat despite PnP noise.
+  // initFromDetection resets it, so it re-learns on every target. The aim pitch in
+  // center-aim then points at the SELECTED face's height, not a fixed centre.
+  bool   adapt_dz_enable   = false;   // launch enables it (standard); safe default off
+  double dz_max            = 0.12;    // [m] physical clamp on the learned step
+  double dz_flat_threshold = 0.015;   // [m] below this the robot is treated as flat (dz=0)
+  // ── FAST dz CONVERGENCE + CONFIDENCE + MEAN-HEIGHT AIM (WORKLOG §4i) ──
+  // The old 0.05 EMA needed ~20 odd-face samples (seen only intermittently) to
+  // settle, so on a staggered enemy the pitch stayed mis-calibrated for seconds
+  // and shot too high on the low plate / too low on the high one. Now the step is
+  // learned with a sample-counted EMA (the first samples move it fast, then it
+  // settles to dz_ema_alpha) and a confidence counter so fire can wait for it.
+  double dz_ema_alpha      = 0.20;    // steady EMA rate after the fast-start samples
+  int    dz_confident_count = 3;      // odd-face samples before the step is trusted
+  // CENTER-AIM pitch points at the MEAN of the two armor heights (centre + dz/2)
+  // instead of the selected face's height. On a staggered SPINNER the swept plate
+  // alternates high/low every handoff; aiming the pitch at the per-face height made
+  // it jitter up/down and shoot the wrong height during a handoff. The mean is the
+  // single steady pitch that keeps BOTH plates within plate_half_height (worst-case
+  // vertical miss halved to dz/2). Flat robot: dz≈0 ⇒ mean = centre ⇒ unchanged.
+  bool   center_aim_mean_height = true;
+  // Do not fire from center-aim until the height step is confidently learned (a
+  // spinner reveals all 4 faces, so confidence comes within a few tenths of a
+  // second). Stops the "fires before the armor height is calibrated" waste; the
+  // bullet economy (ARC ~750-ball cap) wants the pitch settled before a shot.
+  bool   fire_require_dz_confident = true;
 
   // ── BALLISTICS & PHYSICAL GEOMETRY ──
   double bullet_speed      = 25.0;  // [m/s] — MEASURE THIS on your robot!
@@ -554,6 +598,15 @@ struct TrackerConfig
   // Tune up if robots can be back-to-back (false split into two tracks).
   // Tune down if two passing enemies get incorrectly merged into one track.
   double same_target_identity_dist = 1.0;
+
+  // ── FAST RE-ACQUIRE WHILE COASTING (WORKLOG §4i) ──
+  // While TEMP_LOST we are not actually SEEING the target — the aim sits on a
+  // coasted (predicted) position. If a spatially-DISTINCT fresh detection appears
+  // (our robot moved/vanished and a different one is now visible), switch to it
+  // immediately instead of staying stale for the whole lost_timeout (~1 s). The
+  // identity test (same_target_identity_dist) still protects a brief occlusion
+  // where the SAME robot reappears nearby — that is not a switch. Switchable off.
+  bool   temp_lost_fast_reacquire = true;
 };
 
 // =========================================================================
@@ -638,6 +691,7 @@ public:
   double radius() const { return radius_; }
   double otherRadius() const { return other_radius_; }
   double dz() const { return dz_; }
+  bool dzConfident() const { return dz_confident_; }
   std::string targetId() const { return target_id_; }
   /// Monotonically increasing counter, bumped on every initFromDetection.
   /// The node compares this across frames to detect target switches.
@@ -754,6 +808,15 @@ private:
   double other_radius_ = 0.28;
   double dz_ = 0.0;
   bool dz_initialized_ = false;
+  int  dz_sample_count_ = 0;     // odd-face samples folded into dz_ (WORKLOG §4i)
+  bool dz_confident_ = false;    // dz_sample_count_ ≥ dz_confident_count
+  // DECOUPLED per-parity height estimates (WORKLOG §4i.2). dz is learned as
+  // (odd-face height − even-face height) from two direct EMAs instead of
+  // det.z − x_(4): the EKF centre x_(4) averages BOTH parities on a spinner (→
+  // centre+dz/2), so the old difference under-shot and converged slowly through a
+  // feedback loop. These are unbiased and fast. Reset per target.
+  double z_even_ema_ = 0.0;  int z_even_count_ = 0;
+  double z_odd_ema_  = 0.0;  int z_odd_count_  = 0;
   double last_yaw_ = 0.0;
   std::string target_id_;
   TrackerDebugInfo debug_info_;
