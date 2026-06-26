@@ -86,7 +86,7 @@ void Tracker::ekfPredict(double dt)
     Q(i,i) = std::pow(t,4)/4*s2;  Q(i,i+1) = std::pow(t,3)/2*s2;
     Q(i+1,i) = Q(i,i+1);          Q(i+1,i+1) = t*t*s2;
   };
-  block(0, cfg_.q_pos); block(2, cfg_.q_pos); block(4, cfg_.q_pos);
+  block(0, cfg_.q_pos); block(2, cfg_.q_pos); block(4, cfg_.q_z);
   block(6, cfg_.q_yaw);
   Q(8,8) = std::pow(t,4)/4 * cfg_.q_r;
 
@@ -96,7 +96,11 @@ void Tracker::ekfPredict(double dt)
 
   // Clamp covariance (prevents explosion during TEMP_LOST)
   Eigen::VectorXd mc(9);
-  mc << 1.0, 10.0, 1.0, 10.0, 1.0, 2.0, 1.0, 30.0, 0.01;
+  //       xc   vxc   yc   vyc  za   vza  yaw  vyaw   r
+  // vza (index 5) is tightened from 2.0 -> 0.3: plates have no real vertical
+  // velocity, so capping its covariance stops the EKF from sustaining a
+  // phantom vza that drives pitch oscillation.
+  mc << 1.0, 10.0, 1.0, 10.0, 1.0, 0.3, 1.0, 30.0, 0.01;
   for (int i = 0; i < 9; i++) {
     if (P_(i,i) > mc(i)) {
       double s = std::sqrt(mc(i) / std::max(P_(i,i), 1e-10));
@@ -247,15 +251,22 @@ void Tracker::initFromDetection(const ArmorDetection & det)
   double yaw = unwrapYaw(det.yaw);
   double r = cfg_.initial_radius;
   radius_ = r;  other_radius_ = r;
-  // Seed dz_ from the known physical step between armor pairs.
-  // If initial_dz is 0 (default) the behavior is unchanged.
-  // If set to e.g. 0.05, faces 1 and 3 immediately get +5cm z offset
-  // so the aim is correct from the first frame even before a face jump.
+  // Seed the adaptive height-step from the optional initial_dz prior.
+  // With initial_dz = 0 (default) the tracker starts flat and learns the step
+  // (and its sign) from the first 90° face jump — adapting per robot, so
+  // staggered and co-planar chassis are both handled automatically.
+  // A nonzero initial_dz just gives a head-start magnitude; the sign is still
+  // corrected by the first measured jump.
   if (cfg_.initial_dz != 0.0) {
-    dz_ = cfg_.initial_dz;
-    dz_initialized_ = true;
+    dz_step_mag_  = std::abs(cfg_.initial_dz);
+    dz_           = cfg_.initial_dz;
+    dz_jump_count_ = 1;       // treat the prior as one "soft" observation
+    dz_flat_      = false;
   } else {
-    dz_ = 0;  dz_initialized_ = false;
+    dz_step_mag_  = 0.0;
+    dz_           = 0.0;
+    dz_jump_count_ = 0;
+    dz_flat_      = false;
   }
   x_ = Eigen::VectorXd::Zero(9);
   x_ << det.x+r*cos(yaw), 0, det.y+r*sin(yaw), 0, det.z, 0, yaw, 0, r;
@@ -419,46 +430,43 @@ void Tracker::handleArmorJump(const ArmorDetection & det, const rclcpp::Time & n
   // 90° jump = pair switch (different radius and height)
   double ja = std::abs(jump);
   if (ja > M_PI/4 && ja < 3*M_PI/4) {
-    // Height step between pairs.
-    // The sign flip (dz_ = -dz_) was unreliable: x_(4) at jump time is the
-    // z of the face we just LEFT, not the true center, so new_dz was measured
-    // from the wrong reference. Over multiple jumps the sign flip + noisy EMA
-    // would corrupt dz_ away from the physical value within 2-3 seconds.
-    //
-    // New approach:
-    //   1. Compute the raw height step from this jump: step = x_(4) - det.z
-    //   2. Use the ABSOLUTE value for the EMA — the sign is handled separately
-    //      by tracking which face index is "high" vs "low".
-    //   3. After the EMA update, restore the sign based on whether we jumped
-    //      UP (new face is higher → dz_ positive) or DOWN (→ negative).
-    //   4. If initial_dz was seeded, protect it: only update if the new
-    //      measurement agrees in sign with the seed.
-    double raw_step = x_(4) - det.z;  // positive = we jumped DOWN to a lower face
-    double abs_step = std::abs(raw_step);
+    // ── Adaptive inter-pair height step ──
+    // raw_step = (z of the face we are LEAVING) − (z of the face we ARRIVE at).
+    // For staggered plates this is ±(true step) and its sign alternates
+    // naturally as the visible pair swaps; for co-planar plates it is ~0.
+    double raw_step = x_(4) - det.z;
+    double mag      = std::abs(raw_step);
 
-    if (!dz_initialized_) {
-      // First jump: take the measurement directly
-      dz_ = raw_step;
-      dz_initialized_ = true;
-    } else {
-      // Subsequent jumps: EMA on absolute magnitude, preserve sign from measurement
-      // Only update if the new measurement is plausible (within 3x of current value)
-      // to reject outliers from noisy PnP at oblique angles.
-      double abs_dz = std::abs(dz_);
-      if (abs_step < std::max(abs_dz * 3.0, 0.03) && abs_step > 0.005) {
-        double new_abs = 0.10 * abs_step + 0.90 * abs_dz;
-        // Sign: if raw_step and dz_ agree in sign, keep. If they disagree,
-        // only flip if the disagreement is consistent (abs_step > 0.5*abs_dz).
-        // This prevents single noisy measurements from flipping the sign.
-        if (raw_step * dz_ > 0) {
-          dz_ = new_abs * (dz_ > 0 ? 1.0 : -1.0);
-        } else if (abs_step > abs_dz * 0.5) {
-          // Consistent sign disagreement — the initial seed may have been wrong
-          dz_ = new_abs * (raw_step > 0 ? 1.0 : -1.0);
-        }
-        // else: small disagreement, keep current sign
-      }
+    dz_jump_count_++;
+
+    // EMA the MAGNITUDE only. Adaptive gain: converge fast over the first few
+    // jumps, then hold steady so noise can't drift the learned step.
+    const bool learning  = (dz_jump_count_ <= 3);
+    const double g        = learning ? 0.5 : 0.10;
+
+    // While learning, accept any reading; once settled, reject oblique-PnP
+    // outliers (implausibly large steps) so one bad frame can't corrupt it.
+    const bool plausible = learning ||
+                           (mag < std::max(dz_step_mag_ * 3.0 + 0.01, 0.03));
+    if (plausible) {
+      dz_step_mag_ = (1.0 - g) * dz_step_mag_ + g * mag;
     }
+
+    // Flat-target latch: if the step stays tiny over the first jumps, this
+    // robot has co-planar plates — pin the step to zero so the pitch stops
+    // moving on face switches. Unlatch only if a clear step reappears.
+    if (dz_jump_count_ >= 2 && dz_step_mag_ < 0.012) dz_flat_ = true;
+    if (dz_flat_) {
+      if (mag > 0.030) dz_flat_ = false;     // a real step showed up after all
+      else             dz_step_mag_ = 0.0;   // stay collapsed
+    }
+
+    // Sign comes straight from the measurement when unambiguous: the visible
+    // pair just changed, so raw_step's sign IS "other pair vs current pair".
+    // When near-flat the sign is irrelevant (magnitude ~0); just alternate to
+    // stay phase-consistent in case a step emerges on a later jump.
+    if (mag > 0.015) dz_ =  (raw_step >= 0.0 ? 1.0 : -1.0) * dz_step_mag_;
+    else             dz_ = -((dz_ >= 0.0)    ? 1.0 : -1.0) * dz_step_mag_;
     x_(4) = det.z;  x_(5) = 0;
     std::swap(radius_, other_radius_);
     x_(8) = radius_;
@@ -472,13 +480,11 @@ void Tracker::handleArmorJump(const ArmorDetection & det, const rclcpp::Time & n
     x_ << det.x+r*cos(yaw), 0, det.y+r*sin(yaw), 0, det.z, 0, yaw, 0, r;
     P_ = P0_;
     radius_ = cfg_.initial_radius;  other_radius_ = cfg_.initial_radius;
-    // Preserve dz_ if it was seeded from initial_dz or learned — resetting
-    // to zero on every divergence was causing random high/low misses during
-    // spinning because the height step was re-learned from scratch each time.
-    if (!dz_initialized_ || std::abs(dz_) < 0.005) {
-      dz_ = cfg_.initial_dz;
-      dz_initialized_ = (cfg_.initial_dz != 0.0);
-    }
+    // Preserve the learned height step across a divergence hard-reset: it is a
+    // property of the (same) physical robot, and re-learning it from scratch on
+    // every divergence caused random high/low misses during spinning. The sign
+    // is re-derived from the next 90° jump's measurement; only the EKF center is
+    // re-seeded above. (dz_step_mag_, dz_flat_, dz_jump_count_ intentionally kept.)
     // Reset timing estimator — divergence means the phase is unknown
     last_jump_time_valid_ = false;
     consecutive_same_dir_jumps_ = 0;
@@ -844,7 +850,8 @@ AimResult Tracker::computeAim(double cur_yaw, double cur_pitch,
     state_ == TRACKING &&
     best.range >= cfg_.min_fire_dist &&
     best.range <= cfg_.max_fire_dist &&
-    best.margin >= 0.0;
+    best.margin >= 0.0 &&
+    best.vis   >= cfg_.fire_min_vis;   // skip foreshortened plates (0.0 = disabled)
 
   return aim;
 }

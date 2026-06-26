@@ -41,6 +41,7 @@ public:
     cfg.confirm_frames   = declare_parameter("confirm_frames", 3);
     cfg.lost_timeout     = declare_parameter("lost_timeout", 0.4);
     cfg.q_pos            = declare_parameter("q_pos", 5.0);
+    cfg.q_z              = declare_parameter("q_z", 2.0);
     cfg.q_yaw            = declare_parameter("q_yaw", 10.0);
     cfg.q_r              = declare_parameter("q_r", 1e-6);
     cfg.r_pos_base       = declare_parameter("r_pos_base", 0.05);
@@ -64,6 +65,7 @@ public:
     cfg.window_ref_dist  = declare_parameter("window_ref_dist", 3.0);
     cfg.min_fire_dist    = declare_parameter("min_fire_dist", 0.3);
     cfg.max_fire_dist    = declare_parameter("max_fire_dist", 6.0);
+    cfg.fire_min_vis     = declare_parameter("fire_min_vis", 0.0);
     cfg.time_bias        = declare_parameter("time_bias", 0.10);
     // Measured-latency prediction horizon: the node measures
     // (now − capture stamp) per frame and the tracker adds actuation_latency
@@ -108,7 +110,14 @@ public:
         target_color_status_index_);
     }
 
-    smooth_alpha_ = declare_parameter("cmd_smooth_alpha", 0.85);
+    // Per-axis command smoothing (EMA toward the destination). 1.0 = no
+    // smoothing (pass-through). cmd_smooth_alpha is the legacy single knob and
+    // acts as the default for both axes; the per-axis params override it so the
+    // YAW can stay snappy (1.0) for fast movers while the PITCH is smoothed to
+    // kill height jitter (e.g. 0.6) — the two no longer fight each other.
+    smooth_alpha_       = declare_parameter("cmd_smooth_alpha", 1.0);
+    smooth_alpha_yaw_   = declare_parameter("cmd_smooth_alpha_yaw",   smooth_alpha_);
+    smooth_alpha_pitch_ = declare_parameter("cmd_smooth_alpha_pitch", smooth_alpha_);
 
     // Command stabilisation parameters.
     cmd_deadband_yaw_ = declare_parameter("cmd_deadband_yaw", 0.005);
@@ -986,8 +995,8 @@ private:
       smooth_init_ = true;
     } else {
       sm_y_ = angles::normalize_angle(
-        sm_y_ + smooth_alpha_ * angles::shortest_angular_distance(sm_y_, yaw_target));
-      sm_p_ = smooth_alpha_ * pitch_target + (1.0 - smooth_alpha_) * sm_p_;
+        sm_y_ + smooth_alpha_yaw_ * angles::shortest_angular_distance(sm_y_, yaw_target));
+      sm_p_ = smooth_alpha_pitch_ * pitch_target + (1.0 - smooth_alpha_pitch_) * sm_p_;
       yaw_target = sm_y_;
       pitch_target = sm_p_;
     }
@@ -1402,6 +1411,8 @@ private:
   rclcpp::Time last_time_{0, 0, RCL_ROS_TIME};
 
   double smooth_alpha_ = 0.30;
+  double smooth_alpha_yaw_ = 1.0;
+  double smooth_alpha_pitch_ = 1.0;
   double cmd_deadband_yaw_ = 0.015;
   double cmd_deadband_pitch_ = 0.015;
   double cmd_rate_limit_yaw_ = 2.5;
