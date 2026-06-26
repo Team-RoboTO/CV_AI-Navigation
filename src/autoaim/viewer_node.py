@@ -135,6 +135,9 @@ class ViewerNode(Node):
         self.pub = (
             self.create_publisher(Image, self.debug_image_topic, 1)
             if self.publish_enabled else None)
+        self.get_logger().info(
+            f"Viewer fire lock thresholds: yaw={self.fire_lock_yaw:.3f} rad, "
+            f"pitch={self.fire_lock_pitch:.3f} rad")
         self.get_logger().info(f'Viewer started — view {self.debug_image_topic} in RViz2')
 
     def camera_info_cb(self, msg):

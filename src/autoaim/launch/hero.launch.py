@@ -74,7 +74,7 @@ def autoaim_params():
 
         {"bullet_speed": 11.5},
         {"gravity": 9.8},
-        {"gimbal_height": 0.570},
+        {"gimbal_height": 0.530},
 
         # MEASURE FROM THE ACTIVE LENS, NOT THE HOUSING CENTER — and note this
         # is a ZED X MINI: stereo baseline 50 mm, so the lens is only ~2.5 cm
@@ -88,13 +88,13 @@ def autoaim_params():
         #   barrel_offset_z = (muzzle height) - (lens height) [m]
         #                     Sentry-calibrated shared value: camera above barrel.
         {"barrel_offset_x": 0.0},
-        {"barrel_offset_y": 0.0},     # <- MEASURE (lens-cover trick, see INSTRUCTIONS.md)
-        {"barrel_offset_z": -0.05},
+        {"barrel_offset_y": 0.02},     # <- MEASURE (lens-cover trick, see INSTRUCTIONS.md)
+        {"barrel_offset_z": 0.06},
 
         # 1.0 rad @ ref 1 m -> ~0.33 rad window at 3 m: OK for tuning, loose for
         # a match. Against a fast spinner, timed shots need ~0.10-0.18 rad with
         # window_ref_dist ~3.0. Tighten once the static calibration is done.
-        {"angular_window": 0.10},
+        {"angular_window": 0.35},
         {"window_ref_dist": 3.0},
         {"min_fire_dist": 0.2},
         {"max_fire_dist": 6.0},
@@ -133,8 +133,8 @@ def autoaim_params():
         {"cmd_deadband_pitch": 0.005},
         {"cmd_rate_limit_yaw": 0.0},
         {"cmd_rate_limit_pitch": 0.0},
-        {"fire_lock_yaw": 0.035},
-        {"fire_lock_pitch": 0.030},
+        {"fire_lock_yaw": 0.048},
+        {"fire_lock_pitch": 0.078},
 
         # ⚠ THESE TWO MUST BE EQUAL. Both describe the same physical fact —
         # whether the micro's pitch FEEDBACK has the opposite sign of its pitch
@@ -179,8 +179,8 @@ def generate_launch_description():
     serial_port = LaunchConfiguration("serial_port")
 
     serial_params = [
-        {"shooting_active": True},
-        {"rotating_chassis": True},
+        {"shooting_active": False},
+        {"rotating_chassis": False},
 
         {"serial_port": serial_port},
         {"serial_baudrate": 500000},
@@ -208,8 +208,8 @@ def generate_launch_description():
     viewer_params = [
         # Must match micro_pitch_lock_opposite_sign in the autoaim params above.
         {"micro_pitch_feedback_opposite_sign": False},
-        {"fire_lock_yaw": 0.05},
-        {"fire_lock_pitch": 0.04},
+        {"fire_lock_yaw": 0.040},
+        {"fire_lock_pitch": 0.075},
     ]
 
     # Camera selection: set DEFAULT_CAMERA above, or override with camera:=zed

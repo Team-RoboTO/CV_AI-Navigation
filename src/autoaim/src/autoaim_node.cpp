@@ -122,6 +122,13 @@ public:
     // With gimbal.pitch_sign=-1.0, set this to False (lock uses raw pitch directly).
     // With gimbal.pitch_sign=+1.0 and opposite firmware, set this to True.
     micro_pitch_lock_opposite_sign_ = declare_parameter("micro_pitch_lock_opposite_sign", false);
+    RCLCPP_INFO(
+      get_logger(),
+      "Fire lock thresholds: yaw=%.3f rad, pitch=%.3f rad "
+      "(pitch_feedback_opposite_sign=%s, pitch_lock_opposite_sign=%s)",
+      fire_lock_yaw_, fire_lock_pitch_,
+      micro_pitch_feedback_opposite_sign_ ? "true" : "false",
+      micro_pitch_lock_opposite_sign_ ? "true" : "false");
 
     // Safety when EKF/prediction briefly jumps off-screen or the target is lost.
     cmd_hold_time_ = declare_parameter("cmd_hold_time", 0.25);
