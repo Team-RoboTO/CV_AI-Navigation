@@ -11,6 +11,55 @@ Restart=always
 RestartSec=5
 KillMode=process
 
+# =============================================================================
+# PERFORMANCE PINNING (host-side, runs as root before the container launch)
+#
+# WHY: the auto-aim pipeline (detector -> PnP -> EKF -> ballistic -> gimbal) is
+# latency-critical. By default the Jetson runs a power-capped nvpmodel profile,
+# uses DVFS (clocks drop under perceived low load), and lets idle CPU cores sink
+# into deep idle states (slow to wake). Every one of those mechanisms adds tail
+# latency / jitter exactly when a new target appears and the whole pipeline
+# spikes at once. We trade power and heat for deterministic, maximum compute.
+#
+# ORDER MATTERS (systemd runs ExecStartPre sequentially, top to bottom). The
+# sequence below intentionally goes: raise ceiling -> assert all cores online ->
+# pin clocks -> reassert governor -> kill deep idle. Pinning (jetson_clocks)
+# only acts on cores that are ONLINE, so onlining must come before it.
+
+# 1) Select MAXN on Orin NX 16GB: no power cap, ALL 8 cores online, max ceilings.
+#    Must run first because it raises the clock ceiling the rest pin against.
+#    NOTE: this selects standard MAXN, not MAXN_SUPER. Enabling Super requires a
+#    super nvpmodel.conf + super DTB swap at flash time (do it in the planned
+#    JetPack 6.2.1 reflash), which boosts the GPU clock (~918 -> ~1173 MHz).
+ExecStartPre=-/usr/sbin/nvpmodel -m 0
+
+# 2) DEFENSIVE: explicitly force every CPU core ONLINE. Redundant with MAXN, but
+#    protects against a core having been hot-unplugged or drifted offline; it
+#    guarantees jetson_clocks (next) actually pins all 8 cores and not a subset.
+ExecStartPre=-/bin/bash -c 'for c in /sys/devices/system/cpu/cpu[0-9]*/online; do echo 1 > "$c" 2>/dev/null || true; done'
+
+# 3) Pin CPU/GPU/EMC to the max allowed by the current profile, disable DVFS
+#    (writes scaling_min_freq = scaling_max_freq per core, so frequency can no
+#    longer drop), and force the fan to max (mandatory now that we run uncapped;
+#    hardware Tj thermal protection still applies only as a last resort).
+ExecStartPre=-/usr/bin/jetson_clocks --fan
+
+# 4) DEFENSIVE: reassert the "performance" governor on every core. jetson_clocks
+#    already pins min==max so this is cosmetic (min==max forces max regardless of
+#    governor). On this L4T kernel the "performance" governor may not be exposed
+#    (only schedutil), in which case the write is silently ignored by the leading
+#    "-". Harmless either way; remove this line if you want a clean log.
+ExecStartPre=-/bin/bash -c 'for g in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do echo performance > "$g" 2>/dev/null || true; done'
+
+# 5) LATENCY: disable DEEP CPU idle states (state1 and up) on every core, keeping
+#    only state0 (WFI, a light idle that wakes almost instantly). This is the one
+#    thing jetson_clocks does NOT do. Deep idle saves power but costs microseconds
+#    of wake-up latency every time a parked core has to pick up the next frame's
+#    detector/EKF/ballistic work. We accept higher idle power/heat to remove that
+#    wake-up jitter. NOTE: this is fine-grained tuning (microseconds), not a major
+#    lever; remove it if idle temperatures become a problem.
+ExecStartPre=-/bin/bash -c 'for s in /sys/devices/system/cpu/cpu[0-9]*/cpuidle/state[1-9]*/disable; do echo 1 > "$s" 2>/dev/null || true; done'
+
 ExecStart=/usr/local/bin/autoaim_autostart.sh
 
 ExecStop=-/usr/bin/docker exec -w /workspaces/isaac_ros-dev autoaim_headless bash -lc 'if [ -f /tmp/autoaim_launch.pid ]; then PID="$(cat /tmp/autoaim_launch.pid)"; echo "[autoaim] stopping launch process group $PID"; kill -INT "-$PID" 2>/dev/null || kill -INT "$PID" 2>/dev/null || true; sleep 3; kill -TERM "-$PID" 2>/dev/null || true; rm -f /tmp/autoaim_launch.pid; else echo "[autoaim] no launch PID file"; fi'
