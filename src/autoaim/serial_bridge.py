@@ -98,6 +98,10 @@ class SerialBridgeNode(Node):
 
     def __init__(self):
         super().__init__('micro_communications_node')
+        # Launch files keep this false in competition. The C++ serial bridge is
+        # controlled by ROS arguments; this fallback Python bridge skips active
+        # log calls and f-string construction with the same category flag.
+        self._enable_ros_logs = bool(self.declare_parameter("enable_ros_logs", False).value)
 
         # ------------------------------------------------------------------
         # Internal state: latest values from each topic.
@@ -216,19 +220,22 @@ class SerialBridgeNode(Node):
             self._ser.reset_output_buffer()
             self._last_rx_time = time.monotonic()
             self._consecutive_errors = 0
-            self.get_logger().info(
-                f"Serial port {self._port} opened successfully at {self._baudrate} baud.")
+            if self._enable_ros_logs:
+                self.get_logger().info(
+                    f"Serial port {self._port} opened successfully at {self._baudrate} baud.")
             return True
         except (serial.SerialException, OSError) as e:
-            self.get_logger().warn(
-                f"Failed to open serial port {self._port}: {e} — will retry "
-                f"every {self._reconnect_interval:.1f}s")
+            if self._enable_ros_logs:
+                self.get_logger().warn(
+                    f"Failed to open serial port {self._port}: {e} — will retry "
+                    f"every {self._reconnect_interval:.1f}s")
             self._ser = None
             return False
 
     def _close_and_schedule_reconnect(self, reason: str):
         """Close the port and let the next timer tick attempt reconnect."""
-        self.get_logger().warn(f"Serial link lost ({reason}) — will reconnect.")
+        if self._enable_ros_logs:
+            self.get_logger().warn(f"Serial link lost ({reason}) — will reconnect.")
         if self._ser is not None:
             try:
                 self._ser.close()
@@ -271,8 +278,9 @@ class SerialBridgeNode(Node):
             now = time.monotonic()
             if now - self._last_reconnect_attempt >= self._reconnect_interval:
                 self._last_reconnect_attempt = now
-                self.get_logger().info(
-                    f"Attempting serial reconnect on {self._port}...")
+                if self._enable_ros_logs:
+                    self.get_logger().info(
+                        f"Attempting serial reconnect on {self._port}...")
                 self._open_serial()
             return
 
@@ -310,8 +318,9 @@ class SerialBridgeNode(Node):
             self._consecutive_errors = 0
         except (serial.SerialException, OSError) as e:
             self._consecutive_errors += 1
-            self.get_logger().warn(
-                f"Serial TX error ({self._consecutive_errors}): {e}")
+            if self._enable_ros_logs:
+                self.get_logger().warn(
+                    f"Serial TX error ({self._consecutive_errors}): {e}")
             if self._consecutive_errors >= 5:
                 self._close_and_schedule_reconnect(
                     f"{self._consecutive_errors} consecutive TX/RX errors")
@@ -326,8 +335,9 @@ class SerialBridgeNode(Node):
                 self._drain_rx_legacy()
         except (serial.SerialException, OSError) as e:
             self._consecutive_errors += 1
-            self.get_logger().warn(
-                f"Serial RX error ({self._consecutive_errors}): {e}")
+            if self._enable_ros_logs:
+                self.get_logger().warn(
+                    f"Serial RX error ({self._consecutive_errors}): {e}")
             if self._consecutive_errors >= 5:
                 self._close_and_schedule_reconnect(
                     f"{self._consecutive_errors} consecutive TX/RX errors")
@@ -386,11 +396,13 @@ class SerialBridgeNode(Node):
                     if self._sanity_ok(unpacked):
                         self._publish_status(unpacked)
                     else:
-                        self.get_logger().warn(
-                            "RX sanity check failed (garbage values) — flushing buffer")
+                        if self._enable_ros_logs:
+                            self.get_logger().warn(
+                                "RX sanity check failed (garbage values) — flushing buffer")
                         self._ser.reset_input_buffer()
                 except struct.error as e:
-                    self.get_logger().warn(f"RX unpack error: {e}")
+                    if self._enable_ros_logs:
+                        self.get_logger().warn(f"RX unpack error: {e}")
                     self._ser.reset_input_buffer()
 
     def _drain_rx_framed(self):
@@ -433,7 +445,8 @@ class SerialBridgeNode(Node):
     def destroy_node(self):
         if self._ser is not None and self._ser.is_open:
             self._ser.close()
-            self.get_logger().info("Serial port closed.")
+            if self._enable_ros_logs:
+                self.get_logger().info("Serial port closed.")
         super().destroy_node()
 
 

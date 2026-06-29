@@ -15,7 +15,7 @@
     engine_path: "/workspaces/isaac_ros-dev/AI-models/yolov26_keypoints.engine"
     threshold: 0.15          # detection confidence threshold
     nms_iou: 0.2             # NMS IoU (raw-output engines only; post-NMS engines skip it)
-    debug_scores: true
+    debug_scores: false        # score logging/debug aid; inactive unless code paths use it
 
     # ── Camera capture (ZED SDK) ──
     resolution: "SVGA"       # VGA | SVGA | HD720 | HD1080 | HD1200 (per-eye left image)
@@ -27,7 +27,13 @@
     auto_white_balance: true # WHITEBALANCE_AUTO
 
     # ── Publishing ──
-    publish_debug_every: 4   # /yolo/debug_image: publish every N frames (0 = never)
-    camera_info_every: 1     # /camera_info: publish every N frames (0 = never)
+    # Safe-by-default: a normal launch is competition mode. Debug outputs are
+    # opt-in from the launch-file DEBUG_SETTINGS block; /detector/armors and
+    # /detector/armors_keypoints stay functional and are never gated here.
+    publish_debug_every: 0   # /yolo/debug_image: every N frames (0 = no publisher)
+    publish_json: false      # /detector/armors_keypoints_json: debug echo only
+    # Intrinsics are static for this stream. The first frame is still published
+    # immediately, then repeated sparsely for late subscribers.
+    camera_info_every: 60    # /camera_info: every N frames (0 = never)
     frame_id: "camera_color_optical_frame"
     imu_frame_id: "zed_imu_link"
