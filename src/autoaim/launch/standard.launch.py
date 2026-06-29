@@ -94,7 +94,7 @@ def autoaim_params():
         # True: read our team color from /micro_status[target_color_status_index]
         #       and pick the enemy class automatically via micro_color_target_classes.
         # False: always shoot the fixed class list in target_classes below.
-        {"target_classes_from_micro_status": False},  # ON/OFF auto color from micro
+        {"target_classes_from_micro_status": True},  # ON/OFF auto color from micro
 
         # micro_color_target_classes[i] = YOLO class to shoot when micro sends i.
         #   i=0 (we are red)  -> shoot blue -> "0"
@@ -124,7 +124,7 @@ def autoaim_params():
         # missing image<->angle sync (now fixed). High q makes the state track
         # measurement noise -> jittery commands -> fire-lock dropouts.
         # Start lower; raise again only if tracking feels sluggish AFTER the fix.
-        {"q_pos": 100.0},
+        {"q_pos": 80.0},
         # q_z DECOUPLED from q_pos: the height channel must NOT inherit the big
         # q_pos used to chase movers, or PnP z-jitter becomes phantom vertical
         # velocity and the pitch oscillates. Keep small.
@@ -147,7 +147,7 @@ def autoaim_params():
         {"radius_ema_alpha": 0.05},
         {"initial_dz": 0.05},
 
-        {"bullet_speed": 25.0},
+        {"bullet_speed": 24.0},
         {"gravity": 9.8},
         {"gimbal_height": 0.420},
 
@@ -188,7 +188,7 @@ def autoaim_params():
         # muzzle exit (calibrate: shoot a mover, adjust in 5 ms steps; the node
         # logs the measured pipeline part every 2 s).
         {"use_measured_latency": True},
-        {"actuation_latency": 0.020},
+        {"actuation_latency": 0.045},
         # Fallback fixed bias, used ONLY if use_measured_latency is False.
         {"time_bias": 0.045},
 
