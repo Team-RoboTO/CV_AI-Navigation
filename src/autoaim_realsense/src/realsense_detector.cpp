@@ -3,13 +3,20 @@
 // This is the C++ twin of zed_detector.py. It uses librealsense2 DIRECTLY (no
 // realsense2_camera ROS node, no image-topic round trip) and the COLOR stream
 // only, runs the SAME TensorRT engine through a CUDA letterbox preprocess, and
-// publishes the SAME topics / message types that autoaim already consumes:
+// publishes the SAME functional topics / message types that autoaim consumes:
 //
 //   /detector/armors               vision_msgs/Detection2DArray  (legacy bbox)
 //   /detector/armors_keypoints     autoaim/ArmorKeypointArray    (tracking input)
-//   /detector/armors_keypoints_json std_msgs/String              (debug)
-//   /yolo/debug_image              sensor_msgs/Image             (throttled)
 //   /camera_info                   sensor_msgs/CameraInfo        (color intrinsics)
+//
+// Debug outputs are opt-in safe-by-default:
+//
+//   /detector/armors_keypoints_json std_msgs/String              (debug)
+//   /yolo/debug_image              sensor_msgs/Image             (throttled debug)
+//
+// Tracking never reads the JSON string; it consumes the typed
+// ArmorKeypointArray above. Keeping debug publishers off by default makes a
+// normal launch a competition launch while still allowing per-output diagnosis.
 //
 // The class-id convention (0 blue, 1 grey, 2 red) and keypoint order
 // (TL,TR,BR,BL) are identical to the ZED path — autoaim does not need to know
@@ -77,12 +84,31 @@ constexpr float kKeypointScoreThreshold = 0.05f;
     }                                                                          \
   } while (0)
 
+// Runtime ROS log gate. Launch files default enable_ros_logs=false in
+// competition; these wrappers avoid entering RCLCPP_* macros at all when the
+// flag is off, while keeping the original log call sites maintainable.
+#define AA_RCLCPP_LOG_IF(enabled, macro_name, ...) \
+  do { \
+    if (enabled) { \
+      macro_name(__VA_ARGS__); \
+    } \
+  } while (0)
+#define AA_RCLCPP_DEBUG(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_DEBUG, __VA_ARGS__)
+#define AA_RCLCPP_INFO(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_INFO, __VA_ARGS__)
+#define AA_RCLCPP_WARN(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_WARN, __VA_ARGS__)
+#define AA_RCLCPP_ERROR(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_ERROR, __VA_ARGS__)
+#define AA_RCLCPP_FATAL(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_FATAL, __VA_ARGS__)
+#define AA_RCLCPP_INFO_THROTTLE(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_INFO_THROTTLE, __VA_ARGS__)
+#define AA_RCLCPP_WARN_THROTTLE(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_WARN_THROTTLE, __VA_ARGS__)
+
+std::atomic_bool g_realsense_ros_logs_enabled{false};
+
 // Minimal TensorRT logger (warnings and above, like the Python detector).
 class TrtLogger : public nvinfer1::ILogger {
  public:
   void log(Severity severity, const char* msg) noexcept override {
     if (severity <= Severity::kWARNING) {
-      RCLCPP_WARN(rclcpp::get_logger("realsense_detector.trt"), "%s", msg);
+      AA_RCLCPP_WARN(g_realsense_ros_logs_enabled.load(std::memory_order_relaxed), rclcpp::get_logger("realsense_detector.trt"), "%s", msg);
     }
   }
 };
@@ -118,6 +144,10 @@ class RealSenseDetector : public rclcpp::Node {
     engine_path_ = resolve_engine_path(declare_parameter<std::string>("engine_path", ""));
     threshold_ = static_cast<float>(declare_parameter<double>("threshold", 0.15));
     nms_iou_ = static_cast<float>(declare_parameter<double>("nms_iou", 0.2));
+    // Runtime log gate. False skips AA_RCLCPP_* wrappers entirely while the
+    // detector still publishes functional bbox/keypoint/CameraInfo topics.
+    enable_ros_logs_ = declare_parameter<bool>("enable_ros_logs", false);
+    g_realsense_ros_logs_enabled.store(enable_ros_logs_, std::memory_order_relaxed);
     serial_no_ = declare_parameter<std::string>("serial_no", "");
     req_width_ = declare_parameter<int>("width", 640);
     req_height_ = declare_parameter<int>("height", 480);
@@ -140,16 +170,32 @@ class RealSenseDetector : public rclcpp::Node {
     enable_imu_ = declare_parameter<bool>("enable_imu", false);
     // Rotate the color image 180 deg for an upside-down camera mount.
     flip_180_ = declare_parameter<bool>("flip_180", false);
-    publish_debug_every_ = declare_parameter<int>("publish_debug_every", 4);
+    // Debug image cadence: 0 means no debug-image publisher at all. The typed
+    // keypoint and bbox topics below are the functional detector path and are
+    // never gated by this safe-by-default debug knob.
+    publish_debug_every_ = declare_parameter<int>("publish_debug_every", 0);
+    // JSON is a viewer/echo aid only. The tracker reads the typed
+    // /detector/armors_keypoints message, never this string, so disabling it
+    // cannot break detection -> tracking -> command -> serial -> fire.
+    publish_json_ = declare_parameter<bool>("publish_json", false);
     camera_info_every_ = declare_parameter<int>("camera_info_every", 1);
     frame_id_ = declare_parameter<std::string>("frame_id", "camera_color_optical_frame");
 
     auto qos = rclcpp::SensorDataQoS();
     det_pub_ = create_publisher<vision_msgs::msg::Detection2DArray>("/detector/armors", qos);
     kpt_pub_ = create_publisher<autoaim::msg::ArmorKeypointArray>("/detector/armors_keypoints", qos);
-    json_pub_ = create_publisher<std_msgs::msg::String>("/detector/armors_keypoints_json", qos);
-    img_pub_ = create_publisher<sensor_msgs::msg::Image>("/yolo/debug_image", 1);
-    cam_info_pub_ = create_publisher<sensor_msgs::msg::CameraInfo>("/camera_info", qos);
+    if (publish_json_) {
+      json_pub_ = create_publisher<std_msgs::msg::String>("/detector/armors_keypoints_json", qos);
+    }
+    if (publish_debug_every_ > 0) {
+      img_pub_ = create_publisher<sensor_msgs::msg::Image>("/yolo/debug_image", 1);
+    }
+    // Camera intrinsics are static and published sparsely (camera_info_every).
+    // Latch them (transient-local + reliable) so a late-joining or respawned
+    // autoaim node receives the last CameraInfo immediately, instead of waiting
+    // up to camera_info_every frames for the next one.
+    auto cam_info_qos = rclcpp::QoS(1).reliable().transient_local();
+    cam_info_pub_ = create_publisher<sensor_msgs::msg::CameraInfo>("/camera_info", cam_info_qos);
 
     initRealSense();   // opens color stream, fills native_w/h_, cam_info_msg_
     initTensorRT();    // deserializes engine, parses IO shapes
@@ -157,7 +203,7 @@ class RealSenseDetector : public rclcpp::Node {
 
     running_ = true;
     worker_ = std::thread(&RealSenseDetector::captureLoop, this);
-    RCLCPP_INFO(get_logger(),
+    AA_RCLCPP_INFO(enable_ros_logs_, get_logger(),
                 "RealSense detector started: %dx%d@%d, engine=%s",
                 native_w_, native_h_, req_fps_, engine_path_.c_str());
   }
@@ -219,7 +265,7 @@ class RealSenseDetector : public rclcpp::Node {
         }
       }
     } catch (const rs2::error& e) {
-      RCLCPP_WARN(get_logger(), "RealSense option set failed: %s", e.what());
+      AA_RCLCPP_WARN(enable_ros_logs_, get_logger(), "RealSense option set failed: %s", e.what());
     }
 
     // Color intrinsics -> cached CameraInfo (intrinsics do not change at runtime).
@@ -255,7 +301,7 @@ class RealSenseDetector : public rclcpp::Node {
         cam_info_msg_.distortion_model = "plumb_bob";
         break;
     }
-    RCLCPP_INFO(get_logger(),
+    AA_RCLCPP_INFO(enable_ros_logs_, get_logger(),
                 "RealSense color intrinsics %dx%d fx=%.1f fy=%.1f cx=%.1f cy=%.1f",
                 native_w_, native_h_, intr.fx, intr.fy, intr.ppx, intr.ppy);
   }
@@ -346,7 +392,7 @@ class RealSenseDetector : public rclcpp::Node {
       num_classes_ = output_channels_ - 4 - kNumKeypoints * 3;
       if (num_classes_ <= 0) throw std::runtime_error("Invalid raw pose output channels");
     }
-    RCLCPP_INFO(get_logger(),
+    AA_RCLCPP_INFO(enable_ros_logs_, get_logger(),
                 "Engine net=%d in_ch=%d out_mode=%s out_ch=%d anchors=%d classes=%d",
                 img_size_, input_channels_, output_mode_post_nms_ ? "post_nms" : "raw",
                 output_channels_, num_anchors_, num_classes_);
@@ -393,7 +439,7 @@ class RealSenseDetector : public rclcpp::Node {
       try {
         fs = pipe_.wait_for_frames(1000);
       } catch (const rs2::error& e) {
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_, get_logger(), *get_clock(), 2000,
                              "RealSense wait_for_frames: %s", e.what());
         continue;
       }
@@ -447,7 +493,7 @@ class RealSenseDetector : public rclcpp::Node {
                              pad_y_net_, unscaled_h_net_, scale_net_to_native_, stream_);
     }
     if (!context_->enqueueV3(stream_)) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "enqueueV3 failed");
+      AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_, get_logger(), *get_clock(), 2000, "enqueueV3 failed");
       return;
     }
     CUDA_CHECK(cudaMemcpyAsync(h_out_, d_out_, out_count_ * sizeof(float),
@@ -583,10 +629,14 @@ class RealSenseDetector : public rclcpp::Node {
     kpt_arr.image_height = static_cast<uint32_t>(native_h_);
     kpt_arr.keypoint_order = {"TL", "TR", "BR", "BL"};
 
-    std::ostringstream json;
-    json << "{\"header\":{\"stamp\":{\"sec\":" << stamp.seconds() << "},\"frame_id\":\""
-         << frame_id_ << "\"},\"image_width\":" << native_w_ << ",\"image_height\":"
-         << native_h_ << ",\"keypoint_order\":[\"TL\",\"TR\",\"BR\",\"BL\"],\"detections\":[";
+    std::unique_ptr<std::ostringstream> json;
+    if (publish_json_) {
+      json = std::make_unique<std::ostringstream>();
+      *json << "{\"header\":{\"stamp\":{\"sec\":" << stamp.seconds() << "},\"frame_id\":\""
+            << frame_id_ << "\"},\"image_width\":" << native_w_ << ",\"image_height\":"
+            << native_h_
+            << ",\"keypoint_order\":[\"TL\",\"TR\",\"BR\",\"BL\"],\"detections\":[";
+    }
 
     bool first = true;
     for (const Armor& a : armors_) {
@@ -632,19 +682,23 @@ class RealSenseDetector : public rclcpp::Node {
       }
       kpt_arr.detections.push_back(k);
 
-      if (!first) json << ",";
-      first = false;
-      json << "{\"class_id\":" << a.cls << ",\"class_name\":\"" << class_name(a.cls)
-           << "\",\"confidence\":" << a.conf << ",\"bbox\":{\"cx\":" << (L + W * 0.5f)
-           << ",\"cy\":" << (T + H * 0.5f) << ",\"w\":" << W << ",\"h\":" << H << "}}";
+      if (publish_json_) {
+        if (!first) *json << ",";
+        first = false;
+        *json << "{\"class_id\":" << a.cls << ",\"class_name\":\"" << class_name(a.cls)
+              << "\",\"confidence\":" << a.conf << ",\"bbox\":{\"cx\":" << (L + W * 0.5f)
+              << ",\"cy\":" << (T + H * 0.5f) << ",\"w\":" << W << ",\"h\":" << H << "}}";
+      }
     }
-    json << "]}";
 
     det_pub_->publish(det_arr);
     kpt_pub_->publish(kpt_arr);
-    std_msgs::msg::String js;
-    js.data = json.str();
-    json_pub_->publish(js);
+    if (publish_json_ && json_pub_) {
+      *json << "]}";
+      std_msgs::msg::String js;
+      js.data = json->str();
+      json_pub_->publish(js);
+    }
   }
 
   void publishDebugImage(const uint8_t* data, const rclcpp::Time& stamp) {
@@ -674,7 +728,9 @@ class RealSenseDetector : public rclcpp::Node {
   int color_bpp_{3};  // bytes/px of the color stream: 3 (BGR8) or 2 (YUYV)
   cv::Mat flip_buf_;   // reused 180-rotated color buffer (BGR8 + flip_180_ only)
   cv::Mat debug_bgr_;  // reused BGR debug image built from YUYV (yuyv only)
-  int publish_debug_every_{4}, camera_info_every_{1};
+  int publish_debug_every_{0}, camera_info_every_{1};
+  bool publish_json_{false};
+  bool enable_ros_logs_{false};
 
   // ── RealSense ──
   rs2::pipeline pipe_;
@@ -727,7 +783,7 @@ int main(int argc, char** argv) {
   try {
     rclcpp::spin(std::make_shared<RealSenseDetector>());
   } catch (const std::exception& e) {
-    RCLCPP_FATAL(rclcpp::get_logger("realsense_detector"), "fatal: %s", e.what());
+    AA_RCLCPP_FATAL(g_realsense_ros_logs_enabled.load(std::memory_order_relaxed), rclcpp::get_logger("realsense_detector"), "fatal: %s", e.what());
     rclcpp::shutdown();
     return 1;
   }

@@ -61,6 +61,103 @@ The C++ `serial_bridge` executable is used by default. The Python `serial_bridge
 remains installed as a fallback with the same node name, parameters, topics, and raw
 packet layout.
 
+### Debug policy and launch-file debug settings
+
+Normal launch files are safe-by-default competition launches. Debug publishers are off,
+viewer nodes are off, and ROS log sinks are off. The functional pipeline must stay active
+without carrying debug publishers, debug image encoding, RViz marker construction, JSON
+string formatting, or console/rosout logging.
+
+The controls are grouped near the top of each launch file in `DEBUG_SETTINGS`. They are
+normal launch-file configuration values, not command-line launch arguments. Change them
+in the launch file when preparing a bench/debug profile, and keep the committed
+competition defaults off unless the robot-specific profile explicitly needs otherwise.
+
+Never gate the functional path with these settings: `/detector/armors`,
+`/detector/armors_keypoints`, `/cmd_vel_AI`, serial TX, fire control, PnP, EKF, and
+calibration parameters must keep the same behavior in competition and debug modes. In
+particular, `/detector/armors` must stay published because sentry/hero turret mux logic
+uses the bbox detections for navigation/turret arbitration.
+
+#### How ROS log control works
+
+Each launch file has two layers of log control:
+
+1. Per-node category flags such as `log_detector_enable` and `log_autoaim_enable`. If a
+   category is false, the launch helper passes `--log-level fatal` to that node. If the
+   category is true, the helper passes that node's `log_level_*` value, whose default is
+   `warn` to match normal ROS warning/error behavior.
+2. The master sink flag `ros_log_sinks_enable`. If false, the launch helper also passes
+   `--disable-stdout-logs`, `--disable-rosout-logs`, and `--disable-external-lib-logs`.
+   With the sinks disabled, ROS logging produces no stdout/rosout/external-lib output,
+   including fatal output. This is the competition-match default.
+
+This is runtime ROS logging control, not compile-time removal. C++ nodes receive the
+`enable_ros_logs` parameter and use local `AA_RCLCPP_*` wrappers; when false, the wrapper
+returns before entering the underlying `RCLCPP_*` macro, so macro arguments such as
+`get_clock()`, `.c_str()`, and throttle bookkeeping are not evaluated. The ROS log-level
+and sink arguments remain in place as a second layer of protection and to control output
+when logs are enabled. Python nodes also receive `enable_ros_logs`; when false, their
+active `get_logger()` calls and f-string construction are skipped before entering rclpy
+logging.
+
+Keep log suppression centralized through the launch `DEBUG_SETTINGS` flags and the
+per-file `AA_RCLCPP_*` wrappers. Do not add ad hoc booleans around individual log lines;
+that makes it too easy for different nodes to drift from the same safe-by-default policy.
+
+| `DEBUG_SETTINGS` key | Type/default | Node/launch file | Effect when enabled or changed |
+|---|---:|---|---|
+| `viewer_node_enable` | bool, `False` | launch-only, all launch files | Starts `autoaim_viewer`. When false, the viewer is not launched and `/tracker/debug_image` is absent. It does not affect detector, tracker, `/cmd_vel_AI`, serial, or fire. |
+| `detector_publish_debug_every` | int, `0` | ZED + RealSense detector | Passed to detector parameter `publish_debug_every`. `0` means no `/yolo/debug_image` publisher. A value like `4` publishes one annotated image every fourth frame for bench diagnosis. Functional detector topics remain unconditional. |
+| `detector_publish_json` | bool, `False` | ZED + RealSense detector | Passed to detector parameter `publish_json`. Creates/publishes `/detector/armors_keypoints_json`, a human-readable debug echo for `ros2 topic echo` or ad hoc tools. The tracker never reads this string; it consumes the typed `/detector/armors_keypoints` message. |
+| `autoaim_publish_markers` | bool, `False` | `autoaim_node` | Passed to `debug_publish_markers`. Creates `/tracker/marker` and calls RViz MarkerArray construction only when true. `/cmd_vel_AI` and target tracking stay unconditional. |
+| `autoaim_publish_aim_pixels` | bool, `False` | `autoaim_node` | Passed to `debug_publish_aim_pixels`. Creates `/tracker/aim_pixels` for viewer/HUD debugging only when true. Pixel projection math used by `require_aim_inside_frame` is not gated. |
+| `ros_log_sinks_enable` | bool, `False` | all ROS nodes | Master ROS log sink switch. False adds `--disable-stdout-logs`, `--disable-rosout-logs`, and `--disable-external-lib-logs`, so even fatal ROS log output is suppressed. It does not stop rclcpp/rclpy nodes from running. |
+| `log_detector_enable` | bool, `False` | active detector node | Detector log category. False passes `enable_ros_logs=false`, so ZED Python skips active logger calls and RealSense C++ skips `AA_RCLCPP_*` before entering `RCLCPP_*`; true uses `log_level_detector`. |
+| `log_autoaim_enable` | bool, `False` | `autoaim_node` | Autoaim/tracker log category. False passes `enable_ros_logs=false`, so C++ log wrappers return before the `RCLCPP_*` macros. Tracking and `/cmd_vel_AI` remain unchanged. |
+| `log_serial_enable` | bool, `False` | `serial_bridge` | Serial bridge log category. False suppresses reconnect/TX/RX log calls. Both C++ and Python fallback bridge receive `enable_ros_logs=false`; serial TX/RX and `/micro_status` remain unchanged. |
+| `log_viewer_enable` | bool, `False` | `autoaim_viewer` | Viewer log category. Relevant only when `viewer_node_enable` is true. Python viewer skips active log calls and f-string construction when false. |
+| `log_turret_mux_enable` | bool, `False` | `turret_yaw_mux`, sentry only | Sentry-only mux log category. False passes `enable_ros_logs=false`, so C++ mux wrappers return before `RCLCPP_*`. This key exists only in launch files that instantiate the mux. |
+| `log_level_detector` | string, `"warn"` | active detector node | Used only when `log_detector_enable=true`. Set to `info` or `debug` for deeper diagnosis; default `warn` restores normal warning/error behavior. |
+| `log_level_autoaim` | string, `"warn"` | `autoaim_node` | Used only when `log_autoaim_enable=true`. |
+| `log_level_serial` | string, `"warn"` | `serial_bridge` | Used only when `log_serial_enable=true`. |
+| `log_level_viewer` | string, `"warn"` | `autoaim_viewer` | Used only when `log_viewer_enable=true`. |
+| `log_level_turret_mux` | string, `"warn"` | `turret_yaw_mux`, sentry only | Used only when `log_turret_mux_enable=true`. |
+
+#### Useful log profiles
+
+Competition default in the launch files:
+
+```python
+"ros_log_sinks_enable": False
+"log_detector_enable": False
+"log_autoaim_enable": False
+"log_serial_enable": False
+"log_viewer_enable": False
+```
+
+Bench profile with normal warning/error logs:
+
+```python
+"ros_log_sinks_enable": True
+"log_detector_enable": True
+"log_autoaim_enable": True
+"log_serial_enable": True
+"log_viewer_enable": True
+"log_level_detector": "warn"
+"log_level_autoaim": "warn"
+"log_level_serial": "warn"
+"log_level_viewer": "warn"
+```
+
+Deep diagnosis profile for one node:
+
+```python
+"ros_log_sinks_enable": True
+"log_autoaim_enable": True
+"log_level_autoaim": "info"
+```
+
 ---
 
 ## Models
@@ -126,7 +223,9 @@ For matches, attack only the enemy color. Use both red and blue only for mixed l
 
 ## 1. Launch arguments
 
-These are passed from the command line to launch files.
+These are passed from the command line to launch files. Debug controls are not launch
+arguments anymore; they live in the `DEBUG_SETTINGS` block near the top of each launch
+file so competition defaults cannot be changed accidentally from a normal launch command.
 
 | Parameter | Current/default | Where it impacts code | Raise/lower/change effect |
 |---|---:|---|---|
@@ -148,15 +247,47 @@ They do not tune the ballistic solver, EKF, barrel offsets, or fire gates.
 | `engine_path` | ZED + RealSense | TensorRT engine loaded by the detector. | Not a numeric tuning parameter. Must match model layout, JetPack/TensorRT/GPU. | Detector fails or decodes garbage if incompatible. |
 | `threshold` | ZED + RealSense | YOLO detection confidence threshold. | Fewer false positives and cleaner PnP, but more missed distant/blurred armors. | More recall, but more false positives, PnP jitter, and fire-lock dropouts. |
 | `nms_iou` | ZED + RealSense | Non-maximum suppression IoU for raw-output engines. Post-NMS engines mostly skip it. | More overlapping detections survive. Can duplicate the same armor. | More aggressive suppression. Can delete close/overlapping armors. |
-| `publish_debug_every` | ZED + RealSense | Publishes `/yolo/debug_image` every N frames. | Higher number reduces ROS/CPU overhead but gives less visual feedback. | Lower number gives smoother debug view but increases overhead. `0` disables debug image. |
-| `camera_info_every` | ZED + RealSense | Publishes `/camera_info` every N frames. | Higher number reduces repeated CameraInfo traffic. | Too low is fine; `0` can prevent PnP initialization if autoaim never receives intrinsics. |
+| `publish_debug_every` | ZED + RealSense | Publishes `/yolo/debug_image` every N frames. Default YAML/launch override is `0`, so the debug-image publisher is absent in competition. | Higher number reduces ROS/CPU overhead but gives less visual feedback. | Lower number gives smoother debug view but increases overhead. `0` disables debug image. |
+| `publish_json` | ZED + RealSense | Publishes `/detector/armors_keypoints_json` when true. This is debug-only human-readable output; the tracker uses `/detector/armors_keypoints`. | Enables JSON string construction/publishing for echo tools. | Default false avoids string formatting and removes the JSON publisher in competition. |
+| `camera_info_every` | ZED + RealSense | Publishes `/camera_info` every N frames. YAML value is `60`: the first frame is sent immediately, then sparse repeats because intrinsics are static. `/camera_info` uses a **latched (transient-local) QoS** (see below), so late/respawned subscribers still get the last intrinsics immediately. | Higher number reduces repeated CameraInfo traffic; the latch still covers late subscribers. | Too low just adds redundant traffic. **Never set `0`** — it removes CameraInfo entirely and blocks PnP initialization. |
 | `frame_id` | ZED + RealSense | Header frame for camera image/CameraInfo. | Use only if the rest of the system expects the same frame name. | Wrong frame names confuse debugging/TF conventions. |
+
+#### CameraInfo delivery and latched QoS
+
+`/camera_info` carries the static camera intrinsics (`fx, fy, cx, cy` and distortion).
+`autoaim_node` reads the **first** message it receives, hands the intrinsics to the PnP
+solver, and then ignores every later CameraInfo (`if (pnp_.ready()) return;`). PnP turns
+each 2D armor detection into a 3D position, so until that first CameraInfo arrives autoaim
+cannot aim — the detection callbacks early-return on `!pnp_.ready()`. This is the only
+hard dependency on `/camera_info`; the image topics are not needed by the functional path.
+
+Because the intrinsics never change, the detector publishes them only every
+`camera_info_every` frames (60) instead of every frame. To make that sparse cadence safe,
+`/camera_info` is published with a **latched** profile — `reliability=RELIABLE`,
+`durability=TRANSIENT_LOCAL`, `depth=1` — on both detectors (`zed_detector.py`,
+`realsense_detector.cpp`) and on the matching subscription in `autoaim_node.cpp`.
+Transient-local means the publisher caches the last CameraInfo and delivers it immediately
+to any subscriber that connects later. So an autoaim node that starts after the detector,
+or respawns mid-match, receives the intrinsics at once instead of waiting up to
+`camera_info_every` frames (~0.5 s on ZED at 120 fps, ~1 s on RealSense at 60 fps) for the
+next repeat. With the previous `camera_info_every: 1` this race was masked by re-sending
+every frame; at `60` the latch is what keeps it safe.
+
+How to use it: there is no new launch knob — the latch is automatic. Keep
+`camera_info_every` at any value `> 0` (60 is the competition default) and the latch covers
+late joiners at any cadence; lowering it only adds redundant traffic. Both ends must request
+transient-local for the latch to work, so if you add another consumer of `/camera_info` that
+must survive a late join (e.g. a second tracker), give its subscription
+`reliability=RELIABLE, durability=TRANSIENT_LOCAL`. The viewer deliberately keeps its default
+best-effort/volatile CameraInfo subscription — still compatible (a reliable + transient-local
+publisher serves a best-effort + volatile reader), it just does not need the cache. Never set
+`camera_info_every: 0`.
 
 ### ZED-specific parameters: `config/zed.yaml`
 
 | Parameter | Current value | Effect | If increased/enabled | If decreased/disabled |
 |---|---:|---|---|---|
-| `debug_scores` | `true` | Draws/logs detection scores in debug output. | More useful debug visualization. | Cleaner debug output, slightly less overlay work. |
+| `debug_scores` | `false` | Historical score logging/debug aid. The current score log call sites are commented out, but the parameter remains safe-by-default so re-enabling them is opt-in. | More useful score diagnostics if those code paths are re-enabled. | Competition default; no score-log work. |
 | `resolution` | `SVGA` | ZED left-image resolution used for inference geometry and CameraInfo. | Higher resolution improves keypoint precision at distance but increases latency/load. | Lower resolution reduces latency/load but worsens long-range PnP. |
 | `fps` | `120` | ZED capture FPS. | Higher FPS helps spinner tracking only if inference keeps up. | Lower FPS reduces load but worsens face-jump timing and target motion tracking. |
 | `image_flip` | `true` | Corrects upside-down camera mount with ZED SDK flip. | Correct when camera is mounted upside-down. Also affects which physical sensor becomes the active left image. | Wrong value flips keypoint geometry and can corrupt PnP/yaw. |
@@ -189,6 +320,17 @@ They do not tune the ballistic solver, EKF, barrel offsets, or fire gates.
 
 These parameters are consumed by `autoaim_node.cpp` and `tracker.cpp`. They are the main
 robot-specific tuning surface.
+
+### Debug-only AutoAim outputs
+
+These parameters are set from the launch-file `DEBUG_SETTINGS` block. They affect only
+debug publishers and debug message construction; they must never be used to gate tracking,
+command publication, serial TX, or fire decisions.
+
+| Parameter | Current/default | Effect | If enabled |
+|---|---:|---|---|
+| `debug_publish_markers` | `false` | Controls `/tracker/marker` RViz MarkerArray output. The launch gate skips the `publishMarkers(...)` call, so MarkerArray construction is avoided when false. | Useful for RViz tracker geometry debugging. No effect on `/cmd_vel_AI`. |
+| `debug_publish_aim_pixels` | `false` | Controls `/tracker/aim_pixels`, a viewer/HUD aid containing projected aim/impact pixels. | Useful for image-space aim debugging. Pixel projection math needed by `require_aim_inside_frame` remains active regardless of this flag. |
 
 ### Target color and detector input
 

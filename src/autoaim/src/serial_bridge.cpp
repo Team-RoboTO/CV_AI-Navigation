@@ -77,6 +77,23 @@
 #include <geometry_msgs/msg/twist.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
 
+// Runtime ROS log gate. Launch files default enable_ros_logs=false in
+// competition; these wrappers avoid entering RCLCPP_* macros at all when the
+// flag is off, while keeping the original log call sites maintainable.
+#define AA_RCLCPP_LOG_IF(enabled, macro_name, ...) \
+  do { \
+    if (enabled) { \
+      macro_name(__VA_ARGS__); \
+    } \
+  } while (0)
+#define AA_RCLCPP_DEBUG(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_DEBUG, __VA_ARGS__)
+#define AA_RCLCPP_INFO(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_INFO, __VA_ARGS__)
+#define AA_RCLCPP_WARN(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_WARN, __VA_ARGS__)
+#define AA_RCLCPP_ERROR(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_ERROR, __VA_ARGS__)
+#define AA_RCLCPP_FATAL(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_FATAL, __VA_ARGS__)
+#define AA_RCLCPP_INFO_THROTTLE(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_INFO_THROTTLE, __VA_ARGS__)
+#define AA_RCLCPP_WARN_THROTTLE(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_WARN_THROTTLE, __VA_ARGS__)
+
 namespace
 {
 constexpr size_t TX_NUM_VALUES = 7;
@@ -138,6 +155,9 @@ public:
     cmd_timeout_ = declare_parameter<double>("cmd_timeout", 0.3);
     use_framed_ = declare_parameter<bool>("use_framed_protocol", false);
     const double tx_hz = declare_parameter<double>("serial_tx_hz", 100.0);
+    // Runtime log gate for the C++ bridge. False skips AA_RCLCPP_* wrappers
+    // entirely but never changes serial TX/RX, micro_status, or safety watchdogs.
+    enable_ros_logs_ = declare_parameter<bool>("enable_ros_logs", false);
 
     parity_ = declare_parameter<std::string>("serial_parity", "even");
     low_latency_ = declare_parameter<bool>("low_latency", false);
@@ -201,7 +221,7 @@ public:
       std::chrono::duration<double>(1.0 / std::max(tx_hz, 1.0)),
       std::bind(&SerialBridgeNode::serialTick, this));
 
-    RCLCPP_INFO(
+    AA_RCLCPP_INFO(enable_ros_logs_,
       get_logger(),
       "serial_bridge started: turret_cmd=%s nav_cmd=%s micro_status=%s",
       turret_cmd_topic_.c_str(), nav_cmd_topic_.c_str(), micro_status_topic_.c_str());
@@ -211,7 +231,7 @@ public:
   {
     if (fd_ >= 0) {
       ::close(fd_);
-      RCLCPP_INFO(get_logger(), "Serial port closed.");
+      AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "Serial port closed.");
     }
   }
 
@@ -223,12 +243,12 @@ public:
     sp.sched_priority = thread_priority_;
 
     if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
-      RCLCPP_WARN(
+      AA_RCLCPP_WARN(enable_ros_logs_,
         get_logger(),
         "Could not set SCHED_FIFO priority %d. Need rtprio rlimit or CAP_SYS_NICE.",
         thread_priority_);
     } else {
-      RCLCPP_INFO(get_logger(), "Serial bridge running at SCHED_FIFO priority %d.",
+      AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "Serial bridge running at SCHED_FIFO priority %d.",
         thread_priority_);
     }
   }
@@ -276,13 +296,13 @@ private:
 
     const speed_t speed = baud_to_speed(baudrate_);
     if (speed == 0) {
-      RCLCPP_ERROR(get_logger(), "Unsupported baudrate %d", baudrate_);
+      AA_RCLCPP_ERROR(enable_ros_logs_, get_logger(), "Unsupported baudrate %d", baudrate_);
       return false;
     }
 
     int fd = ::open(port_.c_str(), O_RDWR | O_NOCTTY);
     if (fd < 0) {
-      RCLCPP_WARN(get_logger(),
+      AA_RCLCPP_WARN(enable_ros_logs_, get_logger(),
         "Failed to open serial port %s: %s — will retry every %.1fs",
         port_.c_str(), std::strerror(errno), reconnect_interval_);
       return false;
@@ -290,7 +310,7 @@ private:
 
     termios tio{};
     if (tcgetattr(fd, &tio) != 0) {
-      RCLCPP_WARN(get_logger(), "tcgetattr failed on %s: %s", port_.c_str(),
+      AA_RCLCPP_WARN(enable_ros_logs_, get_logger(), "tcgetattr failed on %s: %s", port_.c_str(),
         std::strerror(errno));
       ::close(fd);
       return false;
@@ -319,7 +339,7 @@ private:
     tio.c_cc[VTIME] = 0;
 
     if (tcsetattr(fd, TCSANOW, &tio) != 0) {
-      RCLCPP_WARN(get_logger(), "tcsetattr failed on %s: %s", port_.c_str(),
+      AA_RCLCPP_WARN(enable_ros_logs_, get_logger(), "tcsetattr failed on %s: %s", port_.c_str(),
         std::strerror(errno));
       ::close(fd);
       return false;
@@ -330,7 +350,7 @@ private:
       if (ioctl(fd, TIOCGSERIAL, &ss) == 0) {
         ss.flags |= ASYNC_LOW_LATENCY;
         if (ioctl(fd, TIOCSSERIAL, &ss) != 0) {
-          RCLCPP_WARN(
+          AA_RCLCPP_WARN(enable_ros_logs_,
             get_logger(),
             "ASYNC_LOW_LATENCY not supported on %s. This is normal on many CDC-ACM devices.",
             port_.c_str());
@@ -345,14 +365,14 @@ private:
     consecutive_errors_ = 0;
     rx_buf_.clear();
 
-    RCLCPP_INFO(get_logger(), "Serial port %s opened successfully at %d baud.",
+    AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "Serial port %s opened successfully at %d baud.",
       port_.c_str(), baudrate_);
     return true;
   }
 
   void closeAndScheduleReconnect(const std::string & reason)
   {
-    RCLCPP_WARN(get_logger(), "Serial link lost (%s) — will reconnect.", reason.c_str());
+    AA_RCLCPP_WARN(enable_ros_logs_, get_logger(), "Serial link lost (%s) — will reconnect.", reason.c_str());
     if (fd_ >= 0) {
       ::close(fd_);
       fd_ = -1;
@@ -367,7 +387,7 @@ private:
     if (fd_ < 0) {
       if (now - last_reconnect_attempt_ >= reconnect_interval_) {
         last_reconnect_attempt_ = now;
-        RCLCPP_INFO(get_logger(), "Attempting serial reconnect on %s...", port_.c_str());
+        AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "Attempting serial reconnect on %s...", port_.c_str());
         openSerial();
       }
       return;
@@ -444,7 +464,7 @@ private:
     ssize_t written = ::write(fd_, out_ptr, out_len);
     if (written != static_cast<ssize_t>(out_len)) {
       consecutive_errors_++;
-      RCLCPP_WARN(get_logger(), "Serial TX error (%d): %s",
+      AA_RCLCPP_WARN(enable_ros_logs_, get_logger(), "Serial TX error (%d): %s",
         consecutive_errors_, written < 0 ? std::strerror(errno) : "short write");
       if (consecutive_errors_ >= 5) {
         closeAndScheduleReconnect(std::to_string(consecutive_errors_) +
@@ -459,7 +479,7 @@ private:
     const bool rx_ok = use_framed_ ? drainRxFramed() : drainRxLegacy();
     if (!rx_ok) {
       consecutive_errors_++;
-      RCLCPP_WARN(get_logger(), "Serial RX error (%d): %s",
+      AA_RCLCPP_WARN(enable_ros_logs_, get_logger(), "Serial RX error (%d): %s",
         consecutive_errors_, std::strerror(errno));
       if (consecutive_errors_ >= 5) {
         closeAndScheduleReconnect(std::to_string(consecutive_errors_) +
@@ -569,7 +589,7 @@ private:
     if (sanityOk(vals, RX_NUM_VALUES)) {
       publishStatus(vals);
     } else {
-      RCLCPP_WARN(get_logger(), "RX sanity check failed — flushing input buffer.");
+      AA_RCLCPP_WARN(enable_ros_logs_, get_logger(), "RX sanity check failed — flushing input buffer.");
       tcflush(fd_, TCIFLUSH);
     }
 
@@ -681,6 +701,7 @@ private:
   bool use_framed_ = false;
   bool low_latency_ = false;
   int thread_priority_ = 0;
+  bool enable_ros_logs_ = false;
 
   int fd_ = -1;
   double last_rx_time_ = 0.0;

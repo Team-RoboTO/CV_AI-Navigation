@@ -54,6 +54,9 @@ class ViewerNode(Node):
     def __init__(self):
         super().__init__('autoaim_viewer')
         self.bridge = CvBridge()
+        # Launch files keep this false in competition. Guard active Python log
+        # calls so f-strings and rclpy logging work are skipped when logs are off.
+        self.enable_ros_logs = bool(self.declare_parameter("enable_ros_logs", False).value)
 
         self.detections = []
         self.keypoint_detections = []  # ArmorKeypoint list, drawn as 4-point polygons
@@ -120,25 +123,28 @@ class ViewerNode(Node):
                 self.keypoint_cb,
                 sensor_qos)
         else:
-            self.get_logger().warn(
-                "autoaim.msg.ArmorKeypointArray not available — keypoint overlay disabled.")
+            if self.enable_ros_logs:
+                self.get_logger().warn(
+                    "autoaim.msg.ArmorKeypointArray not available — keypoint overlay disabled.")
 
         if self.exclusive_output:
             existing_publishers = self.get_publishers_info_by_topic(self.debug_image_topic)
             if existing_publishers:
                 self.publish_enabled = False
-                self.get_logger().error(
-                    f"Not publishing {self.debug_image_topic}: another viewer is already "
-                    f"publishing it ({len(existing_publishers)} publisher(s)). Stop duplicate "
-                    "autoaim launches/viewers to remove flicker.")
+                if self.enable_ros_logs:
+                    self.get_logger().error(
+                        f"Not publishing {self.debug_image_topic}: another viewer is already "
+                        f"publishing it ({len(existing_publishers)} publisher(s)). Stop duplicate "
+                        "autoaim launches/viewers to remove flicker.")
 
         self.pub = (
             self.create_publisher(Image, self.debug_image_topic, 1)
             if self.publish_enabled else None)
-        self.get_logger().info(
-            f"Viewer fire lock thresholds: yaw={self.fire_lock_yaw:.3f} rad, "
-            f"pitch={self.fire_lock_pitch:.3f} rad")
-        self.get_logger().info(f'Viewer started — view {self.debug_image_topic} in RViz2')
+        if self.enable_ros_logs:
+            self.get_logger().info(
+                f"Viewer fire lock thresholds: yaw={self.fire_lock_yaw:.3f} rad, "
+                f"pitch={self.fire_lock_pitch:.3f} rad")
+            self.get_logger().info(f'Viewer started — view {self.debug_image_topic} in RViz2')
 
     def camera_info_cb(self, msg):
         self.img_w = int(msg.width)
@@ -260,7 +266,8 @@ class ViewerNode(Node):
                 frame = self.bridge.imgmsg_to_cv2(msg, 'bgra8')
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
             except Exception as e:
-                self.get_logger().warn(f'Image conversion failed: {e}', throttle_duration_sec=5.0)
+                if self.enable_ros_logs:
+                    self.get_logger().warn(f'Image conversion failed: {e}', throttle_duration_sec=5.0)
                 return
 
         frame = frame.copy()

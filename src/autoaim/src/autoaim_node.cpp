@@ -24,6 +24,23 @@
 #include "autoaim/pnp_solver.hpp"
 #include "autoaim/tracker.hpp"
 
+// Runtime ROS log gate. Launch files default enable_ros_logs=false in
+// competition; these wrappers avoid entering RCLCPP_* macros at all when the
+// flag is off, while keeping the original log call sites maintainable.
+#define AA_RCLCPP_LOG_IF(enabled, macro_name, ...) \
+  do { \
+    if (enabled) { \
+      macro_name(__VA_ARGS__); \
+    } \
+  } while (0)
+#define AA_RCLCPP_DEBUG(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_DEBUG, __VA_ARGS__)
+#define AA_RCLCPP_INFO(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_INFO, __VA_ARGS__)
+#define AA_RCLCPP_WARN(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_WARN, __VA_ARGS__)
+#define AA_RCLCPP_ERROR(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_ERROR, __VA_ARGS__)
+#define AA_RCLCPP_FATAL(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_FATAL, __VA_ARGS__)
+#define AA_RCLCPP_INFO_THROTTLE(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_INFO_THROTTLE, __VA_ARGS__)
+#define AA_RCLCPP_WARN_THROTTLE(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_WARN_THROTTLE, __VA_ARGS__)
+
 namespace autoaim
 {
 
@@ -33,6 +50,11 @@ public:
   explicit AutoAimNode(const rclcpp::NodeOptions & options)
   : Node("autoaim", options)
   {
+    // Runtime log gate. When false, the AA_RCLCPP_* wrappers below skip the
+    // ROS logging macros entirely. This is debug-only and never gates tracking,
+    // /cmd_vel_AI, serial, or fire behavior.
+    enable_ros_logs_ = declare_parameter<bool>("enable_ros_logs", false);
+
     // ── All parameters in one place ──
     TrackerConfig cfg;
     cfg.light_ratio      = declare_parameter("light_ratio", 0.85);
@@ -104,7 +126,7 @@ public:
 
     if (target_classes_from_micro_status_) {
       target_classes_.clear();
-      RCLCPP_INFO(
+      AA_RCLCPP_INFO(enable_ros_logs_,
         get_logger(),
         "Target class will be selected from /micro_status[%d]",
         target_color_status_index_);
@@ -131,7 +153,7 @@ public:
     // With gimbal.pitch_sign=-1.0, set this to False (lock uses raw pitch directly).
     // With gimbal.pitch_sign=+1.0 and opposite firmware, set this to True.
     micro_pitch_lock_opposite_sign_ = declare_parameter("micro_pitch_lock_opposite_sign", false);
-    RCLCPP_INFO(
+    AA_RCLCPP_INFO(enable_ros_logs_,
       get_logger(),
       "Fire lock thresholds: yaw=%.3f rad, pitch=%.3f rad "
       "(pitch_feedback_opposite_sign=%s, pitch_lock_opposite_sign=%s)",
@@ -200,21 +222,32 @@ public:
     // header.stamp (zed_detector.py now does — sl.TIME_REFERENCE.IMAGE).
     angle_sync_enable_ = declare_parameter("angle_sync_enable", true);
 
+    // Debug publishers are opt-in safe-by-default. They expose RViz/viewer
+    // telemetry only; the functional path is the unconditional /cmd_vel_AI
+    // command below, which still carries the fire flag to the serial bridge.
+    debug_publish_markers_ = declare_parameter<bool>("debug_publish_markers", false);
+    debug_publish_aim_pixels_ = declare_parameter<bool>("debug_publish_aim_pixels", false);
+
     // ── Subscribers ──
     if (use_keypoints_) {
       kpt_sub_ = create_subscription<autoaim::msg::ArmorKeypointArray>(
         keypoint_topic_, rclcpp::SensorDataQoS(),
         std::bind(&AutoAimNode::keypointCallback, this, std::placeholders::_1));
-      RCLCPP_INFO(get_logger(), "Using YOLO-pose keypoint detections on %s", keypoint_topic_.c_str());
+      AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "Using YOLO-pose keypoint detections on %s", keypoint_topic_.c_str());
     } else {
       det_sub_ = create_subscription<vision_msgs::msg::Detection2DArray>(
         "/detector/armors", rclcpp::SensorDataQoS(),
         std::bind(&AutoAimNode::detectionCallback, this, std::placeholders::_1));
-      RCLCPP_WARN(get_logger(), "Using legacy bbox-only detections on /detector/armors");
+      AA_RCLCPP_WARN(enable_ros_logs_, get_logger(), "Using legacy bbox-only detections on /detector/armors");
     }
 
+    // Intrinsics are static and the detector publishes them sparsely
+    // (camera_info_every) with a latched (transient-local) publisher. Request
+    // transient-local + reliable here too so this subscription receives the last
+    // CameraInfo immediately on (re)connection — otherwise a late join would wait
+    // up to camera_info_every frames before PnP can initialize.
     cam_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(
-      "/camera_info", rclcpp::SensorDataQoS(),
+      "/camera_info", rclcpp::QoS(1).reliable().transient_local(),
       [this](sensor_msgs::msg::CameraInfo::ConstSharedPtr msg) {
         image_width_ = static_cast<int>(msg->width);
         image_height_ = static_cast<int>(msg->height);
@@ -232,7 +265,7 @@ public:
         cam_cx_ = K[2];
         cam_cy_ = K[5];
 
-        RCLCPP_INFO(
+        AA_RCLCPP_INFO(enable_ros_logs_,
           get_logger(),
           "Camera intrinsics received (%dx%d) fx=%.1f fy=%.1f cx=%.1f cy=%.1f",
           msg->width, msg->height, cam_fx_, cam_fy_, cam_cx_, cam_cy_);
@@ -244,11 +277,15 @@ public:
 
     // ── Publishers ──
     twist_pub_ = create_publisher<geometry_msgs::msg::Twist>("/cmd_vel_AI", 10);
-    aim_px_pub_ = create_publisher<geometry_msgs::msg::Twist>("/tracker/aim_pixels", 10);
-    marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
-      "/tracker/marker", 10);
+    if (debug_publish_aim_pixels_) {
+      aim_px_pub_ = create_publisher<geometry_msgs::msg::Twist>("/tracker/aim_pixels", 10);
+    }
+    if (debug_publish_markers_) {
+      marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
+        "/tracker/marker", 10);
+    }
 
-    RCLCPP_INFO(
+    AA_RCLCPP_INFO(enable_ros_logs_,
       get_logger(),
       "Auto-aim node started: using /micro_status [yaw, pitch, vx, vy, ...], publishing /cmd_vel_AI");
   }
@@ -257,7 +294,7 @@ private:
   void microStatusCallback(const std_msgs::msg::Float32MultiArray::ConstSharedPtr msg)
   {
     if (msg->data.size() < 2) {
-      RCLCPP_WARN_THROTTLE(
+      AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_,
         get_logger(), *get_clock(), 2000,
         "/micro_status needs at least 2 floats: [yaw_rad, pitch_rad, vx, vy, ...]");
       return;
@@ -363,7 +400,7 @@ private:
     if (target_color_status_index_ < 0 ||
         static_cast<size_t>(target_color_status_index_) >= msg.data.size())
     {
-      RCLCPP_WARN_THROTTLE(
+      AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_,
         get_logger(), *get_clock(), 2000,
         "target_color_status_index=%d is not available in /micro_status "
         "(size=%zu); not selecting a target color yet",
@@ -375,7 +412,7 @@ private:
       static_cast<double>(msg.data[static_cast<size_t>(target_color_status_index_)]);
 
     if (!std::isfinite(raw_color)) {
-      RCLCPP_WARN_THROTTLE(
+      AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_,
         get_logger(), *get_clock(), 2000,
         "/micro_status[%d] target color is not finite: %.3f",
         target_color_status_index_, raw_color);
@@ -384,7 +421,7 @@ private:
 
     const int micro_color = static_cast<int>(std::lround(raw_color));
     if (std::abs(raw_color - static_cast<double>(micro_color)) > 0.25) {
-      RCLCPP_WARN_THROTTLE(
+      AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_,
         get_logger(), *get_clock(), 2000,
         "/micro_status[%d] target color should be near an integer, got %.3f",
         target_color_status_index_, raw_color);
@@ -394,7 +431,7 @@ private:
     if (micro_color < 0 ||
         static_cast<size_t>(micro_color) >= micro_color_target_classes_.size())
     {
-      RCLCPP_WARN_THROTTLE(
+      AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_,
         get_logger(), *get_clock(), 2000,
         "/micro_status[%d]=%d has no entry in micro_color_target_classes "
         "(size=%zu)",
@@ -405,7 +442,7 @@ private:
     const std::string & target_class =
       micro_color_target_classes_[static_cast<size_t>(micro_color)];
     if (target_class.empty()) {
-      RCLCPP_WARN_THROTTLE(
+      AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_,
         get_logger(), *get_clock(), 2000,
         "micro_color_target_classes[%d] is empty; not selecting a target color",
         micro_color);
@@ -424,7 +461,7 @@ private:
     last_micro_target_color_ = micro_color;
     resetTrackingForTargetClassChange();
 
-    RCLCPP_INFO(
+    AA_RCLCPP_INFO(enable_ros_logs_,
       get_logger(),
       "Target class from /micro_status[%d]=%d -> %s",
       target_color_status_index_,
@@ -485,7 +522,7 @@ private:
       {
         chassis_yaw = chassis_yaw_;
       } else if (chassis_heading_index_ >= 0) {
-        RCLCPP_WARN_THROTTLE(
+        AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_,
           get_logger(), *get_clock(), 5000,
           "chassis_heading_index=%d set but not available in /micro_status "
           "(size=%zu). Falling back to gimbal yaw — ego-motion will be wrong "
@@ -517,7 +554,7 @@ private:
     // ego-motion is fully validated).
     double drift = std::hypot(robot_x_, robot_y_);
     if (ego_position_max_drift_ > 0.0 && drift > ego_position_max_drift_) {
-      RCLCPP_WARN(
+      AA_RCLCPP_WARN(enable_ros_logs_,
         get_logger(),
         "Ego-motion drift %.2f m exceeds cap %.1f m — resetting origin and "
         "shifting tracker world frame.",
@@ -598,7 +635,7 @@ private:
           pitch = bp;
         }
       } else {
-        RCLCPP_WARN_THROTTLE(
+        AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_,
           get_logger(), *get_clock(), 5000,
           "angle_sync enabled but detection header.stamp is zero — the detector "
           "must forward the camera frame timestamp. Falling back to latest angles.");
@@ -632,7 +669,7 @@ private:
     }
 
     if (p_cam.z() <= 0.05) {
-      RCLCPP_WARN_THROTTLE(
+      AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_,
         get_logger(), *get_clock(), 1000,
         "REJECTED: PnP returned target behind/too close to camera z=%.3f",
         p_cam.z());
@@ -663,7 +700,7 @@ private:
     tf2::Matrix3x3(q_odom).getRPY(r, p, y);
 
     if (std::abs(p_odom.z()) > cfg_.max_armor_z) {
-      RCLCPP_WARN_THROTTLE(
+      AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_,
         get_logger(), *get_clock(), 1000,
         "REJECTED: z=%.2f exceeds max_armor_z=%.1f",
         p_odom.z(), cfg_.max_armor_z);
@@ -677,7 +714,7 @@ private:
     const double rel_range_3d = std::sqrt(
       p_cam.x() * p_cam.x() + p_cam.y() * p_cam.y() + p_cam.z() * p_cam.z());
     if (rel_range_3d > cfg_.max_armor_dist) {
-      RCLCPP_WARN_THROTTLE(
+      AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_,
         get_logger(), *get_clock(), 1000,
         "REJECTED: rel_range=%.2f exceeds max_armor_dist=%.1f",
         rel_range_3d, cfg_.max_armor_dist);
@@ -700,7 +737,7 @@ private:
       yaw_inward = bearing_inward;
     }
 
-    RCLCPP_INFO_THROTTLE(
+    AA_RCLCPP_INFO_THROTTLE(enable_ros_logs_,
       get_logger(), *get_clock(), 1000,
       "PnP OK [%s]: cam=(%.2f,%.2f,%.2f) odom=(%.2f,%.2f,%.2f) yaw=%.2f rel=%.2f large=%d err=%.2f",
       use_keypoints_ ? "keypoints" : "bbox",
@@ -726,7 +763,7 @@ private:
 
     last_time_ = now;
 
-    RCLCPP_INFO_THROTTLE(
+    AA_RCLCPP_INFO_THROTTLE(enable_ros_logs_,
       get_logger(), *get_clock(), 1000,
       "Passing %zu armors to tracker (state=%d)",
       armors.size(), static_cast<int>(tracker_->state()));
@@ -766,7 +803,7 @@ private:
       pipeline_latency = (this->now() - now).seconds();
     }
     tracker_->setPipelineLatency(pipeline_latency);
-    RCLCPP_INFO_THROTTLE(
+    AA_RCLCPP_INFO_THROTTLE(enable_ros_logs_,
       get_logger(), *get_clock(), 2000,
       "pipeline latency (capture->aim) = %.1f ms, + actuation_latency = %.0f ms "
       "(use_measured_latency=%d)",
@@ -812,7 +849,9 @@ private:
     last_imp_pitch_ = imp_cam_pitch;
 
     publishCommand(header, aim);
-    publishMarkers(header, aim);
+    if (debug_publish_markers_) {
+      publishMarkers(header, aim);
+    }
   }
 
   void keypointCallback(const autoaim::msg::ArmorKeypointArray::ConstSharedPtr msg)
@@ -822,7 +861,7 @@ private:
     }
 
     if (!imu_valid_) {
-      RCLCPP_WARN_THROTTLE(
+      AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_,
         get_logger(), *get_clock(), 2000,
         "Waiting for /micro_status: Float32MultiArray [yaw_rad, pitch_rad, vx, vy, ...]");
       return;
@@ -858,7 +897,7 @@ private:
       }
 
       if (!kpts_ok) {
-        RCLCPP_WARN_THROTTLE(
+        AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_,
           get_logger(), *get_clock(), 1000,
           "Skipping class=%s: invalid/low-score keypoints",
           cid.c_str());
@@ -870,7 +909,7 @@ private:
       double reproj_error = 0.0;
 
       if (!pnp_.solveKeypoints(corners, rvec, tvec, is_large, &reproj_error, max_reproj_error_)) {
-        RCLCPP_WARN_THROTTLE(
+        AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_,
           get_logger(), *get_clock(), 1000,
           "PnP FAILED for keypoints class=%s reproj_err=%.2f",
           cid.c_str(), reproj_error);
@@ -892,7 +931,7 @@ private:
     }
 
     if (!imu_valid_) {
-      RCLCPP_WARN_THROTTLE(
+      AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_,
         get_logger(), *get_clock(), 2000,
         "Waiting for /micro_status: Float32MultiArray [yaw_rad, pitch_rad, vx, vy, ...]");
       return;
@@ -927,7 +966,7 @@ private:
       bool is_large = false;
 
       if (!pnp_.solve(cx, cy, w, h, cfg_.light_ratio, rvec, tvec, is_large)) {
-        RCLCPP_WARN_THROTTLE(
+        AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_,
           get_logger(), *get_clock(), 1000,
           "PnP FAILED for bbox (%.0f,%.0f,%.0f,%.0f)",
           cx, cy, w, h);
@@ -1083,7 +1122,9 @@ private:
     double pitch_target_micro = pitch_sign_ * pitch_target;
 
 
-    // Debug projection and validity check.
+    // Pixel projection supports require_aim_inside_frame_ safety and the
+    // optional /tracker/aim_pixels debug topic. Keep the calculation in the
+    // functional path; gate only the debug message allocation/publish below.
     bool pixels_finite = false;
     bool pixels_inside = false;
     double aim_px_x = 0.0;
@@ -1152,7 +1193,7 @@ private:
 
       holding_last_cmd = true;
 
-      RCLCPP_WARN_THROTTLE(
+      AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_,
         get_logger(), *get_clock(), 500,
         "Holding last cmd: tracking=%d finite=%d pixels_inside=%d hold=%.2fs yaw=%.3f pitch=%.3f",
         static_cast<int>(aim.tracking),
@@ -1229,7 +1270,7 @@ private:
     twist.linear.x = aim.distance;
     twist_pub_->publish(twist);
 
-    RCLCPP_INFO_THROTTLE(
+    AA_RCLCPP_INFO_THROTTLE(enable_ros_logs_,
       get_logger(), *get_clock(), 500,
       "CMD micro: yaw=%.4f pitch=%.4f | micro raw yaw=%.4f pitch=%.4f | err yaw=%.4f pitch=%.4f | locked=%d fire=%d hold=%d",
       yaw_target_micro,
@@ -1242,7 +1283,7 @@ private:
       static_cast<int>(fire_decision),
       static_cast<int>(holding_last_cmd));
 
-    if (aim.tracking && pnp_.ready() && pixels_finite) {
+    if (debug_publish_aim_pixels_ && aim_px_pub_ && aim.tracking && pnp_.ready() && pixels_finite) {
       geometry_msgs::msg::Twist aim_px;
       aim_px.linear.x = aim_px_x;
       aim_px.linear.y = aim_px_y;
@@ -1490,6 +1531,10 @@ private:
   rclcpp::Subscription<vision_msgs::msg::Detection2DArray>::SharedPtr det_sub_;
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr cam_sub_;
   rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr micro_status_sub_;
+
+  bool enable_ros_logs_ = false;
+  bool debug_publish_markers_ = false;
+  bool debug_publish_aim_pixels_ = false;
 
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr twist_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr aim_px_pub_;

@@ -3,19 +3,24 @@
 """
 ZED X Mini + TensorRT YOLO26-pose detector for RoboMaster armors.
 
-This version is adapted from the bbox-only detector. It still publishes the
-legacy /detector/armors Detection2DArray topic, but it also publishes a JSON
-message containing bbox + the 4 keypoints in this convention:
+This version is adapted from the bbox-only detector. It publishes the legacy
+/detector/armors Detection2DArray topic and the typed ArmorKeypointArray used by
+the tracker. JSON and image topics are debug-only and opt-in safe-by-default:
+a normal launch should be a competition launch without viewer/debug endpoints.
+
+Keypoint convention:
 
     KP0 = TL, KP1 = TR, KP2 = BR, KP3 = BL
 
-Topics:
+Functional topics:
     /detector/armors                vision_msgs/Detection2DArray
     /detector/armors_keypoints      autoaim/ArmorKeypointArray
-    /detector/armors_keypoints_json std_msgs/String
-    /yolo/debug_image               sensor_msgs/Image
     /zed/imu_data                   sensor_msgs/Imu
     /camera_info                    sensor_msgs/CameraInfo
+
+Debug topics:
+    /detector/armors_keypoints_json std_msgs/String
+    /yolo/debug_image               sensor_msgs/Image
 
 Supported TensorRT output layouts:
     1) Raw YOLO pose output, exported with nms=False:
@@ -63,7 +68,7 @@ from rclpy.time import Time as RclpyTime
 from cv_bridge import CvBridge
 from pycuda.compiler import SourceModule
 from rclpy.node import Node
-from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
+from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import CameraInfo, Image, Imu
 from std_msgs.msg import String
 from autoaim.msg import ArmorKeypoint, ArmorKeypointArray
@@ -129,7 +134,8 @@ DEFAULT_GAIN = 50
 DEFAULT_AUTO_WHITE_BALANCE = True
 DEFAULT_THRESHOLD = 0.15
 DEFAULT_NMS_IOU = 0.2
-DEFAULT_PUBLISH_DEBUG_EVERY = 4
+DEFAULT_PUBLISH_DEBUG_EVERY = 0
+DEFAULT_PUBLISH_JSON = False
 DEFAULT_CAMERA_INFO_EVERY = 1
 DEFAULT_FRAME_ID = "camera_color_optical_frame"
 DEFAULT_IMU_FRAME_ID = "zed_imu_link"
@@ -142,14 +148,24 @@ class Yolo26PoseKeypointsNode(Node):
         super().__init__("yolo26_pose_keypoints_node")
 
         # Parameters let you override every camera/runtime value from launch or
-        # config/zed.yaml without editing this file. Defaults reproduce
-        # the original hard-coded behavior exactly.
+        # config/zed.yaml without editing this file. Debug-output defaults are
+        # deliberately off so running the node directly is still safe-by-default.
         # -- detector / inference --
         self.declare_parameter("engine_path", ENGINE_PATH)
         self.declare_parameter("threshold", DEFAULT_THRESHOLD)
         self.declare_parameter("nms_iou", DEFAULT_NMS_IOU)
+        # Debug image cadence: 0 means no /yolo/debug_image publisher. The
+        # functional detector topics below stay unconditional.
         self.declare_parameter("publish_debug_every", DEFAULT_PUBLISH_DEBUG_EVERY)
-        self.declare_parameter("debug_scores", True)
+        # JSON is only for echo/viewer debugging; tracking consumes the typed
+        # /detector/armors_keypoints message, never this string.
+        self.declare_parameter("publish_json", DEFAULT_PUBLISH_JSON)
+        # Historical score logging is currently commented out below; keep the
+        # parameter safe-by-default so re-enabling those logs remains opt-in.
+        self.declare_parameter("debug_scores", False)
+        # Launch-controlled Python log gate. When false, active get_logger()
+        # calls and their f-string construction are skipped in this node.
+        self.declare_parameter("enable_ros_logs", False)
         # -- camera capture / runtime (previously hard-coded constants) --
         self.declare_parameter("resolution", DEFAULT_RESOLUTION)
         self.declare_parameter("fps", DEFAULT_FPS)
@@ -166,7 +182,9 @@ class Yolo26PoseKeypointsNode(Node):
         self.threshold = float(self.get_parameter("threshold").value)
         self.nms_iou = float(self.get_parameter("nms_iou").value)
         self.publish_debug_every = int(self.get_parameter("publish_debug_every").value)
+        self.publish_json = bool(self.get_parameter("publish_json").value)
         self.debug_scores = bool(self.get_parameter("debug_scores").value)
+        self.enable_ros_logs = bool(self.get_parameter("enable_ros_logs").value)
 
         res_name = str(self.get_parameter("resolution").value).upper()
         if res_name not in ZED_RESOLUTIONS:
@@ -188,7 +206,7 @@ class Yolo26PoseKeypointsNode(Node):
         # ── 1. CUDA & TensorRT ───────────────────────────────────────────────
         cuda.init()
         self.cuda_ctx = cuda.Device(0).make_context()
-        self.logger_trt = trt.Logger(trt.Logger.WARNING)
+        self.logger_trt = trt.Logger(trt.Logger.WARNING if self.enable_ros_logs else trt.Logger.INTERNAL_ERROR)
         trt.init_libnvinfer_plugins(self.logger_trt, "")
 
         with open(self.engine_path, "rb") as f:
@@ -210,7 +228,8 @@ class Yolo26PoseKeypointsNode(Node):
         self.out_shape = out_shape
 
         in_shape = tuple(int(x) for x in self.engine.get_tensor_shape(self.in_name))
-        self.get_logger().info(f"Engine input shape={in_shape}")
+        if self.enable_ros_logs:
+            self.get_logger().info(f"Engine input shape={in_shape}")
         self.img_size, self.input_channels = self._parse_input_shape(in_shape)
         self.channel_stride = self.img_size * self.img_size
 
@@ -292,14 +311,25 @@ class Yolo26PoseKeypointsNode(Node):
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=1,
         )
+        # Camera intrinsics are static and published sparsely (camera_info_every).
+        # Latch them (transient-local + reliable) so an autoaim node that subscribes
+        # late or respawns mid-match receives the last CameraInfo immediately,
+        # instead of waiting up to camera_info_every frames for the next one.
+        cam_info_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
         self.pub = self.create_publisher(Detection2DArray, "/detector/armors", qos)
         # Typed keypoint output consumed by autoaim.
         self.kpt_pub = self.create_publisher(ArmorKeypointArray, "/detector/armors_keypoints", qos)
-        # Optional JSON debug copy; useful for quick echo/debug without custom message introspection.
-        self.kpt_json_pub = self.create_publisher(String, "/detector/armors_keypoints_json", qos)
+        if self.publish_json:
+            self.kpt_json_pub = self.create_publisher(String, "/detector/armors_keypoints_json", qos)
         self.zed_pub = self.create_publisher(Imu, "/zed/imu_data", qos)
-        self.img_pub = self.create_publisher(Image, "/yolo/debug_image", 1)
-        self.cam_info_pub = self.create_publisher(CameraInfo, "/camera_info", qos)
+        if self.publish_debug_every > 0:
+            self.img_pub = self.create_publisher(Image, "/yolo/debug_image", 1)
+        self.cam_info_pub = self.create_publisher(CameraInfo, "/camera_info", cam_info_qos)
         self.bridge = CvBridge()
         self.frame_count = 0
 
@@ -681,36 +711,40 @@ class Yolo26PoseKeypointsNode(Node):
                         ]
                         kpt_array_msg.detections.append(kmsg)
 
-                        # Optional JSON debug copy.
-                        json_detections.append({
-                            "class_id": cls,
-                            "class_name": CLASS_NAMES.get(cls, str(cls)),
-                            "confidence": conf,
-                            "bbox": {
-                                "left": float(L),
-                                "top": float(T),
-                                "right": float(R),
-                                "bottom": float(B),
-                                "cx": float(L + W * 0.5),
-                                "cy": float(T + H * 0.5),
-                                "w": float(W),
-                                "h": float(H),
-                            },
-                            "keypoints": [
-                                {
-                                    "name": KEYPOINT_NAMES[j],
-                                    "x": float(kp[j, 0]),
-                                    "y": float(kp[j, 1]),
-                                    "score": float(kp[j, 2]),
-                                    "valid": bool(kp[j, 2] >= KEYPOINT_SCORE_THRESHOLD),
-                                }
-                                for j in range(NUM_KEYPOINTS)
-                            ],
-                        })
+                        if self.publish_json:
+                            # Optional JSON debug copy. The tracker uses kmsg
+                            # above, so this can be disabled without affecting
+                            # detection -> tracking -> command -> serial -> fire.
+                            json_detections.append({
+                                "class_id": cls,
+                                "class_name": CLASS_NAMES.get(cls, str(cls)),
+                                "confidence": conf,
+                                "bbox": {
+                                    "left": float(L),
+                                    "top": float(T),
+                                    "right": float(R),
+                                    "bottom": float(B),
+                                    "cx": float(L + W * 0.5),
+                                    "cy": float(T + H * 0.5),
+                                    "w": float(W),
+                                    "h": float(H),
+                                },
+                                "keypoints": [
+                                    {
+                                        "name": KEYPOINT_NAMES[j],
+                                        "x": float(kp[j, 0]),
+                                        "y": float(kp[j, 1]),
+                                        "score": float(kp[j, 2]),
+                                        "valid": bool(kp[j, 2] >= KEYPOINT_SCORE_THRESHOLD),
+                                    }
+                                    for j in range(NUM_KEYPOINTS)
+                                ],
+                            })
 
             self.pub.publish(det_array_msg)
             self.kpt_pub.publish(kpt_array_msg)
-            self.kpt_json_pub.publish(String(data=self._make_keypoint_json(now_msg, json_detections)))
+            if self.publish_json:
+                self.kpt_json_pub.publish(String(data=self._make_keypoint_json(now_msg, json_detections)))
 
             # IMU every frame (ZED-only feature). CameraInfo throttled: the
             # autoaim node latches intrinsics on the first message, so there is
@@ -719,7 +753,8 @@ class Yolo26PoseKeypointsNode(Node):
             if self.camera_info_every > 0 and self.frame_count % self.camera_info_every == 0:
                 self._publish_camera_info(now_msg)
 
-            # Raw image for the viewer node. Publish less often to reduce bandwidth.
+            # Raw image for the viewer node. It is opt-in debug output; when
+            # disabled no /yolo/debug_image publisher exists.
             self.frame_count += 1
             if self.publish_debug_every > 0 and self.frame_count % self.publish_debug_every == 0:
                 img_msg = self.bridge.cv2_to_imgmsg(self.mat_cpu.get_data(), "bgra8")

@@ -21,6 +21,23 @@
 #include "tf2_ros/transform_listener.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 
+// Runtime ROS log gate. Launch files default enable_ros_logs=false in
+// competition; these wrappers avoid entering RCLCPP_* macros at all when the
+// flag is off, while keeping the original log call sites maintainable.
+#define AA_RCLCPP_LOG_IF(enabled, macro_name, ...) \
+  do { \
+    if (enabled) { \
+      macro_name(__VA_ARGS__); \
+    } \
+  } while (0)
+#define AA_RCLCPP_DEBUG(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_DEBUG, __VA_ARGS__)
+#define AA_RCLCPP_INFO(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_INFO, __VA_ARGS__)
+#define AA_RCLCPP_WARN(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_WARN, __VA_ARGS__)
+#define AA_RCLCPP_ERROR(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_ERROR, __VA_ARGS__)
+#define AA_RCLCPP_FATAL(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_FATAL, __VA_ARGS__)
+#define AA_RCLCPP_INFO_THROTTLE(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_INFO_THROTTLE, __VA_ARGS__)
+#define AA_RCLCPP_WARN_THROTTLE(enabled, ...) AA_RCLCPP_LOG_IF(enabled, RCLCPP_WARN_THROTTLE, __VA_ARGS__)
+
 class TurretYawMux : public rclcpp::Node
 {
 public:
@@ -31,6 +48,9 @@ public:
     detection_topic_ = declare_parameter<std::string>("detection_topic", "/detector/armors");
     micro_status_topic_ = declare_parameter<std::string>("micro_status_topic", "/micro_status");
     output_topic_ = declare_parameter<std::string>("output_topic", "/turret/cmd");
+    // Runtime log gate for the sentry mux. False skips AA_RCLCPP_* wrappers
+    // entirely and does not affect /turret/cmd arbitration.
+    enable_ros_logs_ = declare_parameter<bool>("enable_ros_logs", false);
 
     idle_target_topic_ = declare_parameter<std::string>("idle_target_topic", "/turret/idle_target");
     map_frame_ = declare_parameter<std::string>("map_frame", "map");
@@ -121,36 +141,36 @@ public:
     parameter_callback_handle_ = add_on_set_parameters_callback(
       std::bind(&TurretYawMux::onSetParameters, this, std::placeholders::_1));
 
-    RCLCPP_INFO(get_logger(), "turret_yaw_mux started");
-    RCLCPP_INFO(get_logger(), "  cv_cmd_topic: %s", cv_cmd_topic_.c_str());
-    RCLCPP_INFO(get_logger(), "  detection_topic: %s", detection_topic_.c_str());
-    RCLCPP_INFO(get_logger(), "  micro_status_topic: %s", micro_status_topic_.c_str());
-    RCLCPP_INFO(get_logger(), "  idle_target_topic: %s", idle_target_topic_.c_str());
-    RCLCPP_INFO(get_logger(), "  output_topic: %s", output_topic_.c_str());
-    RCLCPP_INFO(get_logger(), "  map_frame: %s", map_frame_.c_str());
-    RCLCPP_INFO(get_logger(), "  base_frame: %s", base_frame_.c_str());
-    RCLCPP_INFO(get_logger(), "  detection_timeout: %.3f", detection_timeout_sec_);
-    RCLCPP_INFO(get_logger(), "  cv_cmd_timeout: %.3f", cv_cmd_timeout_sec_);
-    RCLCPP_INFO(get_logger(), "  min_detection_score: %.3f", min_detection_score_);
-    RCLCPP_INFO(
+    AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "turret_yaw_mux started");
+    AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "  cv_cmd_topic: %s", cv_cmd_topic_.c_str());
+    AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "  detection_topic: %s", detection_topic_.c_str());
+    AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "  micro_status_topic: %s", micro_status_topic_.c_str());
+    AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "  idle_target_topic: %s", idle_target_topic_.c_str());
+    AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "  output_topic: %s", output_topic_.c_str());
+    AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "  map_frame: %s", map_frame_.c_str());
+    AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "  base_frame: %s", base_frame_.c_str());
+    AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "  detection_timeout: %.3f", detection_timeout_sec_);
+    AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "  cv_cmd_timeout: %.3f", cv_cmd_timeout_sec_);
+    AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "  min_detection_score: %.3f", min_detection_score_);
+    AA_RCLCPP_INFO(enable_ros_logs_,
       get_logger(),
       "  target_classes_from_micro_status: %s",
       target_classes_from_micro_status_ ? "true" : "false");
-    RCLCPP_INFO(get_logger(), "  target_color_status_index: %d", target_color_status_index_);
-    RCLCPP_INFO(
+    AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "  target_color_status_index: %d", target_color_status_index_);
+    AA_RCLCPP_INFO(enable_ros_logs_,
       get_logger(),
       "  use_idle_target_when_no_detection: %s",
       use_idle_target_when_no_detection_ ? "true" : "false");
-    RCLCPP_INFO(
+    AA_RCLCPP_INFO(enable_ros_logs_,
       get_logger(),
       "  freeze_when_no_detection fallback: %s",
       freeze_when_no_detection_ ? "true" : "false");
-    RCLCPP_INFO(get_logger(), "  yaw_sign: %.3f", yaw_sign_);
-    RCLCPP_INFO(get_logger(), "  yaw_zero_offset: %.3f", yaw_zero_offset_);
-    RCLCPP_INFO(get_logger(), "  idle_yaw_rate_limit: %.3f", idle_yaw_rate_limit_);
-    RCLCPP_INFO(get_logger(), "  idle_recompute_period: %.3f", idle_recompute_period_sec_);
-    RCLCPP_INFO(get_logger(), "  idle_yaw_deadband: %.3f", idle_yaw_deadband_);
-    RCLCPP_INFO(get_logger(), "  target_reset_distance: %.3f", target_reset_distance_);
+    AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "  yaw_sign: %.3f", yaw_sign_);
+    AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "  yaw_zero_offset: %.3f", yaw_zero_offset_);
+    AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "  idle_yaw_rate_limit: %.3f", idle_yaw_rate_limit_);
+    AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "  idle_recompute_period: %.3f", idle_recompute_period_sec_);
+    AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "  idle_yaw_deadband: %.3f", idle_yaw_deadband_);
+    AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "  target_reset_distance: %.3f", target_reset_distance_);
     logValidClasses();
   }
 
@@ -201,7 +221,7 @@ private:
       }
     }
 
-    RCLCPP_INFO(get_logger(), "  valid_class_ids: [%s]", classes.c_str());
+    AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "  valid_class_ids: [%s]", classes.c_str());
   }
 
   void resetIdleUnwrap()
@@ -407,7 +427,7 @@ private:
     if (target_color_status_index_ < 0 ||
         static_cast<size_t>(target_color_status_index_) >= msg.data.size())
     {
-      RCLCPP_WARN_THROTTLE(
+      AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_,
         get_logger(), *get_clock(), 2000,
         "/micro_status[%d] is not available; keeping current valid_class_ids",
         target_color_status_index_);
@@ -424,7 +444,7 @@ private:
     const int micro_color = static_cast<int>(std::lround(raw_color));
 
     if (std::abs(raw_color - static_cast<double>(micro_color)) > 0.25) {
-      RCLCPP_WARN_THROTTLE(
+      AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_,
         get_logger(), *get_clock(), 2000,
         "/micro_status[%d] color should be near 0 or 1, got %.3f",
         target_color_status_index_, raw_color);
@@ -434,7 +454,7 @@ private:
     if (micro_color < 0 ||
         static_cast<size_t>(micro_color) >= micro_color_target_classes_.size())
     {
-      RCLCPP_WARN_THROTTLE(
+      AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_,
         get_logger(), *get_clock(), 2000,
         "/micro_status[%d]=%d has no mapping in micro_color_target_classes",
         target_color_status_index_, micro_color);
@@ -445,7 +465,7 @@ private:
       micro_color_target_classes_[static_cast<size_t>(micro_color)];
 
     if (target_class.empty() || target_class == "1") {
-      RCLCPP_WARN_THROTTLE(
+      AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_,
         get_logger(), *get_clock(), 2000,
         "Invalid target class from micro color mapping: '%s'",
         target_class.c_str());
@@ -468,7 +488,7 @@ private:
     have_valid_detection_ = false;
     last_valid_detection_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
 
-    RCLCPP_INFO(
+    AA_RCLCPP_INFO(enable_ros_logs_,
       get_logger(),
       "Target class from /micro_status[%d]=%d -> detector class '%s'",
       target_color_status_index_,
@@ -506,7 +526,7 @@ private:
     if (target_changed_significantly) {
       resetIdleUnwrap();
 
-      RCLCPP_INFO(
+      AA_RCLCPP_INFO(enable_ros_logs_,
         get_logger(),
         "Idle target changed/reset unwrap: frame=%s target=(%.2f, %.2f, %.2f)",
         idle_target_.header.frame_id.c_str(),
@@ -542,7 +562,7 @@ private:
       last_valid_detection_time_ = now();
       have_valid_detection_ = true;
 
-      RCLCPP_DEBUG(
+      AA_RCLCPP_DEBUG(enable_ros_logs_,
         get_logger(),
         "Valid detection: class_id=%s score=%.3f",
         best_class.c_str(),
@@ -574,7 +594,7 @@ private:
     }
 
     if (!have_micro_status_) {
-      RCLCPP_WARN_THROTTLE(
+      AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_,
         get_logger(), *get_clock(), 1000,
         "Cannot compute idle turret target: no /micro_status yaw feedback yet");
       return false;
@@ -608,7 +628,7 @@ private:
         base_frame_,
         tf2::durationFromSec(tf_timeout_sec_));
     } catch (const tf2::TransformException & ex) {
-      RCLCPP_WARN_THROTTLE(
+      AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_,
         get_logger(), *get_clock(), 1000,
         "Cannot compute idle turret target: transform target %s -> %s unavailable: %s",
         source_frame.c_str(),
@@ -624,7 +644,7 @@ private:
     const double horizontal_dist = std::hypot(dx_base, dy_base);
 
     if (horizontal_dist < 0.05) {
-      RCLCPP_WARN_THROTTLE(
+      AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_,
         get_logger(), *get_clock(), 1000,
         "Cannot compute idle turret target: target too close to robot");
       return false;
@@ -692,7 +712,7 @@ private:
     out.angular.x = 0.0;
     out.linear.z = 0.0;
 
-    RCLCPP_INFO(
+    AA_RCLCPP_INFO(enable_ros_logs_,
       get_logger(),
       "IDLE_TARGET update: source_frame=%s target_base=(%.2f, %.2f, %.2f), desired_base=%.3f, micro_yaw=%.3f, current_unwrapped=%.3f, ref_unwrapped=%.3f, desired_unwrapped=%.3f, cmd_yaw=%.3f, delta=%.3f",
       source_frame.c_str(),
@@ -762,15 +782,15 @@ private:
         freeze_mode != last_freeze_mode_)
     {
       if (cv_mode) {
-        RCLCPP_INFO(
+        AA_RCLCPP_INFO(enable_ros_logs_,
           get_logger(),
           "Turret mode -> CV  detection_age=%.3f  cv_cmd_age=%.3f",
           (tnow - last_valid_detection_time_).seconds(),
           (tnow - last_cv_cmd_time_).seconds());
       } else if (idle_mode) {
-        RCLCPP_INFO(get_logger(), "Turret mode -> IDLE_TARGET");
+        AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "Turret mode -> IDLE_TARGET");
       } else {
-        RCLCPP_INFO(get_logger(), "Turret mode -> FREEZE");
+        AA_RCLCPP_INFO(enable_ros_logs_, get_logger(), "Turret mode -> FREEZE");
       }
 
       last_cv_mode_ = cv_mode;
@@ -798,6 +818,7 @@ private:
 
   bool freeze_when_no_detection_{true};
   bool use_idle_target_when_no_detection_{true};
+  bool enable_ros_logs_{false};
 
   double yaw_sign_{1.0};
   double yaw_zero_offset_{0.0};

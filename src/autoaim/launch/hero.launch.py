@@ -17,6 +17,77 @@ DEFAULT_ENGINE = "/workspaces/isaac_ros-dev/AI-models/yolov26_keypoints.engine"
 # Change this to "zed" or "realsense" when this robot's default camera changes.
 DEFAULT_CAMERA = "realsense"
 
+# -- Debug / logging policy: safe-by-default competition mode -----------------
+# Keep debug publishers and ROS log output off for normal launches. These values
+# are launch-file configuration, not command-line launch arguments. Functional
+# topics are never gated here: /detector/armors, /detector/armors_keypoints,
+# /cmd_vel_AI, serial TX, and fire control stay active.
+DEBUG_SETTINGS = {
+    "viewer_node_enable": False,           # Starts autoaim_viewer and /tracker/debug_image only when True.
+    "detector_publish_debug_every": 0,     # /yolo/debug_image cadence; 0 means no debug-image publisher, 4 is useful on bench.
+    "detector_publish_json": False,        # /detector/armors_keypoints_json; debug echo only, tracker never reads it.
+    "autoaim_publish_markers": False,      # /tracker/marker RViz MarkerArray; skips MarkerArray construction when False.
+    "autoaim_publish_aim_pixels": False,   # /tracker/aim_pixels viewer aid; command math still runs for safety checks.
+    "ros_log_sinks_enable": False,         # Master sink switch; False disables stdout, rosout, and external-lib ROS log output, including fatal output.
+    "log_detector_enable": False,          # Detector log category; False passes enable_ros_logs=False and uses fatal as a backup ROS level.
+    "log_autoaim_enable": False,           # Autoaim/tracker log category; False skips AA_RCLCPP_* wrappers before ROS logging.
+    "log_serial_enable": False,            # Serial bridge log category; False skips ROS log calls; TX/RX still runs.
+    "log_viewer_enable": False,            # Viewer log category; relevant only when viewer_node_enable is True.
+    "log_level_detector": "warn",         # Used only when log_detector_enable=True; restores normal WARN/ERROR/FATAL visibility.
+    "log_level_autoaim": "warn",          # Used only when log_autoaim_enable=True; INFO/DEBUG remain hidden unless set lower.
+    "log_level_serial": "warn",           # Used only when log_serial_enable=True; matches previous WARN-default behavior.
+    "log_level_viewer": "warn",           # Used only when log_viewer_enable=True.
+}
+
+
+def ros_log_args(enable_key, level_key):
+    # Runtime ROS logging control. The node parameter enable_ros_logs lets C++
+    # AA_RCLCPP_* wrappers and Python guard clauses return before ROS logging;
+    # log-level and sink arguments are the backup layer when logs are enabled.
+    level = DEBUG_SETTINGS[level_key] if DEBUG_SETTINGS[enable_key] else "fatal"
+    args = ["--ros-args", "--log-level", level]
+    if not DEBUG_SETTINGS["ros_log_sinks_enable"]:
+        args += [
+            "--disable-stdout-logs",
+            "--disable-rosout-logs",
+            "--disable-external-lib-logs",
+        ]
+    return args
+
+
+def python_log_params(enable_key):
+    return [
+        # Python nodes read enable_ros_logs before active get_logger() calls so
+        # f-string construction and Python logging calls are skipped when off.
+        {"enable_ros_logs": DEBUG_SETTINGS[enable_key]},
+    ]
+
+def autoaim_debug_params():
+    return [
+        # Debug node parameters are sourced from DEBUG_SETTINGS above so the
+        # safe-by-default policy is centralized. /cmd_vel_AI is published
+        # unconditionally by autoaim_node and is never controlled here.
+        {"debug_publish_markers": DEBUG_SETTINGS["autoaim_publish_markers"]},
+        {"debug_publish_aim_pixels": DEBUG_SETTINGS["autoaim_publish_aim_pixels"]},
+        # C++ autoaim_node uses this to skip AA_RCLCPP_* wrappers entirely when
+        # the category is off; command/tracking/fire paths remain unchanged.
+        {"enable_ros_logs": DEBUG_SETTINGS["log_autoaim_enable"]},
+    ]
+
+
+def detector_debug_params():
+    return [
+        # Listed after the sensor YAML in each detector Node, so these launch
+        # defaults win over persistent YAML defaults. The bbox/keypoint detector
+        # topics are functional outputs and are never controlled here.
+        {"publish_debug_every": DEBUG_SETTINGS["detector_publish_debug_every"]},
+        {"publish_json": DEBUG_SETTINGS["detector_publish_json"]},
+        # Used by both detector implementations: Python skips get_logger() calls,
+        # C++ skips AA_RCLCPP_* wrappers before entering RCLCPP macros.
+        {"enable_ros_logs": DEBUG_SETTINGS["log_detector_enable"]},
+    ]
+
+
 def autoaim_params():
     return [
         # YOLO26 labels: 0=blue armor, 1=grey armor (ignored), 2=red armor.
@@ -181,6 +252,7 @@ def autoaim_params():
     ]
 
 
+
 def generate_launch_description():
     # TensorRT engine lives OUTSIDE the package (not installed into the
     # package share). Override order: --launch arg engine_path  >  env
@@ -189,6 +261,7 @@ def generate_launch_description():
 
     engine_path = LaunchConfiguration("engine_path")
     serial_port = LaunchConfiguration("serial_port")
+
 
     serial_params = [
         {"shooting_active": False},
@@ -215,6 +288,9 @@ def generate_launch_description():
         # Header+CRC8 framing (self-resyncing, rejects corrupted packets).
         # REQUIRES matching micro firmware. Leave False until then.
         {"use_framed_protocol": False},
+        # Shared by the C++ bridge and Python fallback. False skips active
+        # serial log calls only; TX/RX, watchdogs, and micro_status continue.
+        {"enable_ros_logs": DEBUG_SETTINGS["log_serial_enable"]},
     ]
 
     viewer_params = [
@@ -255,22 +331,26 @@ def generate_launch_description():
             name="micro_communications_node",
             parameters=serial_params,
             output="screen",
+            arguments=ros_log_args("log_serial_enable", "log_level_serial"),
         ),
 
         Node(
             package="autoaim",
             executable="autoaim_node",
             name="autoaim",
-            parameters=autoaim_params(),
+            parameters=autoaim_params() + autoaim_debug_params(),
             output="screen",
+            arguments=ros_log_args("log_autoaim_enable", "log_level_autoaim"),
         ),
 
         Node(
             package="autoaim",
             executable="viewer_node.py",
             name="autoaim_viewer",
-            parameters=viewer_params,
+            parameters=viewer_params + python_log_params("log_viewer_enable"),
             output="screen",
+            arguments=ros_log_args("log_viewer_enable", "log_level_viewer"),
+            condition=IfCondition("true" if DEBUG_SETTINGS["viewer_node_enable"] else "false"),
         ),
 
         # ZED detector (camera:=zed). Camera/runtime config in config/zed.yaml.
@@ -278,8 +358,9 @@ def generate_launch_description():
             package="autoaim",
             executable="zed_detector.py",
             name="zed_detector",
-            parameters=[zed_config, engine_override],
+            parameters=[zed_config, engine_override] + detector_debug_params(),
             output="screen",
+            arguments=ros_log_args("log_detector_enable", "log_level_detector"),
             condition=zed_condition,
         ),
 
@@ -289,8 +370,9 @@ def generate_launch_description():
             package="autoaim_realsense",
             executable="realsense_detector",
             name="realsense_detector",
-            parameters=[realsense_config, engine_override],
+            parameters=[realsense_config, engine_override] + detector_debug_params(),
             output="screen",
+            arguments=ros_log_args("log_detector_enable", "log_level_detector"),
             condition=realsense_condition,
         ),
     ])
