@@ -67,9 +67,9 @@ public:
     idle_yaw_deadband_ = declare_parameter<double>("idle_yaw_deadband", 0.03);
 
     idle_pitch_mode_ = declare_parameter<std::string>("idle_pitch_mode", "hold_last_micro");
-    idle_pitch_static_ = declare_parameter<double>("idle_pitch_static", 0.0);
+    idle_pitch_static_ = declare_parameter<double>("idle_pitch_static", -0.115);
     idle_pitch_sign_ = declare_parameter<double>("idle_pitch_sign", 1.0);
-    idle_pitch_zero_offset_ = declare_parameter<double>("idle_pitch_zero_offset", 0.0);
+    idle_pitch_zero_offset_ = declare_parameter<double>("idle_pitch_zero_offset", -0.115);
     idle_target_z_ = declare_parameter<double>("idle_target_z", 0.42);
     use_idle_point_z_ = declare_parameter<bool>("use_idle_point_z", false);
     gimbal_height_ = declare_parameter<double>("gimbal_height", 0.42);
