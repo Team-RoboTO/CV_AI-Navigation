@@ -178,6 +178,12 @@ public:
     ego_velocity_scale_x_ = declare_parameter("ego_velocity_scale_x", 1.0);
     ego_velocity_scale_y_ = declare_parameter("ego_velocity_scale_y", 1.0);
     ego_velocity_max_ = declare_parameter("ego_velocity_max", 3.0);
+    // Head/cannon-frame vx/vy from the micro can contain small fake translation
+    // while the chassis is spinning in place. The deadband removes that false
+    // ego-motion before it is integrated/predicted; the LPF removes fast jitter.
+    // ego_velocity_lpf_alpha: 1.0 = no filtering, lower = smoother.
+    ego_velocity_deadband_ = declare_parameter("ego_velocity_deadband", 0.0);
+    ego_velocity_lpf_alpha_ = declare_parameter("ego_velocity_lpf_alpha", 1.0);
     // Maximum drift [m] before dead-reckoning is reset to zero.
     // Pure velocity integration drifts over time. When the accumulated position
     // exceeds this cap, it is reset to zero. The tracker absorbs the jump via its
@@ -478,6 +484,9 @@ private:
       // Also clear cached velocity so computeAim future-barrel propagation is a no-op.
       robot_vx_world_ = 0.0;
       robot_vy_world_ = 0.0;
+      ego_velocity_filter_initialized_ = false;
+      ego_vx_filtered_ = 0.0;
+      ego_vy_filtered_ = 0.0;
       return;
     }
 
@@ -495,12 +504,44 @@ private:
 
     double vx = raw_vx * ego_velocity_scale_x_;
     double vy = raw_vy * ego_velocity_scale_y_;
-    const double vnorm = std::hypot(vx, vy);
+    double vnorm = std::hypot(vx, vy);
     if (vnorm > ego_velocity_max_ && vnorm > 1e-6) {
       const double scale = ego_velocity_max_ / vnorm;
       vx *= scale;
       vy *= scale;
+      vnorm = ego_velocity_max_;
     }
+
+    // During chassis spin with the robot nearly stationary, wheel/estimator noise
+    // can report small vx/vy values. If those fake velocities are integrated, the
+    // tracker predicts the target/barrel in the wrong place and fire-lock drops.
+    // Use a soft deadband: remove the deadband part but preserve direction and
+    // larger real translations.
+    if (ego_velocity_deadband_ > 0.0) {
+      if (vnorm < ego_velocity_deadband_) {
+        vx = 0.0;
+        vy = 0.0;
+        vnorm = 0.0;
+      } else if (vnorm > 1e-6) {
+        const double keep = (vnorm - ego_velocity_deadband_) / vnorm;
+        vx *= keep;
+        vy *= keep;
+        vnorm -= ego_velocity_deadband_;
+      }
+    }
+
+    const double vel_alpha = std::clamp(ego_velocity_lpf_alpha_, 0.0, 1.0);
+    if (!ego_velocity_filter_initialized_) {
+      ego_vx_filtered_ = vx;
+      ego_vy_filtered_ = vy;
+      ego_velocity_filter_initialized_ = true;
+    } else {
+      ego_vx_filtered_ = vel_alpha * vx + (1.0 - vel_alpha) * ego_vx_filtered_;
+      ego_vy_filtered_ = vel_alpha * vy + (1.0 - vel_alpha) * ego_vy_filtered_;
+    }
+
+    vx = ego_vx_filtered_;
+    vy = ego_vy_filtered_;
 
     double vwx = vx;
     double vwy = vy;
@@ -1480,6 +1521,11 @@ private:
   double ego_velocity_scale_x_ = 1.0;
   double ego_velocity_scale_y_ = 1.0;
   double ego_velocity_max_ = 3.0;
+  double ego_velocity_deadband_ = 0.0;
+  double ego_velocity_lpf_alpha_ = 1.0;
+  bool ego_velocity_filter_initialized_ = false;
+  double ego_vx_filtered_ = 0.0;
+  double ego_vy_filtered_ = 0.0;
   double ego_position_max_drift_ = 4.0;
   double robot_x_ = 0.0;
   double robot_y_ = 0.0;

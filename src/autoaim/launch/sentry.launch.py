@@ -23,11 +23,11 @@ DEFAULT_CAMERA = "zed"
 # topics are never gated here: /detector/armors, /detector/armors_keypoints,
 # /cmd_vel_AI, serial TX, and fire control stay active.
 DEBUG_SETTINGS = {
-    "viewer_node_enable": False,           # Starts autoaim_viewer and /tracker/debug_image only when True.
+    "viewer_node_enable": True,           # Starts autoaim_viewer and /tracker/debug_image only when True.
     "detector_publish_debug_every": 0,     # /yolo/debug_image cadence; 0 means no debug-image publisher, 4 is useful on bench.
-    "detector_publish_json": False,        # /detector/armors_keypoints_json; debug echo only, tracker never reads it.
-    "autoaim_publish_markers": False,      # /tracker/marker RViz MarkerArray; skips MarkerArray construction when False.
-    "autoaim_publish_aim_pixels": False,   # /tracker/aim_pixels viewer aid; command math still runs for safety checks.
+    "detector_publish_json": True,        # /detector/armors_keypoints_json; debug echo only, tracker never reads it.
+    "autoaim_publish_markers": True,      # /tracker/marker RViz MarkerArray; skips MarkerArray construction when False.
+    "autoaim_publish_aim_pixels": True,   # /tracker/aim_pixels viewer aid; command math still runs for safety checks.
     "ros_log_sinks_enable": False,         # Master sink switch; False disables stdout, rosout, and external-lib ROS log output, including fatal output.
     "log_detector_enable": False,          # Detector log category; False passes enable_ros_logs=False and uses fatal as a backup ROS level.
     "log_autoaim_enable": False,           # Autoaim/tracker log category; False skips AA_RCLCPP_* wrappers before ROS logging.
@@ -119,14 +119,14 @@ def autoaim_params():
         {"light_ratio": 0.85},
         {"max_armor_distance": 6.0},
         {"max_armor_z": 4.0},
-        {"confirm_frames": 2},
-        {"lost_timeout": 0.50},
+        {"confirm_frames": 1},
+        {"lost_timeout": 0.75},
 
         # 30/40 were very high — probably raised to fight the lag caused by the
         # missing image<->angle sync (now fixed). High q makes the state track
         # measurement noise -> jittery commands -> fire-lock dropouts.
         # Start lower; raise again only if tracking feels sluggish AFTER the fix.
-        {"q_pos": 60.0},
+        {"q_pos": 80.0},
         # q_z DECOUPLED from q_pos: the height channel must NOT inherit the big
         # q_pos used to chase movers, or PnP z-jitter becomes phantom vertical
         # velocity and the pitch oscillates. Keep small.
@@ -138,6 +138,9 @@ def autoaim_params():
         {"r_yaw_base": 0.05},
         {"r_yaw_slope": 0.005},
         {"max_oblique_deg": 65.0},
+
+        {"pitch_offset_deg": -2.0},
+        {"yaw_offset_deg": 4.5},
 
         # 0.98 at ~100 Hz decays the velocity estimate to ~13%/s — a constant
         # drag that under-leads translating targets. Let q_pos handle the noise.
@@ -171,7 +174,7 @@ def autoaim_params():
         # 1.0 rad @ ref 1 m -> ~0.33 rad window at 3 m: OK for tuning, loose for
         # a match. Against a fast spinner, timed shots need ~0.10-0.18 rad with
         # window_ref_dist ~3.0. Tighten once the static calibration is done.
-        {"angular_window": 0.5},
+        {"angular_window": 0.65},
         {"window_ref_dist": 3.0},
         {"min_fire_dist": 0.2},
         {"max_fire_dist": 6.0},
@@ -190,7 +193,7 @@ def autoaim_params():
         # muzzle exit (calibrate: shoot a mover, adjust in 5 ms steps; the node
         # logs the measured pipeline part every 2 s).
         {"use_measured_latency": True},
-        {"actuation_latency": 0.045},
+        {"actuation_latency": 0.060},
         # Fallback fixed bias, used ONLY if use_measured_latency is False.
         {"time_bias": 0.045},
 
@@ -201,7 +204,7 @@ def autoaim_params():
         {"use_vyaw_from_timing": True},
         {"vyaw_timing_min_dt": 0.050},
         {"vyaw_timing_max_dt": 0.9},
-        {"vyaw_fire_threshold": 2.0},
+        {"vyaw_fire_threshold": 5.0},
 
         {"max_match_dist": 0.8},
         {"maha_threshold": 16.9},
@@ -209,20 +212,20 @@ def autoaim_params():
         {"switch_cooldown": 10},
         {"same_target_identity_dist": 1.0},
 
-        {"cmd_smooth_alpha": 1.00},
+        {"cmd_smooth_alpha": 0.80},
         # YAW stays at 1.0 (snappy, no lag for movers). PITCH can be smoothed
         # independently: lower toward ~0.6 ONLY if pitch is still nervous after
         # q_z + rate-limit + deadband. 1.0 = no smoothing (no added lag).
-        {"cmd_smooth_alpha_pitch": 1.0},
-        {"cmd_deadband_yaw": 0.01},
-        {"cmd_deadband_pitch": 0.01},
-        {"cmd_rate_limit_yaw": 0.0},
+        {"cmd_smooth_alpha_pitch": 0.75},
+        {"cmd_deadband_yaw": 0.02},
+        {"cmd_deadband_pitch": 0.015},
+        {"cmd_rate_limit_yaw": 5.0},
         # Pitch rate limit: ~2.0 rad/s (~114 deg/s). Real plate-height changes
         # are far slower than this, so it removes jitter without adding lag.
         # YAW stays 0.0 (unlimited) so fast movers are tracked snappily.
         {"cmd_rate_limit_pitch": 2.0},
-        {"fire_lock_yaw": 0.05},
-        {"fire_lock_pitch": 0.04},
+        {"fire_lock_yaw": 0.10},
+        {"fire_lock_pitch": 0.07},
 
         # ⚠ THESE TWO MUST BE EQUAL. Both describe the same physical fact —
         # whether the micro's pitch FEEDBACK has the opposite sign of its pitch
@@ -241,7 +244,7 @@ def autoaim_params():
 
         {"cmd_hold_time": 0.25},
         {"cmd_max_delta_yaw": 0.80},
-        {"cmd_max_delta_pitch": 0.80},
+        {"cmd_max_delta_pitch": 0.0},
         {"require_aim_inside_frame": False},
 
         {"use_ego_motion_compensation": True},
@@ -250,6 +253,8 @@ def autoaim_params():
         {"ego_velocity_scale_x": 1.0},
         {"ego_velocity_scale_y": 1.0},
         {"ego_velocity_max": 3.0},
+        {"ego_velocity_deadband": 0.20},
+        {"ego_velocity_lpf_alpha": 0.25},
         {"ego_position_max_drift": 0.0},
         {"chassis_heading_index": -1},
         {"gimbal.yaw_sign": 1.0},
@@ -279,7 +284,6 @@ def turret_mux_params():
         {"yaw_zero_offset": 0.0},
         {"idle_yaw_rate_limit": 4.0},
 
-
         {"idle_recompute_period": 0.02},
         {"idle_yaw_deadband": 0.05},
 
@@ -308,8 +312,8 @@ def generate_launch_description():
 
 
     serial_params = [
-        {"shooting_active": False},
-        {"rotating_chassis": False},
+        {"shooting_active": True},
+        {"rotating_chassis": True},
 
         {"serial_port": serial_port},
         {"serial_baudrate": 500000},
@@ -340,8 +344,8 @@ def generate_launch_description():
         # Must match micro_pitch_lock_opposite_sign in the autoaim params above,
         # otherwise the pitch-error numbers in the debug overlay are sign-flipped.
         {"micro_pitch_feedback_opposite_sign": False},
-        {"fire_lock_yaw": 0.05},
-        {"fire_lock_pitch": 0.04},
+        {"fire_lock_yaw": 0.04},
+        {"fire_lock_pitch": 0.05},
     ]
 
     # Camera selection: set DEFAULT_CAMERA above, or override with camera:=zed
