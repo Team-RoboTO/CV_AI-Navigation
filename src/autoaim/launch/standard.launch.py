@@ -117,8 +117,8 @@ def autoaim_params():
         {"light_ratio": 0.85},
         {"max_armor_distance": 6.0},
         {"max_armor_z": 4.0},
-        {"confirm_frames": 2},
-        {"lost_timeout": 0.50},
+        {"confirm_frames": 1},
+        {"lost_timeout": 0.75},
 
         # 30/40 were very high — probably raised to fight the lag caused by the
         # missing image<->angle sync (now fixed). High q makes the state track
@@ -137,9 +137,13 @@ def autoaim_params():
         {"r_yaw_slope": 0.005},
         {"max_oblique_deg": 65.0},
 
+
+        {"pitch_offset_deg": -2.0},
+        {"yaw_offset_deg": 3.9},
+
         # 0.98 at ~100 Hz decays the velocity estimate to ~13%/s — a constant
         # drag that under-leads translating targets. Let q_pos handle the noise.
-        {"alpha_pos": 0.999},
+        {"alpha_pos": 0.995},
         {"alpha_yaw": 1.00},
         {"alpha_coast": 0.98},
 
@@ -169,8 +173,8 @@ def autoaim_params():
         # 1.0 rad @ ref 1 m -> ~0.33 rad window at 3 m: OK for tuning, loose for
         # a match. Against a fast spinner, timed shots need ~0.10-0.18 rad with
         # window_ref_dist ~3.0. Tighten once the static calibration is done.
-        {"angular_window": 1.0},
-        {"window_ref_dist": 1.0},
+        {"angular_window": 0.9},
+        {"window_ref_dist": 3.0},
         {"min_fire_dist": 0.2},
         {"max_fire_dist": 6.0},
         # Obliquity fire gate, range-independent. 0.0 = OFF (current behavior).
@@ -188,7 +192,7 @@ def autoaim_params():
         # muzzle exit (calibrate: shoot a mover, adjust in 5 ms steps; the node
         # logs the measured pipeline part every 2 s).
         {"use_measured_latency": True},
-        {"actuation_latency": 0.045},
+        {"actuation_latency": 0.060},
         # Fallback fixed bias, used ONLY if use_measured_latency is False.
         {"time_bias": 0.045},
 
@@ -198,7 +202,7 @@ def autoaim_params():
         {"yaw_jump_thresh": 0.55},
         {"use_vyaw_from_timing": True},
         {"vyaw_timing_min_dt": 0.050},
-        {"vyaw_timing_max_dt": 0.500},
+        {"vyaw_timing_max_dt": 0.9},
         {"vyaw_fire_threshold": 5.0},
 
         {"max_match_dist": 0.8},
@@ -207,20 +211,20 @@ def autoaim_params():
         {"switch_cooldown": 10},
         {"same_target_identity_dist": 1.0},
 
-        {"cmd_smooth_alpha": 1.00},
+        {"cmd_smooth_alpha": 0.80},
         # YAW stays at 1.0 (snappy, no lag for movers). PITCH can be smoothed
         # independently: lower toward ~0.6 ONLY if pitch is still nervous after
         # q_z + rate-limit + deadband. 1.0 = no smoothing (no added lag).
-        {"cmd_smooth_alpha_pitch": 1.0},
-        {"cmd_deadband_yaw": 0.005},
-        {"cmd_deadband_pitch": 0.01},
+        {"cmd_smooth_alpha_pitch": 0.75},
+        {"cmd_deadband_yaw": 0.02},
+        {"cmd_deadband_pitch": 0.015},
         {"cmd_rate_limit_yaw": 0.0},
         # Pitch rate limit: ~2.0 rad/s (~114 deg/s). Real plate-height changes
         # are far slower than this, so it removes jitter without adding lag.
         # YAW stays 0.0 (unlimited) so fast movers are tracked snappily.
         {"cmd_rate_limit_pitch": 2.0},
-        {"fire_lock_yaw": 0.05},
-        {"fire_lock_pitch": 0.04},
+        {"fire_lock_yaw": 0.15},
+        {"fire_lock_pitch": 0.10},
 
         # ⚠ THESE TWO MUST BE EQUAL. Both describe the same physical fact —
         # whether the micro's pitch FEEDBACK has the opposite sign of its pitch
@@ -239,7 +243,7 @@ def autoaim_params():
 
         {"cmd_hold_time": 0.25},
         {"cmd_max_delta_yaw": 0.80},
-        {"cmd_max_delta_pitch": 0.80},
+        {"cmd_max_delta_pitch": 0.0},
         {"require_aim_inside_frame": False},
 
         {"use_ego_motion_compensation": True},
@@ -248,6 +252,8 @@ def autoaim_params():
         {"ego_velocity_scale_x": 1.0},
         {"ego_velocity_scale_y": 1.0},
         {"ego_velocity_max": 3.0},
+        {"ego_velocity_deadband": 0.20},
+        {"ego_velocity_lpf_alpha": 0.25},
         {"ego_position_max_drift": 0.0},
         {"chassis_heading_index": -1},
         {"gimbal.yaw_sign": 1.0},
@@ -267,7 +273,7 @@ def generate_launch_description():
 
 
     serial_params = [
-        {"shooting_active": False},
+        {"shooting_active": True},
         {"rotating_chassis": False},
 
         {"serial_port": serial_port},
