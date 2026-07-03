@@ -12,10 +12,10 @@
     # ── RealSense D455 ─────────────────────────────────────────────────────
     rs_serial_no: ""                 # "" = first connected device
     rs_width: 640
-    rs_height: 360
-    rs_fps: 90                       # D455 color maxes at 90 @640x360
+    rs_height: 480
+    rs_fps: 60                      # D455 color maxes at 90 @640x360
     rs_auto_exposure: false
-    rs_exposure: 60                  # RS2_OPTION_EXPOSURE (microseconds)
+    rs_exposure: 100                 # RS2_OPTION_EXPOSURE (microseconds)
     rs_gain: 50
     # "yuyv" = raw sensor; GPU conversion saves CPU. "bgr8" = safe default.
     rs_pixel_format: "yuyv"

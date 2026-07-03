@@ -15,7 +15,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
-find_package(OpenCV REQUIRED COMPONENTS core calib3d imgproc)
+find_package(OpenCV REQUIRED COMPONENTS core calib3d imgproc dnn)
 find_package(autoaim REQUIRED)   # ArmorKeypointArray for ros_topics input mode
 
 # ── Optional Jetson-only deps: CUDA + TensorRT + camera SDKs ────────────────
@@ -86,6 +86,7 @@ if(HAVE_CUDA_TRT)
   set(AIM_GPU_SOURCES src/detector_trt.cpp src/preprocess.cu)
   set(AIM_GPU_INCLUDES
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    ${EIGEN3_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS}
     ${CUDA_INCLUDE_DIRS} ${TENSORRT_INCLUDE_DIR})
   set(AIM_GPU_LIBS ${CUDA_CUDART_LIBRARY} ${CUDA_CUDA_LIBRARY}
     ${TENSORRT_LIB} ${OpenCV_LIBS})
