@@ -39,3 +39,7 @@ __pycache__/
 .claude/
 .codex/
 .codex-plugins/
+
+# Other stuff
+/micro_code
+/sp_vision_25_psp-main

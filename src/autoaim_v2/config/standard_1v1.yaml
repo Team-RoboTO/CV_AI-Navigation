@@ -1,0 +1,112 @@
+# autoaim_v2 — standard robot, ARC 1v1 Infantry Match.
+# Field-tuning order: see DEPLOYMENT.md ("Calibration order").
+/**:
+  ros__parameters:
+    # ── Input ──────────────────────────────────────────────────────────────
+    input_mode: "zed_trt"          # zed_trt (competition) | ros_topics (A/B)
+    engine_path: "/workspaces/isaac_ros-dev/AI-models/yolov26_keypoints.engine"
+    conf_threshold: 0.15
+    nms_iou: 0.2
+    min_confidence: 0.30           # per-armor gate before PnP
+
+    # ── ZED X Mini ─────────────────────────────────────────────────────────
+    resolution: "SVGA"             # 960x600 per eye
+    fps: 120
+    image_flip: true               # camera mounted upside-down
+    # SHORT exposure kills motion blur on spinners (frame period at 120 fps
+    # is 8333 us). Raise gain, not exposure, if the image is too dark.
+    exposure_time_us: 3000
+    gain: 80
+    auto_white_balance: true
+
+    # ── Serial (byte-compatible with the old bridge/firmware) ──────────────
+    serial_port: "/dev/ttyACM0"
+    serial_baudrate: 500000
+    serial_parity: "even"
+    shooting_active: false         # MASTER FIRE SWITCH — true for matches
+    rotating_chassis: false
+    send_gimbal_feedforward: false # needs the 5-line micro patch (docs)
+    cmd_timeout: 0.3
+    heartbeat_hz: 100.0
+
+    # ── Micro conventions (identical to the old pipeline) ──────────────────
+    gimbal.yaw_sign: 1.0
+    gimbal.pitch_sign: -1.0
+    micro_pitch_feedback_opposite_sign: true
+    micro_pitch_lock_opposite_sign: false
+    target_color_status_index: 4
+    bullet_speed_index: -1         # set 9 when fw reports muzzle speed in RX[9]
+    fixed_target_class: -1         # -1 auto from micro color; 0=blue, 2=red
+
+    # ── Geometry ───────────────────────────────────────────────────────────
+    gimbal_height: 0.42
+    # Camera lever arm from the pivot, gimbal frame (x fwd, y left, z up) [m].
+    cam_offset_x: 0.0
+    cam_offset_y: 0.0
+    cam_offset_z: 0.0
+    cam_trim_yaw_deg: 0.0
+    cam_trim_pitch_deg: 0.0
+    cam_trim_roll_deg: 0.0
+    assume_small_armor: true       # 1v1 infantry: enemy has small plates only
+    armor_pitch_deg: 15.0
+    max_reproj_error: 25.0
+    max_armor_dist: 8.0
+
+    # ── Tracker (11-state spherical EKF) ───────────────────────────────────
+    q_accel_xy: 60.0
+    q_accel_z: 4.0
+    q_alpha: 300.0
+    r_bearing: 0.004
+    r_dist_base: 0.03
+    r_dist_slope: 0.05
+    maha_gate: 16.0
+    confirm_frames: 2
+    lost_timeout: 0.6
+    initial_radius: 0.24
+
+    # ── Ballistics / fire control ──────────────────────────────────────────
+    bullet_speed: 24.0             # MEASURE with the referee/chrono!
+    drag_k: 0.0196                 # 17mm 3.2g Cd0.47; 0.0 = drag-free
+    actuation_latency: 0.025       # cmd -> gimbal settled (calibrate)
+    feeder_delay: 0.035            # shoot flag -> pellet exits (calibrate!)
+    feeder_sigma: 0.006
+    disp_bullet_mrad: 3.0
+    disp_system_mrad: 4.0
+    omega_track: 2.0               # rad/s: below = TRACK regime
+    omega_timed: 12.0              # rad/s: above = center-hold + timed shots
+    p_spray_min: 0.50              # full-auto gate (TRACK/SWEEP)
+    p_timed_min: 0.35              # per-shot gate (TIMED)
+    coming_angle_deg: 55.0
+    leaving_angle_deg: 20.0
+    min_fire_dist: 0.3
+    max_fire_dist: 6.5
+    shot_pulse: 0.020
+    shot_min_interval: 0.080       # >= 1 / firmware shooting_frequency
+    barrel_offset_x: 0.0
+    barrel_offset_y: 0.02
+    barrel_offset_z: -0.05
+    yaw_offset_deg: 0.0            # boresight: + shoots left -> increase
+    pitch_offset_deg: 0.0          # boresight: + shoots high -> increase
+    fire_lock_yaw: 0.05
+    fire_lock_pitch: 0.04
+
+    # ── Command shaping / safety ───────────────────────────────────────────
+    cmd_deadband_yaw: 0.005
+    cmd_deadband_pitch: 0.008
+    cmd_max_delta_yaw: 0.80
+    cmd_max_delta_pitch: 0.60
+    cmd_hold_time: 0.25
+
+    # ── Ego motion ─────────────────────────────────────────────────────────
+    use_ego_motion_compensation: true
+    ego_velocity_available: false  # true ONLY when micro vx/vy are validated
+    ego_velocity_body_frame: true
+    ego_velocity_deadband: 0.05
+    ego_velocity_lpf_alpha: 0.6
+    ego_velocity_max: 3.5
+    chassis_heading_index: -1      # set when fw sends chassis heading
+
+    # ── Debug (competition = all off) ──────────────────────────────────────
+    debug_enable: false
+    debug_markers: false
+    debug_every: 4

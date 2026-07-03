@@ -1,0 +1,37 @@
+# autoaim_v2 systemd unit — standard robot, ARC 1v1.
+# Same performance-pinning preamble as the proven autoaim.service; the launch
+# runs inside the existing autoaim_headless container (Isaac ROS dev image).
+#
+# Install:
+#   sudo cp aimv2.service /etc/systemd/system/
+#   sudo cp aimv2_start.sh /usr/local/bin/ && sudo chmod +x /usr/local/bin/aimv2_start.sh
+#   sudo systemctl daemon-reload && sudo systemctl enable --now aimv2
+# (Disable the old service first: sudo systemctl disable --now autoaim)
+
+[Unit]
+Description=autoaim_v2 1v1 auto-aim (ZED X Mini + TensorRT, single process)
+Requires=docker.service
+After=docker.service containerd.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Restart=always
+RestartSec=5
+KillMode=process
+
+# Performance pinning (see autoaim_auto_startup/standard/autoaim.service for
+# the full rationale): MAXN -> all cores online -> pin clocks + fan -> kill
+# deep idle. Order matters.
+ExecStartPre=-/usr/sbin/nvpmodel -m 0
+ExecStartPre=-/bin/bash -c 'for c in /sys/devices/system/cpu/cpu[0-9]*/online; do echo 1 > "$c" 2>/dev/null || true; done'
+ExecStartPre=-/usr/bin/jetson_clocks --fan
+ExecStartPre=-/bin/bash -c 'for s in /sys/devices/system/cpu/cpu[0-9]*/cpuidle/state[1-9]*/disable; do echo 1 > "$s" 2>/dev/null || true; done'
+
+ExecStart=/usr/local/bin/aimv2_start.sh
+
+ExecStop=-/usr/bin/docker exec -w /workspaces/isaac_ros-dev autoaim_headless bash -lc 'if [ -f /tmp/aimv2_launch.pid ]; then PID="$(cat /tmp/aimv2_launch.pid)"; kill -INT "-$PID" 2>/dev/null || kill -INT "$PID" 2>/dev/null || true; sleep 3; kill -TERM "-$PID" 2>/dev/null || true; rm -f /tmp/aimv2_launch.pid; fi'
+
+[Install]
+WantedBy=multi-user.target

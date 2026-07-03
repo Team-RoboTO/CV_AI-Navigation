@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>autoaim_v2</name>
+  <version>2.0.0</version>
+  <description>
+    Single-process C++ auto-aim for the ARC 1v1 Infantry Match.
+    ZED X Mini + TensorRT pose detector + spherical-EKF whole-car tracker +
+    drag ballistics + phase-timed fire control, byte-compatible with the
+    existing STM32H723 USB-CDC protocol.
+  </description>
+  <maintainer email="fabbriandreas07@gmail.com">Team RoboTO</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>eigen</depend>
+  <depend>libopencv-dev</depend>
+  <!-- Old package: provides ArmorKeypointArray for the ros_topics A/B input mode. -->
+  <depend>autoaim</depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
