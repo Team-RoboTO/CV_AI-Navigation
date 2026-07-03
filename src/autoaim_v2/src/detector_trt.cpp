@@ -140,6 +140,37 @@ DetectorTRT::~DetectorTRT()
   if (d_output_) cudaFree(d_output_);
 }
 
+std::vector<ArmorPx> DetectorTRT::infer_contiguous(const uint8_t * d_color,
+                                                   bool is_yuyv, bool flip180,
+                                                   cudaStream_t stream)
+{
+  std::vector<ArmorPx> out;
+  if (!ok_) return out;
+
+  if (is_yuyv) {
+    cuda_preprocess_yuyv(d_color, p_.native_w, p_.native_h, d_input_,
+                         net_size_, pad_y_, scale_, flip180, stream);
+  } else {
+    cuda_preprocess_bgr8(d_color, p_.native_w, p_.native_h, d_input_,
+                         net_size_, pad_y_, scale_, flip180, stream);
+  }
+
+  context_->setTensorAddress(in_name_.c_str(), d_input_);
+  context_->setTensorAddress(out_name_.c_str(), d_output_);
+  if (!context_->enqueueV3(stream)) return out;
+
+  cudaMemcpyAsync(h_output_.data(), d_output_, h_output_.size() * sizeof(float),
+                  cudaMemcpyDeviceToHost, stream);
+  cudaStreamSynchronize(stream);
+
+  if (post_nms_) {
+    decode_post_nms(out);
+  } else {
+    decode_raw(out);
+  }
+  return out;
+}
+
 std::vector<ArmorPx> DetectorTRT::infer(const uint8_t * d_bgra,
                                         size_t pitch_bytes, cudaStream_t stream)
 {

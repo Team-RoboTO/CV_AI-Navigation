@@ -33,6 +33,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/GimbalCmd.msg"
   "msg/ArmorKeypoint.msg"
   "msg/ArmorKeypointArray.msg"
+  "msg/AimDebugArmor.msg"
+  "msg/AimDebugFrame.msg"
   DEPENDENCIES std_msgs
 )
 

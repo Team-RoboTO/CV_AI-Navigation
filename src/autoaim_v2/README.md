@@ -1,8 +1,9 @@
 # autoaim_v2
 
-Single-process C++ auto-aim for the **ARC 1v1 Infantry Match** — ZED X Mini on
-Jetson AGX Orin, STM32H723 over USB-CDC (byte-compatible with the existing
-firmware, no micro changes needed to deploy).
+Single-process C++ auto-aim for the **ARC 1v1 Infantry Match** — supports both
+**ZED X Mini** and **RealSense D455** cameras on Jetson AGX Orin, STM32H723 over
+USB-CDC (byte-compatible with the existing firmware, no micro changes needed to
+deploy).
 
 - **[DESIGN.md](DESIGN.md)** — architecture and the verified math behind every
   decision (latency budget, drag ballistics, spherical EKF, fire regimes).
@@ -14,7 +15,8 @@ firmware, no micro changes needed to deploy).
 | area | old | new |
 |------|-----|-----|
 | processes | 3 (Python detector, tracker node, serial bridge) + DDS hops | 1 process, hot path never touches DDS |
-| detector | Python + PyCUDA, CPU image retrieve | C++ TensorRT, ZED GPU zero-copy |
+| detector | Python + PyCUDA, CPU image retrieve | C++ TensorRT, ZED GPU zero-copy or RS GPU preprocess |
+| camera | ZED X Mini only | ZED X Mini (`zed_trt`) or RealSense D455 (`rs_trt`) |
 | gimbal angles | 100 Hz topic, ring buffer | native 1 kHz serial, interpolated at capture time |
 | serial TX | 100 Hz timer (+5 ms median) | event-driven (~0.2 ms), 100 Hz heartbeat fallback |
 | EKF | 9-state, Cartesian xyz observation | 11-state whole-car, spherical (yaw/pitch/dist/θ) observation — angles trusted at mm grade, PnP depth at its real dm grade |
@@ -28,8 +30,14 @@ firmware, no micro changes needed to deploy).
 ```bash
 colcon build --packages-up-to autoaim_v2 --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
+
+# ZED X Mini (sentry / standard with ZED):
 ros2 launch autoaim_v2 standard_1v1.launch.py            # fire OFF by default
 ros2 launch autoaim_v2 standard_1v1.launch.py shooting_active:=true debug:=true
+
+# RealSense D455 (standard):
+ros2 launch autoaim_v2 standard_rs.launch.py
+ros2 launch autoaim_v2 standard_rs.launch.py shooting_active:=true debug:=true
 ```
 
 Tests: `colcon test --packages-select autoaim_v2` (25 gtests) and the
@@ -45,7 +53,8 @@ src/tracker.cpp       11-state spherical EKF (translation/rotation rescue)
 src/aimer.cpp         prediction, plate selection, fire regimes, p_hit
 src/detector_trt.cpp  TensorRT pose engine (raw + end2end layouts)
 src/zed_camera.cpp    ZED SDK wrapper (GPU retrieve, µs exposure)
-src/preprocess.cu     BGRA→NCHW letterbox kernel
+src/rs_camera.cpp     RealSense SDK wrapper (color stream, YUYV/BGR8)
+src/preprocess.cu     BGRA/BGR8/YUYV→NCHW letterbox kernels
 src/aim_node.cpp      process wiring: threads, serial, ROS params/debug
 test/                 25 gtests incl. timed-fire arrival invariant
 tools/                math_verify.py (design study), replay_synthetic.py (e2e)

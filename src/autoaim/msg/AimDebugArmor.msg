@@ -1,0 +1,19 @@
+int32 class_id
+float32 confidence
+float32[8] corners_xy
+bool accepted
+bool solved
+string reject_reason
+
+float64 pos_cam_x
+float64 pos_cam_y
+float64 pos_cam_z
+float64 pos_world_x
+float64 pos_world_y
+float64 pos_world_z
+float64 yaw
+float64 pitch
+float64 distance
+float64 plate_theta
+float64 theta_sigma
+float64 reprojection_error

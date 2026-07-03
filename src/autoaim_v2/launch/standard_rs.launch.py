@@ -11,9 +11,8 @@ from launch_ros.parameter_descriptions import ParameterValue
 
 def generate_launch_description():
     pkg = get_package_share_directory("autoaim_v2")
-    config = os.path.join(pkg, "config", "standard_1v1.yaml")
+    config = os.path.join(pkg, "config", "standard_rs.yaml")
 
-    # Highest-priority overrides for the values you touch at the field.
     engine_default = os.environ.get(
         "AUTOAIM_ENGINE_PATH",
         "/workspaces/isaac_ros-dev/AI-models/yolov26_keypoints.engine")
@@ -23,7 +22,7 @@ def generate_launch_description():
         DeclareLaunchArgument("engine_path", default_value=engine_default),
         DeclareLaunchArgument("shooting_active", default_value="false",
                               description="MASTER fire switch — true for matches"),
-        DeclareLaunchArgument("input_mode", default_value="zed_trt"),
+        DeclareLaunchArgument("input_mode", default_value="rs_trt"),
         DeclareLaunchArgument("debug", default_value="false"),
         DeclareLaunchArgument("debug_full", default_value="true"),
         DeclareLaunchArgument("debug_image", default_value="false"),

@@ -110,7 +110,10 @@ the same update (better center/radius conditioning than single-plate).
 ```
              ┌────────────────────────── aim_node (single process) ─────────────────────────┐
  ZED X Mini  │  capture/infer/aim thread (hot path, no DDS, no locks on the fast path)      │
- GMSL2 ──────┼─ zed grab → GPU BGRA → CUDA letterbox → TensorRT pose → decode               │
+ GMSL2 ──────┼─ zed grab → GPU BGRA → CUDA letterbox → TensorRT pose → decode    (zed_trt) │
+     OR      │                                                                               │
+ RealSense   │  rs grab → H2D BGR8/YUYV → CUDA letterbox → TensorRT pose → decode (rs_trt) │
+ USB3 ───────┼─                                                                              │
              │   → PnP position + yaw reprojection search (solver)                          │
              │   → world transform @ capture time (gimbal_buffer, 1 kHz samples)            │
              │   → whole-car EKF, 11 states (tracker)                                       │
@@ -128,7 +131,7 @@ the same update (better center/radius conditioning than single-plate).
   floats optionally carry yaw/pitch-rate feedforward when
   `send_gimbal_feedforward: true` (requires the documented 5-line micro patch;
   default false ⇒ zeros, exactly the legacy behaviour).
-- State estimate → command chain runs at camera rate (120 fps).
+- State estimate → command chain runs at camera rate (120 fps ZED / 90 fps RS).
 
 ## State model (tracker)
 
@@ -162,10 +165,12 @@ covers wall re-appearance on the far side).
 | `aimer.*` | prediction, plate selection, fire policy, hit probability |
 | `detector_trt.*` | TensorRT pose engine (raw + post-NMS layouts) |
 | `zed_camera.*` | ZED SDK wrapper (GPU retrieve, µs exposure) |
-| `preprocess.cu` | BGRA→letterboxed NCHW CUDA kernel |
+| `rs_camera.*` | RealSense SDK wrapper (color stream, YUYV/BGR8) |
+| `preprocess.cu` | BGRA/BGR8/YUYV→letterboxed NCHW CUDA kernels |
 | `aim_node.cpp` | process wiring, threads, ROS debug layer |
 | `test/*` | gtest: ballistics, solver, tracker, aimer, protocol, buffer |
 
-Build flavors: on the Jetson (ZED SDK + TensorRT found) everything builds; on
-a dev machine without them, the core library + tests + `ros_topics` input mode
-still build and run (CMake auto-detect).
+Build flavors: on the Jetson with camera SDKs and TensorRT, the node auto-detects
+which camera modes to enable (`zed_trt`, `rs_trt`, or both). On a dev machine
+without them, the core library + tests + `ros_topics` input mode still build and
+run (CMake auto-detect).

@@ -19,11 +19,21 @@ class IExecutionContext;
 namespace aim
 {
 
-// CUDA letterbox preprocess: BGRA (pitched, device) -> normalized RGB NCHW
-// fp32 (device). Implemented in preprocess.cu.
+// CUDA letterbox preprocess kernels. Implemented in preprocess.cu.
+// BGRA pitched (ZED GPU zero-copy):
 void cuda_preprocess_bgra(const uint8_t * d_bgra, size_t pitch_bytes, int in_w,
                           int in_h, float * d_out, int net_size, int pad_y,
                           float scale_net_to_native, cudaStream_t stream);
+// BGR8 contiguous (RealSense):
+void cuda_preprocess_bgr8(const uint8_t * d_bgr8, int in_w, int in_h,
+                          float * d_out, int net_size, int pad_y,
+                          float scale_net_to_native, bool flip180,
+                          cudaStream_t stream);
+// YUYV contiguous (RealSense raw):
+void cuda_preprocess_yuyv(const uint8_t * d_yuyv, int in_w, int in_h,
+                          float * d_out, int net_size, int pad_y,
+                          float scale_net_to_native, bool flip180,
+                          cudaStream_t stream);
 
 struct DetectorParams
 {
@@ -55,6 +65,12 @@ public:
   // Runs preprocess + inference + decode. Synchronous on `stream`.
   std::vector<ArmorPx> infer(const uint8_t * d_bgra, size_t pitch_bytes,
                              cudaStream_t stream);
+
+  // d_color: device pointer to contiguous BGR8 or YUYV frame (RealSense).
+  // is_yuyv: true = YUYV (2 bpp), false = BGR8 (3 bpp).
+  // flip180: fold a 180-degree rotation into the preprocess sampling.
+  std::vector<ArmorPx> infer_contiguous(const uint8_t * d_color, bool is_yuyv,
+                                        bool flip180, cudaStream_t stream);
 
 private:
   void decode_raw(std::vector<ArmorPx> & out);

@@ -3,7 +3,9 @@
 viewer_node.py — Debug overlay for the auto-aim pipeline.
 
 Subscribes to:
-  /yolo/debug_image       (Image from test.py)
+  /yolo/debug_image       (old pipeline Image, configurable with input_image_topic)
+  /aimv2/debug_image      (v2 model-view Image when input_image_topic is set)
+  /aimv2/debug_frame      (v2 full typed debug frame)
   /detector/armors        (Detection2DArray — YOLO bounding boxes)
   /cmd_vel_AI             (Twist — ABSOLUTE pitch/yaw target in radians + fire command)
   /tracker/aim_pixels     (Twist — aim/impact as 2D pixel coordinates from C++ node)
@@ -40,6 +42,12 @@ try:
     HAVE_KEYPOINTS = True
 except ImportError:
     HAVE_KEYPOINTS = False
+
+try:
+    from autoaim.msg import AimDebugFrame
+    HAVE_AIMV2_DEBUG = True
+except ImportError:
+    HAVE_AIMV2_DEBUG = False
 
 
 def wrap_pi(a: float) -> float:
@@ -80,8 +88,15 @@ class ViewerNode(Node):
         self.fire_lock_pitch = float(self.declare_parameter("fire_lock_pitch", 0.04).value)
         self.debug_image_topic = self.declare_parameter(
             "debug_image_topic", "/tracker/debug_image").value
+        self.input_image_topic = self.declare_parameter(
+            "input_image_topic", "/yolo/debug_image").value
+        self.v2_debug_topic = self.declare_parameter(
+            "v2_debug_topic", "/aimv2/debug_frame").value
         self.exclusive_output = bool(self.declare_parameter("exclusive_output", True).value)
         self.publish_enabled = True
+
+        self.v2_debug = None
+        self.last_v2_debug_time = 0.0
 
         # Pixel overlay from C++ node. If missing/stale, viewer computes a fallback
         # from cmd absolute target minus current micro angle.
@@ -106,7 +121,7 @@ class ViewerNode(Node):
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=1)
 
-        self.create_subscription(Image, '/yolo/debug_image', self.image_cb, sensor_qos)
+        self.create_subscription(Image, self.input_image_topic, self.image_cb, sensor_qos)
         self.create_subscription(Detection2DArray, '/detector/armors', self.det_cb, sensor_qos)
         self.create_subscription(Twist, '/cmd_vel_AI', self.cmd_cb, sensor_qos)
         self.create_subscription(Twist, '/tracker/aim_pixels', self.aim_px_cb, sensor_qos)
@@ -127,6 +142,17 @@ class ViewerNode(Node):
                 self.get_logger().warn(
                     "autoaim.msg.ArmorKeypointArray not available — keypoint overlay disabled.")
 
+        if HAVE_AIMV2_DEBUG:
+            self.create_subscription(
+                AimDebugFrame,
+                self.v2_debug_topic,
+                self.v2_debug_cb,
+                sensor_qos)
+        else:
+            if self.enable_ros_logs:
+                self.get_logger().warn(
+                    "autoaim.msg.AimDebugFrame not available — v2 overlay disabled.")
+
         if self.exclusive_output:
             existing_publishers = self.get_publishers_info_by_topic(self.debug_image_topic)
             if existing_publishers:
@@ -144,7 +170,9 @@ class ViewerNode(Node):
             self.get_logger().info(
                 f"Viewer fire lock thresholds: yaw={self.fire_lock_yaw:.3f} rad, "
                 f"pitch={self.fire_lock_pitch:.3f} rad")
-            self.get_logger().info(f'Viewer started — view {self.debug_image_topic} in RViz2')
+            self.get_logger().info(
+                f'Viewer started — subscribing {self.input_image_topic}, '
+                f'view {self.debug_image_topic} in RViz2')
 
     def camera_info_cb(self, msg):
         self.img_w = int(msg.width)
@@ -191,6 +219,40 @@ class ViewerNode(Node):
         self.aim_holding = msg.linear.z > 0.5
         self.last_aim_px_time = time.monotonic()
 
+    def v2_debug_cb(self, msg):
+        self.v2_debug = msg
+        self.last_v2_debug_time = time.monotonic()
+
+        # Let the existing command/lock HUD and fallback aim projection work
+        # even when the v2 node is the only producer.
+        self.tracking = bool(msg.tracker_tracking and msg.tx_command_valid)
+        self.cmd_fire = bool(msg.tx_shoot or msg.planned_shoot)
+        self.cmd_pitch = float(msg.tx_pitch_micro)
+        self.cmd_yaw = float(msg.tx_yaw_micro)
+        self.cmd_distance = float(msg.target_distance)
+        self.micro_yaw = float(msg.gimbal_now_yaw_raw)
+        self.micro_pitch = float(msg.gimbal_now_pitch_raw)
+        self.micro_vx = float(msg.micro_vx)
+        self.micro_vy = float(msg.micro_vy)
+        if msg.camera_fx > 0.0 and msg.camera_fy > 0.0:
+            self.cam_fx = float(msg.camera_fx)
+            self.cam_fy = float(msg.camera_fy)
+            self.cam_cx = float(msg.camera_cx)
+            self.cam_cy = float(msg.camera_cy)
+            self.img_w = int(msg.image_width)
+            self.img_h = int(msg.image_height)
+            max_angle = math.radians(85.0)
+            aim_cam_yaw = max(-max_angle, min(max_angle, -float(msg.lock_error_yaw)))
+            aim_cam_pitch = max(-max_angle, min(max_angle, float(msg.lock_error_pitch)))
+            px = self.cam_cx + self.cam_fx * math.tan(aim_cam_yaw)
+            py = self.cam_cy - self.cam_fy * math.tan(aim_cam_pitch)
+            self.aim_px = (int(px), int(py))
+            self.imp_px = None
+            self.fire_px = bool(msg.tx_shoot or msg.planned_shoot)
+            self.aim_holding = False
+            self.last_aim_px_time = self.last_v2_debug_time
+        self.last_cmd_time = self.last_v2_debug_time
+
     def _age_s(self, stamp: float):
         if stamp <= 0.0:
             return None
@@ -204,6 +266,28 @@ class ViewerNode(Node):
 
     def _fmt_bool(self, value: bool) -> str:
         return "Y" if value else "N"
+
+    def _v2_fresh(self, now_mono: float) -> bool:
+        return (
+            self.v2_debug is not None and
+            (now_mono - self.last_v2_debug_time) <= self.cmd_topic_timeout
+        )
+
+    def _tracker_state_name(self, state: int) -> str:
+        return {
+            0: "LOST",
+            1: "DETECTING",
+            2: "TRACKING",
+            3: "TEMP_LOST",
+        }.get(int(state), str(state))
+
+    def _regime_name(self, regime: int) -> str:
+        return {
+            0: "NONE",
+            1: "TRACK",
+            2: "SWEEP",
+            3: "TIMED",
+        }.get(int(regime), str(regime))
 
     def _micro_pitch_for_lock(self) -> float:
         if self.micro_pitch is None:
@@ -258,6 +342,43 @@ class ViewerNode(Node):
         cv2.putText(frame, label, (min(dax + 14, w - 165), max(day - 8, 16)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
 
+    def _draw_v2_debug(self, frame, w, h, now_mono):
+        if not self._v2_fresh(now_mono):
+            return False
+
+        for armor in self.v2_debug.armors:
+            pts = []
+            try:
+                for i in range(4):
+                    x = int(armor.corners_xy[2 * i])
+                    y = int(armor.corners_xy[2 * i + 1])
+                    pts.append((x, y))
+            except (AttributeError, IndexError):
+                continue
+            if len(pts) != 4:
+                continue
+
+            if armor.accepted:
+                color = (0, 255, 0)
+            elif armor.solved:
+                color = (0, 165, 255)
+            else:
+                color = (70, 70, 255)
+
+            cv2.polylines(frame, [np.array(pts, dtype=np.int32)], True, color, 2)
+            for p in pts:
+                cv2.circle(frame, p, 3, (255, 255, 255), -1)
+
+            label = f"v2 c{armor.class_id} {armor.confidence:.2f}"
+            if not armor.accepted:
+                label += f" {armor.reject_reason}"
+            min_x = int(np.clip(min(p[0] for p in pts), 0, max(0, w - 180)))
+            min_y = int(np.clip(min(p[1] for p in pts) - 6, 14, max(14, h - 4)))
+            cv2.putText(frame, label, (min_x, min_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1, cv2.LINE_AA)
+
+        return True
+
     def image_cb(self, msg):
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
@@ -273,6 +394,7 @@ class ViewerNode(Node):
         frame = frame.copy()
         h, w = frame.shape[:2]
         now_mono = time.monotonic()
+        v2_fresh = self._v2_fresh(now_mono)
         cmd_fresh = (
             self.last_cmd_time > 0.0 and
             (now_mono - self.last_cmd_time) <= self.cmd_topic_timeout)
@@ -281,23 +403,26 @@ class ViewerNode(Node):
             (now_mono - self.last_aim_px_time) < self.aim_topic_timeout)
         actively_tracking = self.tracking and cmd_fresh
 
-        # YOLO bounding boxes
-        for det in self.detections:
-            cx = det.bbox.center.position.x
-            cy = det.bbox.center.position.y
-            bw = det.bbox.size_x
-            bh = det.bbox.size_y
-            x1, y1 = int(cx - bw/2), int(cy - bh/2)
-            x2, y2 = int(cx + bw/2), int(cy + bh/2)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
-            if det.results:
-                label = f"c{det.results[0].hypothesis.class_id} {det.results[0].hypothesis.score:.2f}"
-                cv2.putText(frame, label, (x1, y1 - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 255), 1, cv2.LINE_AA)
+        drew_v2 = self._draw_v2_debug(frame, w, h, now_mono)
+
+        # YOLO bounding boxes from the old detector path.
+        if not drew_v2:
+            for det in self.detections:
+                cx = det.bbox.center.position.x
+                cy = det.bbox.center.position.y
+                bw = det.bbox.size_x
+                bh = det.bbox.size_y
+                x1, y1 = int(cx - bw/2), int(cy - bh/2)
+                x2, y2 = int(cx + bw/2), int(cy + bh/2)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                if det.results:
+                    label = f"c{det.results[0].hypothesis.class_id} {det.results[0].hypothesis.score:.2f}"
+                    cv2.putText(frame, label, (x1, y1 - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 255), 1, cv2.LINE_AA)
 
         # 4-point armor keypoints from the keypoint detector.
         # Convention from msg: TL, TR, BR, BL — draw as quadrilateral.
-        for kpd in self.keypoint_detections:
+        for kpd in ([] if drew_v2 else self.keypoint_detections):
             try:
                 kp = kpd.keypoints_xy  # length 8
                 valid = kpd.keypoint_valid  # length 4
@@ -366,7 +491,21 @@ class ViewerNode(Node):
         text_bad = (0, 0, 255)
 
         lines = []
-        if actively_tracking:
+        if v2_fresh:
+            dbg = self.v2_debug
+            state_name = self._tracker_state_name(dbg.tracker_state)
+            regime_name = self._regime_name(dbg.fire_regime)
+            state_color = text_ok if dbg.tracker_tracking else text_warn
+            lines.append((f"V2: {state_name} / {regime_name}", state_color))
+            lines.append((f"det/acc:   {dbg.detection_count}/{dbg.accepted_count}", text_info))
+            lines.append((f"p_hit:     {dbg.hit_probability:.2f}", text_ok if dbg.hit_probability > 0.5 else text_warn))
+            lines.append((f"omega:     {dbg.target_omega:+.2f} rad/s", text_dim))
+            lines.append((f"latency:   {dbg.pipeline_latency_ms:.1f} ms", text_dim))
+            lines.append((f"lock y/p:  {dbg.lock_error_yaw:+.3f}, {dbg.lock_error_pitch:+.3f}",
+                          text_ok if dbg.locked else text_warn))
+            if dbg.tx_shoot or dbg.planned_shoot:
+                lines.append((">>> FIRE <<<", text_ok))
+        elif actively_tracking:
             lines.append(("STATE: TRACKING", text_ok))
             lines.append((f"Pitch tgt: {self.cmd_pitch:+.3f} rad", text_info))
             lines.append((f"Yaw tgt:   {self.cmd_yaw:+.3f} rad", text_info))

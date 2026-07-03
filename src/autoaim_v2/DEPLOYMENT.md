@@ -1,14 +1,17 @@
-# autoaim_v2 — deployment on the robot (Jetson AGX Orin + ZED X Mini + STM32H723)
+# autoaim_v2 — deployment on the robot (Jetson AGX Orin + STM32H723)
 
-The serial protocol is byte-identical to the old bridge: **no firmware change
-is required** to deploy. The old `autoaim` pipeline stays installed as a
-fallback (`ros2 launch autoaim standard.launch.py`).
+Supports both **ZED X Mini** and **RealSense D455** cameras. The serial protocol
+is byte-identical to the old bridge: **no firmware change is required** to
+deploy. The old `autoaim` pipeline stays installed as a fallback
+(`ros2 launch autoaim standard.launch.py`).
 
 ## 0. Prerequisites on the Jetson
 
 - JetPack 6.x (CUDA 12, TensorRT 10) or JetPack 5.1 (CUDA 11, TensorRT 8.5+)
-- ZED SDK **≥ 4.0** for the matching JetPack (SDK 4+ uses the CUDA primary
-  context, which this node relies on)
+- **ZED X Mini**: ZED SDK **≥ 4.0** for the matching JetPack (SDK 4+ uses the
+  CUDA primary context, which this node relies on)
+- **RealSense D455**: librealsense2 dev (`apt install librealsense2-dev` or
+  build from source for aarch64 — the Intel apt repo ships x86 only)
 - ROS 2 Humble (bare-metal or the existing Isaac ROS container — same as the
   old pipeline)
 - The TensorRT engine `yolov26_keypoints.engine` built **on the Jetson**
@@ -35,14 +38,18 @@ colcon build --packages-up-to autoaim_v2 --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
 ```
 
-The CMake auto-detects ZED SDK + TensorRT. On the Jetson you must see:
+The CMake auto-detects CUDA + TensorRT + camera SDKs. On the Jetson you must
+see at least one of:
 
 ```
-autoaim_v2: building WITH ZED + TensorRT (competition binary)
+autoaim_v2: ZED + TensorRT found (zed_trt mode available)
+autoaim_v2: RealSense + TensorRT found (rs_trt mode available)
 ```
 
-If it says `ros_topics input mode only`, the ZED SDK or TensorRT dev headers
-are missing — fix that first (`ls /usr/local/zed`, `dpkg -l | grep nvinfer`).
+Both can be available simultaneously — the `input_mode` parameter selects which
+camera is used at runtime. If it says `ros_topics input mode only`, the camera
+SDK or TensorRT dev headers are missing — fix that first
+(`ls /usr/local/zed`, `dpkg -l | grep nvinfer`, `dpkg -l | grep librealsense`).
 
 Run the unit tests once per machine: `colcon test --packages-select autoaim_v2
 && colcon test-result` → `25 tests, 0 errors, 0 failures`.
@@ -86,15 +93,18 @@ fire regime sleeps to sub-ms deadlines). Add to `/etc/security/limits.d/99-aim.c
 ## 3. First power-on checklist (safety order)
 
 1. **Feeder empty, flywheels off**, robot on blocks.
-2. `ros2 launch autoaim_v2 standard_1v1.launch.py` (defaults:
-   `shooting_active:=false` — the node never sends shoot=1).
+2. Launch with your camera:
+   - ZED: `ros2 launch autoaim_v2 standard_1v1.launch.py`
+   - RealSense: `ros2 launch autoaim_v2 standard_rs.launch.py`
+   (defaults: `shooting_active:=false` — the node never sends shoot=1).
 3. Check the micro link: gimbal should hold still; move the gimbal by hand in
    manual mode and confirm `/aimv2/debug` (launch with `debug:=true`) updates.
 4. Show it an armor plate (powered lightbars or a printed target at ~2 m).
-   In `debug:=true` the topic `/aimv2/debug` prints
-   `[regime, tracker_state, face, p_hit, omega, dist, ...]` —
-   `tracker_state` must go 1 (DETECTING) → 2 (TRACKING) and `dist` must match
-   a tape measure within ~5 cm.
+   In `debug:=true`, `/aimv2/debug` keeps the compact legacy float array
+   `[regime, tracker_state, face, p_hit, omega, dist, ...]`, and
+   `/aimv2/debug_frame` publishes the full typed debug frame for rosbag. The
+   `tracker_state` field must go 1 (DETECTING) → 2 (TRACKING), and
+   `target_distance` must match a tape measure within ~5 cm.
 5. Switch the micro to auto-aim mode: the gimbal must track the plate as you
    carry it around. If yaw runs AWAY from the target, flip `gimbal.yaw_sign`.
    If pitch mirrors (looks up when the plate is low), see
@@ -102,6 +112,37 @@ fire regime sleeps to sub-ms deadlines). Add to `/etc/security/limits.d/99-aim.c
    unchanged from the old pipeline.
 6. Only then: pellets in, `shooting_active:=true`, static target, single
    bursts. Then calibrate (next section).
+
+### Debug topics / rosbag
+
+For full RealSense bench debug:
+
+```bash
+ros2 launch autoaim_v2 standard_rs.launch.py \
+  debug:=true debug_image:=true viewer:=true shooting_active:=false
+```
+
+Useful topics:
+
+| topic | type | purpose |
+|-------|------|---------|
+| `/aimv2/debug_frame` | `autoaim/msg/AimDebugFrame` | full per-frame detector/PnP/tracker/aimer/serial state |
+| `/aimv2/debug` | `std_msgs/Float32MultiArray` | compact legacy debug vector used by tests |
+| `/aimv2/debug_image` | `sensor_msgs/Image` | RealSense image in the same orientation used by the model |
+| `/aimv2/viewer_image` | `sensor_msgs/Image` | annotated viewer output for RViz/image_view |
+| `/aimv2/markers` | `visualization_msgs/MarkerArray` | optional RViz world markers when `debug_markers:=true` |
+
+Rosbag the useful debug stream:
+
+```bash
+ros2 bag record \
+  /aimv2/debug_frame \
+  /aimv2/debug \
+  /aimv2/debug_image \
+  /aimv2/viewer_image \
+  /aimv2/markers \
+  /camera_info
+```
 
 ## 4. Calibration order (do them in this order)
 
@@ -132,6 +173,7 @@ the same launch line inside the container).
 | switch | where | match value |
 |--------|-------|-------------|
 | `shooting_active` | launch arg | `true` |
+| `input_mode` | launch arg | `zed_trt` or `rs_trt` (matches your camera) |
 | `rotating_chassis` | yaml | your call (spin-to-win) |
 | `fixed_target_class` | yaml | `-1` (auto from referee color) |
 | `debug_enable` | launch arg `debug` | `false` |
