@@ -34,6 +34,19 @@ CAMERA_INFO_MESSAGES=3
 FIRST_HEALTH_ATTEMPTS=8
 TOPIC_TIMEOUT_SEC=8
 
+# Dataset recording: rosbag of CLEAN camera frames (JPEG) for training data.
+# RECORD_EVERY throttles the detector's recording publisher: camera fps / N
+# images per second (60 fps / 2 = 30 img/s, ~90 KB/frame at 848x480 q95,
+# ~10 GB/hour). Bags land in WORKDIR/RECORD_DIR (host-visible via the mount);
+# oldest recordings are deleted once the folder exceeds RECORD_MAX_TOTAL_GB.
+# NOTE: the JPEG encode runs inside the detector frame loop — RECORD_EVERY=1
+# (60 img/s) would spend extra ms per frame in the aiming loop; keep >=2 in matches.
+RECORD_ENABLE=1
+RECORD_EVERY=1
+RECORD_TOPIC="/camera/image_raw/compressed"
+RECORD_DIR="bags/autostart"
+RECORD_MAX_TOTAL_GB=23
+
 log() {
   echo "[autoaim] $*"
 }
@@ -110,7 +123,7 @@ log "launching ROS and checking ${HEALTH_TOPIC}..."
 exec docker exec -i \
   -w "$WORKDIR" \
   "$CONTAINER" \
-  bash -s -- "$LAUNCH_PKG" "$LAUNCH_FILE" "$HEALTH_TOPIC" "$CAMERA" "$WORKDIR" "$SYMLINK_TARGET_WS" "$CAMERA_INFO_MESSAGES" "$FIRST_HEALTH_ATTEMPTS" "$TOPIC_TIMEOUT_SEC" <<'INSIDE_CONTAINER'
+  bash -s -- "$LAUNCH_PKG" "$LAUNCH_FILE" "$HEALTH_TOPIC" "$CAMERA" "$WORKDIR" "$SYMLINK_TARGET_WS" "$CAMERA_INFO_MESSAGES" "$FIRST_HEALTH_ATTEMPTS" "$TOPIC_TIMEOUT_SEC" "$RECORD_ENABLE" "$RECORD_EVERY" "$RECORD_TOPIC" "$RECORD_DIR" "$RECORD_MAX_TOTAL_GB" <<'INSIDE_CONTAINER'
 set -eo pipefail
 
 LAUNCH_PKG="$1"
@@ -122,6 +135,11 @@ SYMLINK_TARGET_WS="$6"
 CAMERA_INFO_MESSAGES="$7"
 FIRST_HEALTH_ATTEMPTS="$8"
 TOPIC_TIMEOUT_SEC="$9"
+RECORD_ENABLE="${10}"
+RECORD_EVERY="${11}"
+RECORD_TOPIC="${12}"
+RECORD_DIR="${13}"
+RECORD_MAX_TOTAL_GB="${14}"
 
 log() {
   echo "[autoaim] $*"
@@ -185,6 +203,93 @@ if [ -f /tmp/autoaim_launch.pid ]; then
   rm -f /tmp/autoaim_launch.pid
 fi
 
+# SIGINT (not TERM/KILL) so ros2 bag finalizes metadata.yaml; a bag killed hard
+# still keeps its data but needs `ros2 bag reindex` before it can be read.
+if [ -f /tmp/autoaim_bag.pid ]; then
+  OLD_BAG_PID="$(cat /tmp/autoaim_bag.pid || true)"
+  if [ -n "$OLD_BAG_PID" ] && kill -0 "$OLD_BAG_PID" 2>/dev/null; then
+    log "stopping old rosbag recorder PID $OLD_BAG_PID"
+    kill -INT "-$OLD_BAG_PID" 2>/dev/null || kill -INT "$OLD_BAG_PID" 2>/dev/null || true
+    sleep 2
+    kill -TERM "-$OLD_BAG_PID" 2>/dev/null || true
+  fi
+  rm -f /tmp/autoaim_bag.pid
+fi
+
+BAG_PID=""
+
+start_recording_bag() {
+  [ "$RECORD_ENABLE" = "1" ] || return 0
+
+  local bag_root="$WORKDIR/$RECORD_DIR"
+  mkdir -p "$bag_root"
+
+  # Bags from a hard power-off (no clean service stop) are missing
+  # metadata.yaml and unreadable until reindexed. Fix them in the background
+  # so every boot leaves the previous match's bag readable.
+  local d
+  for d in "$bag_root"/rec_*/; do
+    if [ -d "$d" ] && [ ! -f "${d}metadata.yaml" ]; then
+      log "reindexing bag from unclean shutdown: $d"
+      setsid ros2 bag reindex "$d" >>/tmp/autoaim_bag_reindex.log 2>&1 &
+    fi
+  done
+
+  # Retention: drop oldest recordings until under the cap, so autostart
+  # recording can never fill the disk.
+  local max_kb=$((RECORD_MAX_TOTAL_GB * 1024 * 1024))
+  local oldest
+  while [ "$(du -sk "$bag_root" 2>/dev/null | cut -f1)" -gt "$max_kb" ]; do
+    oldest="$(ls -1t "$bag_root" | tail -n 1)"
+    [ -n "$oldest" ] || break
+    log "recording retention: removing old bag $oldest"
+    rm -rf "${bag_root:?}/${oldest}"
+  done
+
+  # ros2 bag record refuses to start if the output folder already exists
+  # (seen after a service restart + clock step: recorder died instantly and
+  # nothing was recorded). Pick a unique name, verify the recorder survives
+  # startup, and retry with a fresh name instead of failing silently.
+  local attempt bag_path
+  for attempt in 1 2 3; do
+    bag_path="$bag_root/rec_$(date +%Y%m%d_%H%M%S)"
+    while [ -e "$bag_path" ]; do
+      bag_path="${bag_path}_${RANDOM}"
+    done
+
+    log "starting dataset rosbag (attempt $attempt/3): $bag_path ($RECORD_TOPIC)"
+    setsid ros2 bag record -o "$bag_path" "$RECORD_TOPIC" /camera_info \
+      >/tmp/autoaim_bag.log 2>&1 &
+    BAG_PID=$!
+
+    sleep 3
+    if kill -0 "$BAG_PID" 2>/dev/null; then
+      echo "$BAG_PID" > /tmp/autoaim_bag.pid
+      log "rosbag recorder started, PID: $BAG_PID"
+      return 0
+    fi
+
+    log "ERROR: rosbag recorder died right after start; last log lines:"
+    tail -n 5 /tmp/autoaim_bag.log 2>/dev/null || true
+  done
+
+  BAG_PID=""
+  log "ERROR: dataset recording failed after 3 attempts; launch continues WITHOUT recording"
+}
+
+stop_recording_bag() {
+  if [ -n "$BAG_PID" ] && kill -0 "$BAG_PID" 2>/dev/null; then
+    log "stopping rosbag recorder"
+    kill -INT "-$BAG_PID" 2>/dev/null || kill -INT "$BAG_PID" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      kill -0 "$BAG_PID" 2>/dev/null || break
+      sleep 1
+    done
+    kill -TERM "-$BAG_PID" 2>/dev/null || true
+  fi
+  rm -f /tmp/autoaim_bag.pid
+}
+
 check_camera_info_messages() {
   local topic="$1"
   local needed="$2"
@@ -210,12 +315,17 @@ check_camera_info_messages() {
   return 0
 }
 
+RECORD_ARGS=()
+if [ "$RECORD_ENABLE" = "1" ]; then
+  RECORD_ARGS=(record_every:="$RECORD_EVERY")
+fi
+
 log "starting launch:"
-log "ros2 launch $LAUNCH_PKG $LAUNCH_FILE camera:=$CAMERA"
+log "ros2 launch $LAUNCH_PKG $LAUNCH_FILE camera:=$CAMERA ${RECORD_ARGS[*]:-}"
 
 rm -f /tmp/autoaim_launch.pid
 
-setsid ros2 launch "$LAUNCH_PKG" "$LAUNCH_FILE" camera:="$CAMERA" &
+setsid ros2 launch "$LAUNCH_PKG" "$LAUNCH_FILE" camera:="$CAMERA" ${RECORD_ARGS[@]+"${RECORD_ARGS[@]}"} &
 LAUNCH_PID=$!
 
 echo "$LAUNCH_PID" > /tmp/autoaim_launch.pid
@@ -242,8 +352,11 @@ for i in $(seq 1 "$FIRST_HEALTH_ATTEMPTS"); do
 
     if check_camera_info_messages "$HEALTH_TOPIC" "$CAMERA_INFO_MESSAGES"; then
       log "OK: camera_info is stable"
-      wait "$LAUNCH_PID"
-      exit $?
+      start_recording_bag
+      LAUNCH_RC=0
+      wait "$LAUNCH_PID" || LAUNCH_RC=$?
+      stop_recording_bag
+      exit "$LAUNCH_RC"
     fi
   fi
 

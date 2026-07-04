@@ -325,6 +325,11 @@ def generate_launch_description():
     # The engine_path launch arg/env overrides whatever the sensor YAML sets.
     engine_override = {"engine_path": engine_path}
 
+    # Dataset recording cadence for /camera/image_raw/compressed (clean JPEG
+    # frames). 0 keeps the publisher off; the autostart script passes e.g.
+    # record_every:=2 (60 fps / 2 = 30 img/s) and rosbag-records the topic.
+    record_override = {"publish_record_every": LaunchConfiguration("record_every")}
+
     return LaunchDescription([
         DeclareLaunchArgument("engine_path", default_value=str(default_engine)),
         DeclareLaunchArgument("serial_port", default_value="/dev/ttyACM0"),
@@ -333,6 +338,12 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "camera", default_value=DEFAULT_CAMERA,
             description='Active camera detector: "realsense" or "zed".'),
+
+        DeclareLaunchArgument(
+            "record_every", default_value="0",
+            description="Publish clean JPEG frames on /camera/image_raw/compressed "
+                        "every N camera frames (0 = off). Used by the autostart "
+                        "dataset rosbag; RealSense detector only."),
 
         Node(
             package="autoaim",
@@ -380,7 +391,8 @@ def generate_launch_description():
             package="autoaim_realsense",
             executable="realsense_detector",
             name="realsense_detector",
-            parameters=[realsense_config, engine_override] + detector_debug_params(),
+            parameters=[realsense_config, engine_override, record_override]
+                       + detector_debug_params(),
             output="screen",
             arguments=ros_log_args("log_detector_enable", "log_level_detector"),
             condition=realsense_condition,

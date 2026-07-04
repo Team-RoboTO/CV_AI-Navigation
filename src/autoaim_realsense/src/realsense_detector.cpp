@@ -13,6 +13,8 @@
 //
 //   /detector/armors_keypoints_json std_msgs/String              (debug)
 //   /yolo/debug_image              sensor_msgs/Image             (throttled debug)
+//   /camera/image_raw/compressed   sensor_msgs/CompressedImage   (throttled JPEG,
+//                                  clean frame for dataset recording)
 //
 // Tracking never reads the JSON string; it consumes the typed
 // ArmorKeypointArray above. Keeping debug publishers off by default makes a
@@ -44,10 +46,12 @@
 #include <librealsense2/rs.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/dnn.hpp>
+#include <opencv2/imgcodecs.hpp>  // imencode (JPEG dataset-recording image)
 #include <opencv2/imgproc.hpp>  // cvtColor (YUYV->BGR debug image)
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <vision_msgs/msg/detection2_d_array.hpp>
@@ -174,6 +178,12 @@ class RealSenseDetector : public rclcpp::Node {
     // keypoint and bbox topics below are the functional detector path and are
     // never gated by this safe-by-default debug knob.
     publish_debug_every_ = declare_parameter<int>("publish_debug_every", 0);
+    // Dataset-recording cadence: 0 means no recording publisher at all. Unlike
+    // the debug image this is the CLEAN camera frame (no overlays), published
+    // JPEG-compressed so an autostart rosbag can record training images
+    // without eating disk (raw 640x360 BGR is ~0.7 MB/frame, JPEG q85 ~25 KB).
+    publish_record_every_ = declare_parameter<int>("publish_record_every", 0);
+    record_jpeg_quality_ = declare_parameter<int>("record_jpeg_quality", 85);
     // JSON is a viewer/echo aid only. The tracker reads the typed
     // /detector/armors_keypoints message, never this string, so disabling it
     // cannot break detection -> tracking -> command -> serial -> fire.
@@ -189,6 +199,12 @@ class RealSenseDetector : public rclcpp::Node {
     }
     if (publish_debug_every_ > 0) {
       img_pub_ = create_publisher<sensor_msgs::msg::Image>("/yolo/debug_image", 1);
+    }
+    if (publish_record_every_ > 0) {
+      // Reliable keep-last so the rosbag recorder does not silently drop
+      // frames; messages are small JPEGs so reliability costs nothing here.
+      rec_pub_ = create_publisher<sensor_msgs::msg::CompressedImage>(
+          "/camera/image_raw/compressed", rclcpp::QoS(10).reliable());
     }
     // Camera intrinsics are static and published sparsely (camera_info_every).
     // Latch them (transient-local + reliable) so a late-joining or respawned
@@ -513,18 +529,23 @@ class RealSenseDetector : public rclcpp::Node {
       cam_info_msg_.header.stamp = stamp;
       cam_info_pub_->publish(cam_info_msg_);
     }
-    if (publish_debug_every_ > 0 && (frame_count_ % publish_debug_every_) == 0) {
+    const bool want_debug =
+        publish_debug_every_ > 0 && (frame_count_ % publish_debug_every_) == 0;
+    const bool want_record =
+        publish_record_every_ > 0 && (frame_count_ % publish_record_every_) == 0;
+    if (want_debug || want_record) {
+      const uint8_t* bgr = src;
       if (use_yuyv_) {
-        // Build a BGR debug image from the raw YUY2 frame (throttled, so this
-        // CPU conversion is cheap), matching the network input orientation.
+        // Build a BGR image from the raw YUY2 frame (throttled, so this CPU
+        // conversion is cheap), matching the network input orientation.
         cv::Mat yuyv(native_h_, native_w_, CV_8UC2,
                      const_cast<void*>(color.get_data()));
         cv::cvtColor(yuyv, debug_bgr_, cv::COLOR_YUV2BGR_YUYV);
         if (flip_180_) cv::flip(debug_bgr_, debug_bgr_, -1);
-        publishDebugImage(debug_bgr_.data, stamp);
-      } else {
-        publishDebugImage(src, stamp);
+        bgr = debug_bgr_.data;
       }
+      if (want_debug) publishDebugImage(bgr, stamp);
+      if (want_record) publishRecordImage(bgr, stamp);
     }
   }
 
@@ -701,6 +722,25 @@ class RealSenseDetector : public rclcpp::Node {
     }
   }
 
+  // Clean camera frame (no overlays) as JPEG, for the dataset-recording rosbag
+  // started by the autostart script. Per-frame JPEG beats bag-level zstd on
+  // camera images by an order of magnitude, so the bag records only this topic.
+  void publishRecordImage(const uint8_t* data, const rclcpp::Time& stamp) {
+    cv::Mat bgr(native_h_, native_w_, CV_8UC3, const_cast<uint8_t*>(data));
+    if (!cv::imencode(".jpg", bgr, jpeg_buf_,
+                      {cv::IMWRITE_JPEG_QUALITY, record_jpeg_quality_})) {
+      AA_RCLCPP_WARN_THROTTLE(enable_ros_logs_, get_logger(), *get_clock(), 2000,
+                           "JPEG encode failed for recording image");
+      return;
+    }
+    sensor_msgs::msg::CompressedImage msg;
+    msg.header.stamp = stamp;
+    msg.header.frame_id = frame_id_;
+    msg.format = "jpeg";
+    msg.data.assign(jpeg_buf_.begin(), jpeg_buf_.end());
+    rec_pub_->publish(msg);
+  }
+
   void publishDebugImage(const uint8_t* data, const rclcpp::Time& stamp) {
     sensor_msgs::msg::Image img;
     img.header.stamp = stamp;
@@ -729,6 +769,8 @@ class RealSenseDetector : public rclcpp::Node {
   cv::Mat flip_buf_;   // reused 180-rotated color buffer (BGR8 + flip_180_ only)
   cv::Mat debug_bgr_;  // reused BGR debug image built from YUYV (yuyv only)
   int publish_debug_every_{0}, camera_info_every_{1};
+  int publish_record_every_{0}, record_jpeg_quality_{85};
+  std::vector<uint8_t> jpeg_buf_;  // reused JPEG encode buffer (recording only)
   bool publish_json_{false};
   bool enable_ros_logs_{false};
 
@@ -771,6 +813,7 @@ class RealSenseDetector : public rclcpp::Node {
   rclcpp::Publisher<autoaim::msg::ArmorKeypointArray>::SharedPtr kpt_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr json_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr img_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr rec_pub_;
   rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr cam_info_pub_;
 
   std::atomic<bool> running_{false};

@@ -11,6 +11,9 @@ AI-models/*.onnx
 # Old folders
 old/
 
+# Autostart dataset recordings (rosbags of camera JPEG frames)
+bags/autostart/
+
 # Container folders
 src/isaac_ros_common
 src/isaac_*

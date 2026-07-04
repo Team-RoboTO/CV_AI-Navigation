@@ -128,7 +128,66 @@ Expected success condition:
 
     [autoaim] OK: camera_info is stable
 
-## 6. Useful checks on this device
+## 6. Dataset recording (rosbag of camera images)
+
+Every autostart run also records a rosbag of CLEAN camera frames (no detector
+overlays) for training-data collection. The images are JPEG-compressed by the
+detector before publishing (~10 GB/hour at the default 30 img/s, 848x480 q95 —
+visually lossless). Raw uncompressed images would be ~13x larger. The JPEG
+encode runs inside the detector frame loop, so keep `RECORD_EVERY >= 2` in
+matches; `RECORD_EVERY=1` (60 img/s) steals milliseconds from the aiming loop.
+
+How it works:
+
+- the detector publishes `sensor_msgs/CompressedImage` on
+  `/camera/image_raw/compressed` every `RECORD_EVERY` camera frames
+  (launch arg `record_every`, passed by `autoaim_autostart.sh`)
+- once `camera_info` is stable, the script starts
+  `ros2 bag record` on that topic plus `/camera_info` (intrinsics)
+- bags land in `~/workspaces/isaac_ros-dev/bags/autostart/rec_YYYYmmdd_HHMMSS`
+- the script verifies the recorder is still alive 3 s after starting it and
+  retries up to 3 times with a fresh folder name (a name collision after a
+  clock step used to kill the recorder instantly and silently)
+- bags left without `metadata.yaml` by a hard power-off are reindexed
+  automatically at the next boot (log: `/tmp/autoaim_bag_reindex.log`)
+- when the folder exceeds `RECORD_MAX_TOTAL_GB` (default 20 GB) the OLDEST
+  recordings are deleted automatically, so the disk can never fill up
+- recorder log: `/tmp/autoaim_bag.log` inside the container
+
+Tuning (top of `autoaim_autostart.sh`):
+
+    RECORD_ENABLE=1          # 0 disables recording entirely
+    RECORD_EVERY=2           # camera fps / N images per second (60/2 = 30 img/s)
+    RECORD_MAX_TOTAL_GB=20   # total disk cap for bags/autostart
+
+If the robot is powered off without a clean service stop, the last bag has no
+`metadata.yaml`. It is reindexed automatically at the next boot; to read it on
+another machine before that, run manually:
+
+    ros2 bag reindex bags/autostart/rec_YYYYmmdd_HHMMSS
+
+Extract the JPEGs from a bag into a folder of .jpg files (run inside the
+container; the message payload is already a JPEG, no decoding needed):
+
+```python
+import os, sqlite3, sys
+from rclpy.serialization import deserialize_message
+from sensor_msgs.msg import CompressedImage
+
+bag_db, out_dir = sys.argv[1], sys.argv[2]   # rec_.../rec_..._0.db3  out/
+os.makedirs(out_dir, exist_ok=True)
+db = sqlite3.connect(bag_db)
+rows = db.execute(
+    "SELECT m.timestamp, m.data FROM messages m JOIN topics t ON m.topic_id=t.id "
+    "WHERE t.name='/camera/image_raw/compressed'")
+for i, (ts, raw) in enumerate(rows):
+    msg = deserialize_message(raw, CompressedImage)
+    with open(f"{out_dir}/{ts}_{i:06d}.jpg", "wb") as f:
+        f.write(bytes(msg.data))
+print("done:", i + 1, "images")
+```
+
+## 7. Useful checks on this device
 
 Check service status:
 
@@ -154,7 +213,7 @@ Inside the container, useful checks are:
     ros2 topic echo /camera_info --once
     ros2 topic hz /camera_info
 
-## 7. What this profile intentionally does not do
+## 8. What this profile intentionally does not do
 
 This profile is not the sentry/ZED startup profile. It intentionally does not:
 

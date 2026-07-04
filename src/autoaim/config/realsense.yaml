@@ -21,13 +21,13 @@
 
     # ── Camera capture (librealsense2) ──
     serial_no: ""            # "" = first connected device; else a specific RealSense serial
-    width: 640               # color stream width
-    height: 360              # color stream height
-    fps: 90                  # color stream FPS (D455 color @640x480 maxes at 60; 90 needs height<=360)
+    width: 848               # color stream width (848x480 = full-FOV 16:9 on D455; 640x480 crops)
+    height: 480              # color stream height
+    fps: 60                  # color stream FPS (D455 color: 848x480/640x480 max 60; 90 needs height<=360)
     # auto_exposure true = camera adapts (usable image anywhere; default).
     # Set false + tune exposure/gain for the arena. Fixed 6000 us overexposes a
     # normally-lit room to pure white — only use manual once you measure on field.
-    auto_exposure: false       # false -> manual exposure/gain below
+    auto_exposure: true       # false -> manual exposure/gain below
     exposure: 60             # RS2_OPTION_EXPOSURE (microseconds), manual mode only
     gain: 50                  # RS2_OPTION_GAIN, manual mode only
     # Color pixel format:
@@ -62,6 +62,12 @@
     # /detector/armors_keypoints stay functional and are never gated here.
     publish_debug_every: 0   # /yolo/debug_image: every N frames (0 = no publisher)
     publish_json: false      # /detector/armors_keypoints_json: debug echo only
+    # Dataset recording: CLEAN camera frames (no overlays) as JPEG on
+    # /camera/image_raw/compressed, every N frames (0 = no publisher). The
+    # standard autostart overrides this via the record_every launch arg and
+    # rosbag-records the topic for training-data collection.
+    publish_record_every: 0
+    record_jpeg_quality: 95  # JPEG quality 1-100; 95 = visually lossless, ~90 KB/frame at 848x480
     # Intrinsics are static for this stream. The first frame is still published
     # immediately, then repeated sparsely for late subscribers.
     camera_info_every: 60    # /camera_info: every N frames (0 = never)
